@@ -144,12 +144,12 @@ static void setup_child_environ(struct opts *opts, int pfd)
 	if (opts->retval)
 		setenv("UFTRACE_RETVAL", opts->retval, 1);
 
-	if (opts->depth != MCOUNT_DEFAULT_DEPTH) {
+	if (opts->depth != OPT_DEPTH_DEFAULT) {
 		snprintf(buf, sizeof(buf), "%d", opts->depth);
 		setenv("UFTRACE_DEPTH", buf, 1);
 	}
 
-	if (opts->max_stack != MCOUNT_RSTACK_MAX) {
+	if (opts->max_stack != OPT_RSTACK_DEFAULT) {
 		snprintf(buf, sizeof(buf), "%d", opts->max_stack);
 		setenv("UFTRACE_MAX_STACK", buf, 1);
 	}
@@ -1281,7 +1281,7 @@ static void check_binary(struct opts *opts)
 	if (read(fd, &e_type, sizeof(e_type)) < 0)
 		pr_err("Cannot read '%s'", opts->exename);
 
-	if (e_type != ET_EXEC && !opts->force)
+	if (e_type != ET_EXEC && e_type != ET_DYN && !opts->force)
 		pr_err_ns(OBJTYPE_MSG, opts->exename);
 
 	if (read(fd, &e_machine, sizeof(e_machine)) < 0)

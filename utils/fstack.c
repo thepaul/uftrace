@@ -156,6 +156,7 @@ setup:
 			handle->tasks[i].done = true;
 			handle->tasks[i].fp = NULL;
 			handle->tasks[i].tid = tid;
+			handle->tasks[i].h = handle;
 			continue;
 		}
 
@@ -493,7 +494,7 @@ int fstack_update(int type, struct ftrace_task_handle *task,
 		}
 		else {
 			task->display_depth++;
-			if (task->ctx == FSTACK_CTX_USER) {
+			if (!is_kernel_address(fstack->addr)) {
 				task->user_display_depth++;
 			}
 		}
@@ -506,7 +507,7 @@ int fstack_update(int type, struct ftrace_task_handle *task,
 		else
 			task->display_depth = 0;
 
-		if (task->ctx == FSTACK_CTX_USER) {
+		if (!is_kernel_address(fstack->addr)) {
 			if (task->user_display_depth > 0)
 				task->user_display_depth--;
 			else
@@ -524,12 +525,23 @@ static int fstack_check_skip(struct ftrace_task_handle *task,
 			     struct ftrace_ret_stack *rstack)
 {
 	struct ftrace_session *sess;
-	unsigned long addr = rstack->addr;
+	unsigned long addr = get_real_address(rstack->addr);
 	struct ftrace_trigger tr = { 0 };
 	int depth = task->filter.depth;
+	struct fstack *fstack;
 
 	if (task->filter.out_count > 0)
 		return -1;
+
+	if (rstack->type == FTRACE_EXIT) {
+		/* fstack_consume() is not called yet */
+		fstack = &task->func_stack[task->stack_count - 1];
+
+		if (fstack->flags & FSTACK_FL_NORECORD)
+			return -1;
+
+		return 0;
+	}
 
 	sess = find_task_session(task->tid, rstack->time);
 	if (sess == NULL)
@@ -590,23 +602,30 @@ struct ftrace_task_handle *fstack_skip(struct ftrace_file_handle *handle,
 	if (peek_rstack(handle, &next) < 0)
 		return NULL;
 
-	/*
-	 * different rstack means a context change between user and kernel,
-	 * so the depth was increased and it needs checking.
-	 */
-	while (next == task && (curr_stack != next->rstack ||
-				next->rstack->depth > curr_depth)) {
+	while (true) {
 		struct ftrace_ret_stack *next_stack = next->rstack;
 		struct ftrace_trigger tr = { 0 };
 
-		/* return if it's not filtered */
-		if (next_stack->type == FTRACE_ENTRY) {
-			if (fstack_check_skip(task, next_stack) >= 0)
-				break;
+		/* skip filtered entries until current matching EXIT records */
+		if (next == task && curr_stack == next_stack &&
+		    curr_depth >= next_stack->depth)
+			break;
+
+		/* skip kernel functions outside user functions */
+		if (is_kernel_address(next_stack->addr)) {
+			if (!next->user_stack_count &&
+			    handle->kern && handle->kern->skip_out)
+				goto next;
 		}
-		else if (next_stack->type != FTRACE_EXIT)
+
+		if (next_stack->type == FTRACE_LOST)
 			return NULL;
 
+		/* return if it's not filtered */
+		if (fstack_check_skip(next, next_stack) >= 0)
+			break;
+
+next:
 		/* consume the filtered rstack */
 		fstack_consume(handle, next);
 
@@ -615,9 +634,9 @@ struct ftrace_task_handle *fstack_skip(struct ftrace_file_handle *handle,
 		 * that it can changes stack_count properly.
 		 */
 		if (next_stack->type == FTRACE_ENTRY)
-			fstack_entry(task, next_stack, &tr);
+			fstack_entry(next, next_stack, &tr);
 		else
-			fstack_exit(task);
+			fstack_exit(next);
 
 		if (!fstack_enabled)
 			return NULL;
@@ -895,8 +914,6 @@ int read_task_ustack(struct ftrace_file_handle *handle,
 
 	if (__read_task_ustack(task) < 0) {
 		task->done = true;
-		fclose(task->fp);
-		task->fp = NULL;
 		return -1;
 	}
 
@@ -948,12 +965,6 @@ get_task_ustack(struct ftrace_file_handle *handle, int idx)
 	task = &handle->tasks[idx];
 	rstack_list = &task->rstack_list;
 
-	if (!handle->time_filter) {
-		if (read_task_ustack(handle, task) < 0)
-			return NULL;
-		return &task->ustack;
-	}
-
 	if (rstack_list->count)
 		goto out;
 
@@ -962,18 +973,58 @@ get_task_ustack(struct ftrace_file_handle *handle, int idx)
 	 * the given time filter (-t option).
 	 */
 	while (read_task_ustack(handle, task) == 0) {
+		struct ftrace_session *sess;
+		struct ftrace_trigger tr = {};
+		uint64_t time_filter = handle->time_filter;
+
 		curr = &task->ustack;
 
 		/* prevent ustack from invalid access */
 		task->valid = false;
 
+		sess = find_task_session(task->tid, curr->time);
+		if (sess == NULL)
+			sess = find_task_session(task->t->pid,
+						 curr->time);
+
+		if (sess)
+			ftrace_match_filter(&sess->filters,
+					    curr->addr, &tr);
+
+		if (task->filter.time)
+			time_filter = task->filter.time->threshold;
+
 		if (curr->type == FTRACE_ENTRY) {
 			/* it needs to wait until matching exit found */
 			add_to_rstack_list(rstack_list, curr, &task->args);
+
+			if (tr.flags & TRIGGER_FL_TIME_FILTER) {
+				struct time_filter_stack *tfs;
+
+				tfs = xmalloc(sizeof(*tfs));
+				tfs->next = task->filter.time;
+				tfs->depth = curr->depth;
+				tfs->context = FSTACK_CTX_USER;
+				tfs->threshold = tr.time;
+
+				task->filter.time = tfs;
+			}
 		}
 		else if (curr->type == FTRACE_EXIT) {
 			struct uftrace_rstack_list_node *last;
 			uint64_t delta;
+
+			if (task->filter.time) {
+				struct time_filter_stack *tfs;
+
+				tfs = task->filter.time;
+				if (tfs->depth == curr->depth &&
+				    tfs->context == FSTACK_CTX_USER) {
+					/* discard stale filter */
+					task->filter.time = tfs->next;
+					free(tfs);
+				}
+			}
 
 			if (rstack_list->count == 0) {
 				/* it's already exceeded time filter, just return */
@@ -985,30 +1036,16 @@ get_task_ustack(struct ftrace_file_handle *handle, int idx)
 					       typeof(*last), list);
 			delta = curr->time - last->rstack.time;
 
-			if (delta < handle->time_filter) {
-				struct ftrace_session *sess;
-
-				sess = find_task_session(task->tid, curr->time);
-				if (sess == NULL)
-					sess = find_task_session(task->t->pid,
-								 curr->time);
-
-				if (sess) {
-					/*
-					 * it might set TRACE trigger, which
-					 * shows function even if it's less
-					 * than the time filter.
-					 */
-					struct ftrace_trigger tr = {};
-
-					ftrace_match_filter(&sess->filters,
-							    curr->addr, &tr);
-					if (tr.flags & TRIGGER_FL_TRACE) {
-						add_to_rstack_list(rstack_list,
-								   curr,
-								   &task->args);
-						break;
-					}
+			if (delta < time_filter) {
+				/*
+				 * it might set TRACE trigger, which shows
+				 * function even if it's less than the time
+				 * filter.
+				 */
+				if (tr.flags & TRIGGER_FL_TRACE) {
+					add_to_rstack_list(rstack_list, curr,
+							   &task->args);
+					break;
 				}
 
 				/* also delete matching entry (at the last) */
@@ -1041,7 +1078,7 @@ static int read_user_stack(struct ftrace_file_handle *handle,
 			   struct ftrace_task_handle **task)
 {
 	int i, next_i = -1;
-	uint64_t next_time;
+	uint64_t next_time = 0;
 	struct ftrace_ret_stack *tmp;
 
 	for (i = 0; i < handle->info.nr_tid; i++) {
@@ -1092,6 +1129,10 @@ static void fstack_account_time(struct ftrace_task_handle *task)
 		task->stack_count = task->user_stack_count;
 		task->filter.depth = task->h->depth - task->stack_count;
 	}
+
+	/* if task filter was set, it doesn't have func_stack */
+	if (task->func_stack == NULL)
+		return;
 
 	if (rstack->type == FTRACE_ENTRY) {
 		fstack = &task->func_stack[task->stack_count];
@@ -1259,6 +1300,7 @@ static int __read_rstack(struct ftrace_file_handle *handle,
 
 	u = read_user_stack(handle, &utask);
 	if (kernel) {
+retry:
 		k = read_kernel_stack(handle, &ktask);
 		if (k < 0) {
 			static bool warn = false;
@@ -1267,6 +1309,12 @@ static int __read_rstack(struct ftrace_file_handle *handle,
 				pr_dbg("no more kernel data\n");
 				warn = true;
 			}
+		}
+		else if (ktask->fp == NULL) {
+			/* task might be filtered */
+			ktask->rstack = &ktask->kstack;
+			__fstack_consume(ktask, kernel, k);
+			goto retry;
 		}
 	}
 
@@ -1428,6 +1476,10 @@ static int fstack_test_setup_file(struct ftrace_file_handle *handle, int nr_tid)
 	}
 	setup_task_filter(NULL, handle);
 
+	/* for fstack_entry not to crash */
+	for (i = 0; i < handle->info.nr_tid; i++)
+		handle->tasks[i].t = &test_tasks[i];
+
 	atexit(fstack_test_finish_file);
 	return 0;
 }
@@ -1502,9 +1554,6 @@ TEST_CASE(fstack_skip)
 
 	TEST_EQ(read_rstack(handle, &task), 0);
 
-	/* for fstack_entry not to crash */
-	task->t = &test_tasks[0];
-
 	TEST_EQ(fstack_entry(task, task->rstack, &tr), 0);
 	TEST_EQ(task->tid, test_tids[0]);
 	TEST_EQ((uint64_t)task->rstack->type,  (uint64_t)test_record[0][0].type);
@@ -1517,6 +1566,36 @@ TEST_CASE(fstack_skip)
 	TEST_EQ((uint64_t)task->rstack->type,  (uint64_t)test_record[0][3].type);
 	TEST_EQ((uint64_t)task->rstack->depth, (uint64_t)test_record[0][3].depth);
 	TEST_EQ((uint64_t)task->rstack->addr,  (uint64_t)test_record[0][3].addr);
+
+	return TEST_OK;
+}
+
+TEST_CASE(fstack_time)
+{
+	struct ftrace_file_handle *handle = &fstack_test_handle;
+	struct ftrace_task_handle *task;
+	int i;
+
+	dbg_domain[DBG_FSTACK] = 1;
+
+	TEST_EQ(fstack_test_setup_file(handle, ARRAY_SIZE(test_tids)), 0);
+
+	/* this makes to discard depth 1 records */
+	handle->time_filter = 200;
+
+	for (i = 0; i < NUM_TASK; i++) {
+		TEST_EQ(read_rstack(handle, &task), 0);
+		TEST_EQ(task->tid, test_tids[0]);
+		TEST_EQ((uint64_t)task->rstack->type,  (uint64_t)test_record[0][i*3].type);
+		TEST_EQ((uint64_t)task->rstack->depth, (uint64_t)test_record[0][i*3].depth);
+		TEST_EQ((uint64_t)task->rstack->addr,  (uint64_t)test_record[0][i*3].addr);
+
+		TEST_EQ(read_rstack(handle, &task), 0);
+		TEST_EQ(task->tid, test_tids[1]);
+		TEST_EQ((uint64_t)task->rstack->type,  (uint64_t)test_record[1][i*3].type);
+		TEST_EQ((uint64_t)task->rstack->depth, (uint64_t)test_record[1][i*3].depth);
+		TEST_EQ((uint64_t)task->rstack->addr,  (uint64_t)test_record[1][i*3].addr);
+	}
 
 	return TEST_OK;
 }

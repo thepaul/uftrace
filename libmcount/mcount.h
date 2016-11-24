@@ -20,10 +20,11 @@
 
 #define FTRACE_DIR_NAME   "uftrace.data"
 
-#define MCOUNT_RSTACK_MAX  1024
-#define MCOUNT_NOTRACE_IDX 0x10000
-#define MCOUNT_INVALID_DYNIDX 0xffff
-#define MCOUNT_DEFAULT_DEPTH  (INT_MAX - 1)
+#define MCOUNT_RSTACK_MAX      OPT_RSTACK_DEFAULT
+#define MCOUNT_DEFAULT_DEPTH   OPT_DEPTH_DEFAULT
+
+#define MCOUNT_NOTRACE_IDX     0x10000
+#define MCOUNT_INVALID_DYNIDX  0xffff
 
 enum mcount_flag {
 	MCOUNT_FL_SETJMP	= (1U << 0),
@@ -50,6 +51,7 @@ struct mcount_ret_stack {
 	uint64_t end_time;
 	int tid;
 	int filter_depth;
+	uint64_t filter_time;
 	unsigned short depth;
 	unsigned short dyn_idx;
 	/* set arg_spec at function entry and use it at exit */
@@ -91,6 +93,8 @@ struct filter_control {
 	int out_count;
 	int depth;
 	int saved_depth;
+	uint64_t time;
+	uint64_t saved_time;
 };
 #else
 struct filter_control {};

@@ -466,12 +466,16 @@ static void print_warning(struct ftrace_task_handle *task)
 
 static bool skip_sys_exit(struct opts *opts, struct ftrace_task_handle *task)
 {
-	unsigned long ip = task->func_stack[0].addr;
+	unsigned long ip;
+
+	if (task->func_stack == NULL)
+		return true;
 
 	/* skip 'sys_exit[_group] at last for kernel tracing */
 	if (!opts->kernel || task->user_stack_count != 0)
 		return false;
 
+	ip = task->func_stack[0].addr;
 	if (is_kernel_address(ip)) {
 		struct sym *sym = find_symtabs(NULL, ip);
 
@@ -553,6 +557,7 @@ int command_replay(int argc, char *argv[], struct opts *opts)
 
 	if (opts->kernel && (handle.hdr.feat_mask & KERNEL)) {
 		kern.output_dir = opts->dirname;
+		kern.skip_out = opts->kernel_skip_out;
 		if (setup_kernel_data(&kern) == 0) {
 			handle.kern = &kern;
 			load_kernel_symbol();
@@ -565,7 +570,12 @@ int command_replay(int argc, char *argv[], struct opts *opts)
 		pr_out("# DURATION    TID     FUNCTION\n");
 
 	while (read_rstack(&handle, &task) == 0 && !ftrace_done) {
-		uint64_t curr_time = task->rstack->time;
+		struct ftrace_ret_stack *rstack = task->rstack;
+		uint64_t curr_time = rstack->time;
+
+		/* skip user functions if --kernel-only is set */
+		if (opts->kernel_only && !is_kernel_address(rstack->addr))
+			continue;
 
 		/*
 		 * data sanity check: timestamp should be ordered.
@@ -575,7 +585,7 @@ int command_replay(int argc, char *argv[], struct opts *opts)
 		if (curr_time) {
 			if (prev_time > curr_time)
 				print_warning(task);
-			prev_time = task->rstack->time;
+			prev_time = rstack->time;
 		}
 
 		if (opts->flat)

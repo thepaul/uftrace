@@ -125,6 +125,10 @@ static void build_function_tree(struct ftrace_file_handle *handle,
 		if (rstack->type != FTRACE_EXIT)
 			continue;
 
+		/* skip user functions if --kernel-only is set */
+		if (opts->kernel_only && !is_kernel_address(rstack->addr))
+			continue;
+
 		if (opts->kernel_skip_out) {
 			/* skip kernel functions outside user functions */
 			if (is_kernel_address(task->func_stack[0].addr) &&
@@ -573,6 +577,10 @@ static void report_threads(struct ftrace_file_handle *handle, struct opts *opts)
 		if (rstack->type == FTRACE_LOST)
 			continue;
 
+		/* skip user functions if --kernel-only is set */
+		if (opts->kernel_only && !is_kernel_address(rstack->addr))
+			continue;
+
 		if (opts->kernel_skip_out) {
 			/* skip kernel functions outside user functions */
 			if (is_kernel_address(task->func_stack[0].addr) &&
@@ -945,6 +953,7 @@ int command_report(int argc, char *argv[], struct opts *opts)
 
 	if (opts->kernel && (handle.hdr.feat_mask & KERNEL)) {
 		kern.output_dir = opts->dirname;
+		kern.skip_out = opts->kernel_skip_out;
 		if (setup_kernel_data(&kern) == 0) {
 			handle.kern = &kern;
 			load_kernel_symbol();
