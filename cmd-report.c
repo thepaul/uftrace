@@ -105,69 +105,137 @@ static void insert_entry(struct rb_root *root, struct trace_entry *te, bool thre
 	rb_insert_color(&entry->link, root);
 }
 
-static void build_function_tree(struct ftrace_file_handle *handle,
-				struct rb_root *root, struct opts *opts)
+static bool fill_entry(struct trace_entry *te, struct ftrace_task_handle *task,
+		       uint64_t time, uint64_t addr, struct opts *opts)
 {
-	struct sym *sym;
-	struct trace_entry te;
-	struct ftrace_ret_stack *rstack;
-	struct ftrace_task_handle *task;
 	struct ftrace_session *sess;
+	struct sym *sym;
 	struct fstack *fstack;
 	int i;
 
-	while (read_rstack(handle, &task) >= 0) {
+	/* skip user functions if --kernel-only is set */
+	if (opts->kernel_only && !is_kernel_address(addr))
+		return false;
+
+	if (opts->kernel_skip_out) {
+		/* skip kernel functions outside user functions */
+		if (is_kernel_address(task->func_stack[0].addr) &&
+		    is_kernel_address(addr))
+			return false;
+	}
+
+	sess = find_task_session(task->tid, time);
+	if (sess == NULL && !is_kernel_address(addr))
+		return false;
+
+	sym = find_symtabs(&sess->symtabs, addr);
+	if (sym == NULL)
+		sym = session_find_dlsym(sess, time, addr);
+
+	fstack = &task->func_stack[task->stack_count];
+
+	te->pid  = task->tid;
+	te->sym  = sym;
+	te->addr = addr;
+	te->time_total = fstack->total_time;
+	te->time_self  = te->time_total - fstack->child_time;
+	te->nr_called  = 1;
+
+	/* some LOST entries make invalid self tiem */
+	if (te->time_self > te->time_total)
+		te->time_self = te->time_total;
+
+	te->time_recursive = 0;
+	for (i = 0; i < task->stack_count; i++) {
+		if (addr == task->func_stack[i].addr) {
+			te->time_recursive = te->time_total;
+			break;
+		}
+	}
+
+	return true;
+}
+
+static void build_function_tree(struct ftrace_file_handle *handle,
+				struct rb_root *root, struct opts *opts)
+{
+	struct trace_entry te;
+	struct ftrace_ret_stack *rstack;
+	struct ftrace_task_handle *task;
+	struct fstack *fstack;
+	int i;
+
+	while (read_rstack(handle, &task) >= 0 && !uftrace_done) {
 		rstack = task->rstack;
+
+		if (rstack->type != FTRACE_LOST)
+			task->timestamp_last = rstack->time;
 
 		if (!fstack_check_filter(task))
 			continue;
 
-		if (rstack->type != FTRACE_EXIT)
+		if (rstack->type == FTRACE_ENTRY)
 			continue;
 
-		/* skip user functions if --kernel-only is set */
-		if (opts->kernel_only && !is_kernel_address(rstack->addr))
-			continue;
+		if (rstack->type == FTRACE_LOST) {
+			/* add partial duration of functions before LOST */
+			while (task->stack_count >= task->user_stack_count) {
+				fstack = &task->func_stack[task->stack_count];
 
-		if (opts->kernel_skip_out) {
-			/* skip kernel functions outside user functions */
-			if (is_kernel_address(task->func_stack[0].addr) &&
-			    is_kernel_address(rstack->addr))
-				continue;
-		}
+				if (fstack_enabled && fstack->valid &&
+				    !(fstack->flags & FSTACK_FL_NORECORD) &&
+				    fill_entry(&te, task, task->timestamp_last,
+					       fstack->addr, opts)) {
+					insert_entry(root, &te, false);
+				}
 
-		if (rstack == &task->kstack)
-			sess = first_session;
-		else
-			sess = find_task_session(task->tid, rstack->time);
-
-		if (sess == NULL)
-			continue;
-
-		sym = find_symtabs(&sess->symtabs, rstack->addr);
-
-		fstack = &task->func_stack[task->stack_count];
-
-		te.pid = task->tid;
-		te.sym = sym;
-		te.addr = rstack->addr;
-		te.time_total = fstack->total_time;
-		te.time_self = te.time_total - fstack->child_time;
-		te.nr_called = 1;
-
-		/* some LOST entries make invalid self tiem */
-		if (te.time_self > te.time_total)
-			te.time_self = te.time_total;
-
-		te.time_recursive = 0;
-		for (i = 0; i < task->stack_count; i++) {
-			if (rstack->addr == task->func_stack[i].addr) {
-				te.time_recursive = te.time_total;
-				break;
+				fstack_exit(task);
+				task->stack_count--;
 			}
+			continue;
 		}
 
-		insert_entry(root, &te, false);
+		/* rstack->type == FTRACE_EXIT */
+		if (fill_entry(&te, task, rstack->time, rstack->addr, opts))
+			insert_entry(root, &te, false);
+	}
+
+	if (uftrace_done)
+		return;
+
+	/* add duration of remaining functions */
+	for (i = 0; i < handle->nr_tasks; i++) {
+		uint64_t last_time;
+
+		task = &handle->tasks[i];
+
+		if (task->stack_count == 0)
+			continue;
+
+		last_time = task->rstack->time;
+
+		if (handle->time_range.stop)
+			last_time = handle->time_range.stop;
+
+		while (--task->stack_count >= 0) {
+			fstack = &task->func_stack[task->stack_count];
+
+			if (fstack->addr == 0)
+				continue;
+
+			if (fstack->total_time > last_time)
+				continue;
+
+			fstack->total_time = last_time - fstack->total_time;
+			if (fstack->child_time > fstack->total_time)
+				fstack->total_time = fstack->child_time;
+
+			if (task->stack_count > 0)
+				fstack[-1].child_time += fstack->total_time;
+
+			if (fill_entry(&te, task, last_time, fstack->addr, opts))
+				insert_entry(root, &te, false);
+		}
 	}
 }
 
@@ -411,7 +479,7 @@ static void setup_sort(char *sort_keys)
 				continue;
 
 			if (all_sort_items[i]->avg_mode != (avg_mode != AVG_NONE)) {
-				pr_out("ftrace: '%s' sort key %s be used with %s or %s.\n",
+				pr_out("uftrace: '%s' sort key %s be used with %s or %s.\n",
 				       all_sort_items[i]->name,
 				       avg_mode == AVG_NONE ? "should" : "cannot",
 				       "--avg-total", "--avg-self");
@@ -424,8 +492,8 @@ static void setup_sort(char *sort_keys)
 		}
 
 		if (i == ARRAY_SIZE(all_sort_items)) {
-			pr_out("ftrace: Unknown sort key '%s'\n", k);
-			pr_out("ftrace:   Possible keys:");
+			pr_out("uftrace: Unknown sort key '%s'\n", k);
+			pr_out("uftrace:   Possible keys:");
 			for (i = 0; i < ARRAY_SIZE(all_sort_items); i++)
 				pr_out(" %s", all_sort_items[i]->name);
 			pr_out("\n");
@@ -460,17 +528,17 @@ static void print_function(struct trace_entry *entry)
 	char *symname = symbol_getname(entry->sym, entry->addr);
 
 	if (avg_mode == AVG_NONE) {
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(entry->time_total - entry->time_recursive);
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(entry->time_self);
 		pr_out("  %10lu  %-s\n", entry->nr_called, symname);
 	} else {
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(entry->time_avg);
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(entry->time_min);
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(entry->time_max);
 		pr_out("  %-s\n", symname);
 	}
@@ -487,7 +555,7 @@ static void report_functions(struct ftrace_file_handle *handle, struct opts *opt
 
 	build_function_tree(handle, &name_tree, opts);
 
-	while (!RB_EMPTY_ROOT(&name_tree)) {
+	while (!RB_EMPTY_ROOT(&name_tree) && !uftrace_done) {
 		struct rb_node *node;
 		struct trace_entry *entry;
 
@@ -502,6 +570,9 @@ static void report_functions(struct ftrace_file_handle *handle, struct opts *opt
 
 		sort_entries(&sort_tree, entry);
 	}
+
+	if (uftrace_done)
+		return;
 
 	if (avg_mode == AVG_NONE)
 		pr_out(f_format, "Total time", "Self time", "Calls", "Function");
@@ -553,7 +624,7 @@ static void print_thread(struct trace_entry *entry)
 {
 	char *symname = symbol_getname(entry->sym, entry->addr);
 
-	pr_out("  %5d ", entry->pid);
+	pr_out("  %5d  ", entry->pid);
 	print_time_unit(entry->time_self);
 	pr_out("  %10lu  %-s\n", entry->nr_called, symname);
 
@@ -570,7 +641,7 @@ static void report_threads(struct ftrace_file_handle *handle, struct opts *opts)
 	const char t_format[] = "  %5.5s  %10.10s  %10.10s  %-s\n";
 	const char line[] = "====================================";
 
-	while (read_rstack(handle, &task) >= 0) {
+	while (read_rstack(handle, &task) >= 0 && !uftrace_done) {
 		rstack = task->rstack;
 		if (rstack->type == FTRACE_ENTRY && task->func)
 			continue;
@@ -606,6 +677,9 @@ static void report_threads(struct ftrace_file_handle *handle, struct opts *opts)
 
 		insert_entry(&name_tree, &te, true);
 	}
+
+	if (uftrace_done)
+		return;
 
 	pr_out(t_format, "TID", "Run time", "Num funcs", "Start function");
 	pr_out(t_format, line, line, line, line);
@@ -668,15 +742,29 @@ static void sort_by_name(struct rb_root *root, struct trace_entry *te)
 	rb_insert_color(&te->link, root);
 }
 
-static struct trace_entry * find_by_name(struct rb_root *root, char *name)
+static struct trace_entry * find_by_name(struct rb_root *root,
+					 struct trace_entry *base)
 {
 	struct trace_entry *entry;
 	struct rb_node *parent = NULL;
 	struct rb_node **p = &root->rb_node;
+	char *name;
 
+	if (base->sym == NULL)
+		return NULL;
+
+	name = base->sym->name;
 	while (*p) {
 		parent = *p;
 		entry = rb_entry(parent, struct trace_entry, link);
+
+		if (entry->sym == NULL) {
+			if (entry->addr < base->addr)
+				p = &parent->rb_left;
+			else
+				p = &parent->rb_right;
+			continue;
+		}
 
 		if (strcmp(entry->sym->name, name) == 0)
 			return entry;
@@ -695,7 +783,7 @@ static void sort_function_name(struct rb_root *root_in,
 {
 	struct rb_root no_name = RB_ROOT;
 
-	while (!RB_EMPTY_ROOT(root_in)) {
+	while (!RB_EMPTY_ROOT(root_in) && !uftrace_done) {
 		struct rb_node *node;
 		struct trace_entry *entry;
 
@@ -723,7 +811,7 @@ static void calculate_diff(struct rb_root *base, struct rb_root *pair,
 {
 	struct rb_root tmp = RB_ROOT;
 
-	while (!RB_EMPTY_ROOT(base)) {
+	while (!RB_EMPTY_ROOT(base) && !uftrace_done) {
 		struct rb_node *node;
 		struct trace_entry *e, *p;
 
@@ -731,7 +819,7 @@ static void calculate_diff(struct rb_root *base, struct rb_root *pair,
 		rb_erase(node, base);
 
 		e = rb_entry(node, struct trace_entry, link);
-		p = find_by_name(pair, e->sym->name);
+		p = find_by_name(pair, e);
 		if (p == NULL) {
 			sort_entries(remaining, e);
 			continue;
@@ -747,7 +835,7 @@ static void calculate_diff(struct rb_root *base, struct rb_root *pair,
 	}
 
 	/* sort remaining pair entries by time */
-	while (!RB_EMPTY_ROOT(pair)) {
+	while (!RB_EMPTY_ROOT(pair) && !uftrace_done) {
 		struct rb_node *node;
 		struct trace_entry *entry;
 
@@ -767,16 +855,16 @@ static void print_diff(struct trace_entry *entry)
 	struct trace_entry *pair = entry->pair;
 
 	if (avg_mode == AVG_NONE) {
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(entry->time_total);
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(pair->time_total);
 		pr_out(" ");
 		print_diff_percent(entry->time_total, pair->time_total);
 
-		pr_out("  ");
+		pr_out("   ");
 		print_time_unit(entry->time_self);
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(pair->time_self);
 		pr_out(" ");
 		print_diff_percent(entry->time_self, pair->time_self);
@@ -785,23 +873,23 @@ static void print_diff(struct trace_entry *entry)
 		       entry->nr_called, pair->nr_called,
 		       (long)(pair->nr_called - entry->nr_called), symname);
 	} else {
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(entry->time_avg);
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(pair->time_avg);
 		pr_out(" ");
 		print_diff_percent(entry->time_avg, pair->time_avg);
 
-		pr_out("  ");
+		pr_out("   ");
 		print_time_unit(entry->time_min);
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(pair->time_min);
 		pr_out(" ");
 		print_diff_percent(entry->time_min, pair->time_min);
 
-		pr_out("  ");
+		pr_out("   ");
 		print_time_unit(entry->time_max);
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(pair->time_max);
 		pr_out(" ");
 		print_diff_percent(entry->time_max, pair->time_max);
@@ -818,9 +906,9 @@ static void print_remaining(struct trace_entry *entry)
 	char *symname = symbol_getname(entry->sym, entry->addr);
 
 	if (avg_mode == AVG_NONE) {
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(entry->time_total);
-		pr_out("  %10s  %8s  ", NODATA, NODATA);
+		pr_out("  %10s  %8s   ", NODATA, NODATA);
 
 		print_time_unit(entry->time_self);
 		pr_out("  %10s  %8s ",  NODATA, NODATA);
@@ -828,12 +916,12 @@ static void print_remaining(struct trace_entry *entry)
 		pr_out("  %10lu  %9s  %9s   %-s\n",
 		       entry->nr_called, NODATA, NODATA, symname);
 	} else {
-		pr_out(" ");
+		pr_out("  ");
 		print_time_unit(entry->time_avg);
-		pr_out("  %10s  %8s  ", NODATA, NODATA);
+		pr_out("  %10s  %8s   ", NODATA, NODATA);
 
 		print_time_unit(entry->time_min);
-		pr_out("  %10s  %8s  ", NODATA, NODATA);
+		pr_out("  %10s  %8s   ", NODATA, NODATA);
 
 		print_time_unit(entry->time_max);
 		pr_out("  %10s  %8s   %-s\n",  NODATA, NODATA, symname);
@@ -847,11 +935,11 @@ static void print_remaining_pair(struct trace_entry *entry)
 	char *symname = symbol_getname(entry->sym, entry->addr);
 
 	if (avg_mode == AVG_NONE) {
-		pr_out("  %10s ", NODATA);
+		pr_out("  %10s  ", NODATA);
 		print_time_unit(entry->time_total);
 		pr_out("  %8s ", NODATA);
 
-		pr_out("  %10s ", NODATA);
+		pr_out("  %10s  ", NODATA);
 		print_time_unit(entry->time_self);
 		pr_out("  %8s ", NODATA);
 
@@ -859,15 +947,15 @@ static void print_remaining_pair(struct trace_entry *entry)
 		       NODATA, entry->nr_called, NODATA, symname);
 	} else {
 
-		pr_out("  %10s ", NODATA);
+		pr_out("  %10s  ", NODATA);
 		print_time_unit(entry->time_avg);
 		pr_out("  %8s ", NODATA);
 
-		pr_out("  %10s ", NODATA);
+		pr_out("  %10s  ", NODATA);
 		print_time_unit(entry->time_min);
 		pr_out("  %8s ", NODATA);
 
-		pr_out("  %10s ",  NODATA);
+		pr_out("  %10s  ",  NODATA);
 		print_time_unit(entry->time_max);
 		pr_out("  %8s ", NODATA);
 
@@ -908,6 +996,9 @@ static void report_diff(struct ftrace_file_handle *handle, struct opts *opts)
 
 	calculate_diff(&name_tree, &data.root, &diff_tree, &remaining, opts->sort_column);
 
+	if (uftrace_done)
+		goto out;
+
 	pr_out("#\n");
 	pr_out("# uftrace diff\n");
 	pr_out("#  [%d] base: %s\t(from %s)\n", 0, handle->dirname, handle->info.cmdline);
@@ -930,6 +1021,7 @@ static void report_diff(struct ftrace_file_handle *handle, struct opts *opts)
 	print_and_delete(&data.root, print_remaining_pair);
 	print_and_delete(&diff_tree, print_diff);
 
+out:
 	close_data_file(&dummy_opts, &data.handle);
 }
 
@@ -956,7 +1048,7 @@ int command_report(int argc, char *argv[], struct opts *opts)
 		kern.skip_out = opts->kernel_skip_out;
 		if (setup_kernel_data(&kern) == 0) {
 			handle.kern = &kern;
-			load_kernel_symbol();
+			load_kernel_symbol(opts->dirname);
 		}
 	}
 

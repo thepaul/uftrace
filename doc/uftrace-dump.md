@@ -45,13 +45,16 @@ OPTIONS
 :   Do not show functions which run under the time threshold.  If some functions explicitly have the 'trace' trigger applied, those are always traced regardless of execution time.
 
 \--tid=*TID*[,*TID*,...]
-:   Only print functions called by the given threads.  To see the list of threads in the data file, you can use `uftrace report --threads` or `uftrace info`.
+:   Only print functions called by the given threads.  To see the list of threads in the data file, you can use `uftrace report --threads` or `uftrace info`.  This option can also be used more than once.
 
 -D *DEPTH*, \--depth *DEPTH*
 :   Set trace limit in nesting level.
 
 \--sample-time=*TIME*
 :   Apply sampling time when generating output for the flamegraph.  By default it uses the number of calls for each function.  When this option is used it simulates sampling by counting execution time at the given unit.  So functions which ran less than the sampling time will be removed from the output but functions longer than the time will be shown as larger.
+
+-r *RANGE*, \--time-range=*RANGE*
+:   Only show functions executed within the time RANGE.  The RANGE can be \<start\>~\<stop\> (separated by "~") and one of \<start\> and \<stop\> can be omitted.  The \<start\> and \<stop\> are timestamp or elapsed time if they have \<time_unit\> postfix, for example '100us'.  The timestamp or elapsed time can be shown with `-f time` or `-f elapsed` option respectively in `uftrace replay`(1).
 
 
 EXAMPLE

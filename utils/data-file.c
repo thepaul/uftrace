@@ -6,10 +6,12 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
+#include <assert.h>
 
 #include "uftrace.h"
 #include "utils/utils.h"
 #include "utils/fstack.h"
+#include "utils/symbol.h"
 #include "libmcount/mcount.h"
 
 
@@ -79,6 +81,9 @@ int read_task_file(char *dirname, bool needs_session, bool sym_rel_addr)
 		}
 	}
 
+	if (needs_session)
+		set_kernel_base(dirname, first_session->sid);
+
 	close(fd);
 	return 0;
 }
@@ -103,6 +108,7 @@ int read_task_txt_file(char *dirname, bool needs_session, bool sym_rel_addr)
 	long sec, nsec;
 	struct ftrace_msg_task task;
 	struct ftrace_msg_sess sess;
+	struct ftrace_msg_dlopen dlop;
 	char *exename, *pos;
 
 	xasprintf(&fname, "%s/%s", dirname, "task.txt");
@@ -133,9 +139,10 @@ int read_task_txt_file(char *dirname, bool needs_session, bool sym_rel_addr)
 			if (!needs_session)
 				continue;
 
-			sscanf(line + 5, "timestamp=%lu.%lu tid=%d sid=%s",
-			       &sec, &nsec, &sess.task.tid, (char *)&sess.sid);
+			sscanf(line + 5, "timestamp=%lu.%lu %*[^i]id=%d sid=%s",
+			       &sec, &nsec, &sess.task.pid, (char *)&sess.sid);
 
+			// Get the execname
 			pos = strstr(line, "exename=");
 			if (pos == NULL)
 				pr_err_ns("invalid task.txt format");
@@ -144,13 +151,43 @@ int read_task_txt_file(char *dirname, bool needs_session, bool sym_rel_addr)
 			if (pos)
 				*pos = '\0';
 
-			sess.task.pid = sess.task.tid;
+			sess.task.tid = sess.task.pid;
 			sess.task.time = (uint64_t)sec * NSEC_PER_SEC + nsec;
 			sess.namelen = strlen(exename);
 
 			create_session(&sess, dirname, exename, sym_rel_addr);
 		}
+		else if (!strncmp(line, "DLOP", 4)) {
+			struct ftrace_session *s;
+
+			if (!needs_session)
+				continue;
+
+			sscanf(line + 5, "timestamp=%lu.%lu tid=%d sid=%s base=%"PRIx64,
+			       &sec, &nsec, &dlop.task.tid, (char *)&dlop.sid,
+			       &dlop.base_addr);
+
+			pos = strstr(line, "libname=");
+			if (pos == NULL)
+				pr_err_ns("invalid task.txt format");
+			exename = pos + 8 + 1;  // skip double-quote
+			pos = strrchr(exename, '\"');
+			if (pos)
+				*pos = '\0';
+
+			dlop.task.pid = dlop.task.tid;
+			dlop.task.time = (uint64_t)sec * NSEC_PER_SEC + nsec;
+			dlop.namelen = strlen(exename);
+
+			s = get_session_from_sid(dlop.sid);
+			assert(s);
+			session_add_dlopen(s, dirname, dlop.task.time,
+					   dlop.base_addr, exename);
+		}
 	}
+
+	if (needs_session)
+		set_kernel_base(dirname, first_session->sid);
 
 	fclose(fp);
 	free(fname);
@@ -217,11 +254,51 @@ void write_session_info(const char *dirname, struct ftrace_msg_sess *smsg,
 		pr_err("cannot open %s", fname);
 
 	snprint_timestamp(ts, sizeof(ts), smsg->task.time);
-	fprintf(fp, "SESS timestamp=%s tid=%d sid=%s exename=\"%s\"\n",
-		ts, smsg->task.tid, smsg->sid, exename);
+	fprintf(fp, "SESS timestamp=%s pid=%d sid=%s exename=\"%s\"\n",
+	        ts, smsg->task.pid, smsg->sid, exename);
 
 	fclose(fp);
 	free(fname);
+}
+
+void write_dlopen_info(const char *dirname, struct ftrace_msg_dlopen *dmsg,
+		       const char *libname)
+{
+	FILE *fp;
+	char *fname = NULL;
+	char ts[128];
+
+	xasprintf(&fname, "%s/%s", dirname, "task.txt");
+
+	fp = fopen(fname, "a");
+	if (fp == NULL)
+		pr_err("cannot open %s", fname);
+
+	snprint_timestamp(ts, sizeof(ts), dmsg->task.time);
+	fprintf(fp, "DLOP timestamp=%s tid=%d sid=%s base=%"PRIx64" libname=\"%s\"\n",
+		ts, dmsg->task.tid, dmsg->sid, dmsg->base_addr, libname);
+
+	fclose(fp);
+	free(fname);
+}
+
+static void check_data_order(struct ftrace_file_handle *handle)
+{
+	union {
+		struct ftrace_ret_stack s;
+		uint64_t d[2];
+	} data;
+
+	handle->needs_byte_swap = (get_elf_endian() != handle->hdr.endian);
+	if (handle->needs_byte_swap)
+		pr_dbg("byte order is different!\n");
+
+	/* the s.magic should be in bit[3:5] in the second word */
+	data.d[1] = RECORD_MAGIC << 3;
+
+	handle->needs_bit_swap = (data.s.magic != RECORD_MAGIC);
+	if (handle->needs_bit_swap)
+		pr_dbg("bitfield order is different!\n");
 }
 
 #define RECORD_MSG  "Was '%s' compiled with -pg or\n"		\
@@ -276,6 +353,7 @@ retry:
 	handle->nr_tasks = 0;
 	handle->tasks = NULL;
 	handle->time_filter = opts->threshold;
+	handle->time_range = opts->range;
 
 	if (fread(&handle->hdr, sizeof(handle->hdr), 1, fp) != 1)
 		pr_err("cannot read header data");
@@ -286,6 +364,8 @@ retry:
 	if (handle->hdr.version < UFTRACE_FILE_VERSION_MIN ||
 	    handle->hdr.version > UFTRACE_FILE_VERSION)
 		pr_err("unsupported file version: %u", handle->hdr.version);
+
+	check_data_order(handle);
 
 	if (read_ftrace_info(handle->hdr.info_mask, handle) < 0)
 		pr_err("cannot read ftrace header info!");
@@ -304,7 +384,7 @@ retry:
 		// read task.txt first and then try old task file
 		if (read_task_txt_file(opts->dirname, true, sym_rel) < 0 &&
 		    read_task_file(opts->dirname, true, sym_rel) < 0)
-			pr_err("invalid task file");
+			pr_warn("invalid task file\n");
 	}
 
 	if (handle->hdr.feat_mask & (ARGUMENT | RETVAL))

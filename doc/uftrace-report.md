@@ -59,10 +59,13 @@ OPTIONS
 :   Do not account functions which run under the time threshold.  If some functions explicitly have the 'trace' trigger applied, those are always accounted regardless of execution time.
 
 \--tid=*TID*[,*TID*,...]
-:   Only print functions called by the given threads.  To see the list of threads in the data file, you can use `uftrace report --threads` or `uftrace info`.
+:   Only print functions called by the given threads.  To see the list of threads in the data file, you can use `uftrace report --threads` or `uftrace info`.  This option can also be used more than once.
 
 -D *DEPTH*, \--depth *DEPTH*
 :   Set trace limit in nesting level.
+
+-r *RANGE*, \--time-range=*RANGE*
+:   Only show functions executed within the time RANGE.  The RANGE can be \<start\>~\<stop\> (separated by "~") and one of \<start\> and \<stop\> can be omitted.  The \<start\> and \<stop\> are timestamp or elapsed time if they have \<time_unit\> postfix, for example '100us'.  The timestamp or elapsed time can be shown with `-f time` or `-f elapsed` option respectively in `uftrace replay`(1).
 
 
 EXAMPLE

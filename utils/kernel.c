@@ -32,6 +32,9 @@
 
 static bool kernel_tracing_enabled;
 
+static int save_kernel_files(struct ftrace_kernel *kernel);
+static int load_kernel_files(struct ftrace_kernel *kernel);
+
 
 static char *get_tracing_file(const char *name)
 {
@@ -505,15 +508,192 @@ int finish_kernel_tracing(struct ftrace_kernel *kernel)
 	free(kernel->traces);
 	free(kernel->fds);
 
+	save_kernel_files(kernel);
+	save_kernel_symbol(kernel->output_dir);
+
 	reset_tracing_files();
 
 	return 0;
 }
 
+static const char *get_endian_str(void)
+{
+	if (get_elf_endian() == ELFDATA2LSB)
+		return "LE";
+	else
+		return "BE";
+}
+
+static int save_kernel_file(FILE *fp, const char *name)
+{
+	int fd;
+	ssize_t len;
+	char buf[4096];
+
+	snprintf(buf, sizeof(buf), "%s/%s", TRACING_DIR, name);
+
+	fd = open(buf, O_RDONLY);
+	if (fd < 0)
+		return -1;
+
+	len = read(fd, buf, sizeof(buf));
+	if (len < 0) {
+		close(fd);
+		return -1;
+	}
+
+	fprintf(fp, "TRACEFS: %s: %zd\n", name, len);
+	fwrite(buf, len, 1, fp);
+
+	close(fd);
+	return 0;
+}
+
+static int save_kernel_files(struct ftrace_kernel *kernel)
+{
+	char *path = NULL;
+	FILE *fp;
+	int ret = -1;
+
+	xasprintf(&path, "%s/kernel_header", kernel->output_dir);
+
+	fp = fopen(path, "w");
+	if (fp == NULL)
+		pr_err("cannot write kernel header");
+
+	fprintf(fp, "PAGE_SIZE: %d\n", getpagesize());
+	fprintf(fp, "LONG_SIZE: %zd\n", sizeof(long));
+	fprintf(fp, "ENDIAN: %s\n", get_endian_str());
+
+	if (save_kernel_file(fp, "events/header_page") < 0)
+		goto out;
+
+	if (save_kernel_file(fp, "events/ftrace/funcgraph_entry/format") < 0)
+		goto out;
+
+	if (save_kernel_file(fp, "events/ftrace/funcgraph_exit/format") < 0)
+		goto out;
+
+	ret = 0;
+
+out:
+	fclose(fp);
+	free(path);
+	return ret;
+}
+
+/* provided for backward compatibility */
+static int load_current_kernel(struct ftrace_kernel *kernel)
+{
+	int fd;
+	size_t len;
+	char buf[4096];
+	bool is_big_endian = !strcmp(get_endian_str(), "BE");
+	struct pevent *pevent = kernel->pevent;
+
+	pevent_set_long_size(pevent, sizeof(long));
+	pevent_set_page_size(pevent, getpagesize());
+	pevent_set_file_bigendian(pevent, is_big_endian);
+	pevent_set_host_bigendian(pevent, is_big_endian);
+
+	fd = open(TRACING_DIR"/events/header_page", O_RDONLY);
+	if (fd < 0)
+		return -1;
+
+	len = read(fd, buf, sizeof(buf));
+	pevent_parse_header_page(pevent, buf, len, sizeof(long));
+	close(fd);
+
+	fd = open(TRACING_DIR"/events/ftrace/funcgraph_entry/format", O_RDONLY);
+	if (fd < 0)
+		return -1;
+
+	len = read(fd, buf, sizeof(buf));
+	pevent_parse_event(pevent, buf, len, "ftrace");
+	close(fd);
+
+	fd = open(TRACING_DIR"/events/ftrace/funcgraph_exit/format", O_RDONLY);
+	if (fd < 0)
+		return -1;
+
+	len = read(fd, buf, sizeof(buf));
+	pevent_parse_event(pevent, buf, len, "ftrace");
+	close(fd);
+
+	return 0;
+}
+
+static int load_kernel_files(struct ftrace_kernel *kernel)
+{
+	char *path = NULL;
+	FILE *fp;
+	char buf[4096];
+	struct pevent *pevent = kernel->pevent;
+	int ret = 0;
+
+	xasprintf(&path, "%s/kernel_header", kernel->output_dir);
+
+	fp = fopen(path, "r");
+	if (fp == NULL)  /* old data doesn't have the kernel header */
+		return load_current_kernel(kernel);
+
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		char name[128];
+		size_t len;
+
+		if (strncmp(buf, "TRACEFS:", 8) != 0) {
+			char val[32];
+
+			sscanf(buf, "%[^:]: %s\n", name, val);
+
+			if (!strcmp(name, "PAGE_SIZE")) {
+				ret = strtol(val, NULL, 0);
+				pevent_set_page_size(pevent, ret);
+			}
+			else if (!strcmp(name, "LONG_SIZE")) {
+				ret = strtol(val, NULL, 0);
+				pevent_set_long_size(pevent, ret);
+			}
+			else if (!strcmp(name, "ENDIAN")) {
+				ret = (strcmp(val, "BE") == 0);
+				pevent_set_file_bigendian(pevent, ret);
+
+				ret = (strcmp(get_endian_str(), "BE") == 0);
+				pevent_set_host_bigendian(pevent, ret);
+			}
+			continue;
+		}
+
+		sscanf(buf, "TRACEFS: %[^:]: %zd\n", name, &len);
+
+		if (fread(buf, 1, len, fp) != len) {
+			ret = -1;
+			break;
+		}
+
+		if (!strcmp(name, "events/header_page")) {
+			pevent_parse_header_page(pevent, buf, len,
+						 pevent_get_long_size(pevent));
+		}
+		else if (!strcmp(name, "events/ftrace/funcgraph_entry/format") ||
+			 !strcmp(name, "events/ftrace/funcgraph_exit/format")) {
+			ret = pevent_parse_event(pevent, buf, len, "ftrace");
+			if (ret != 0) {
+				pevent_strerror(pevent, ret, buf, len);
+				pr_err_ns("%s: %s\n", name, buf);
+			}
+		}
+	}
+
+	fclose(fp);
+	free(path);
+	return ret;
+}
+
 static size_t trace_pagesize;
 static struct trace_seq trace_seq;
 static struct ftrace_ret_stack trace_rstack = {
-	.unused = FTRACE_UNUSED,
+	.magic = RECORD_MAGIC,
 };
 
 static int prepare_kbuffer(struct ftrace_kernel *kernel, int cpu);
@@ -541,8 +721,6 @@ static int scandir_filter(const struct dirent *d)
 int setup_kernel_data(struct ftrace_kernel *kernel)
 {
 	int i;
-	int fd;
-	size_t len;
 	char buf[4096];
 	enum kbuffer_endian endian = KBUFFER_ENDIAN_LITTLE;
 	enum kbuffer_long_size longsize = KBUFFER_LSIZE_8;
@@ -557,6 +735,11 @@ int setup_kernel_data(struct ftrace_kernel *kernel)
 	kernel->nr_cpus = scandir(kernel->output_dir, &list, scandir_filter, versionsort);
 	if (kernel->nr_cpus <= 0) {
 		pr_log("cannot find kernel trace data\n");
+		return -1;
+	}
+
+	if (load_kernel_files(kernel) < 0) {
+		pr_out("cannot read kernel header: %m\n");
 		return -1;
 	}
 
@@ -575,14 +758,11 @@ int setup_kernel_data(struct ftrace_kernel *kernel)
 	kernel->missed_events = xcalloc(kernel->nr_cpus, sizeof(*kernel->missed_events));
 	kernel->tids          = xcalloc(kernel->nr_cpus, sizeof(*kernel->tids));
 
-	/* FIXME: should read recorded data file */
-	pevent_set_long_size(kernel->pevent, sizeof(long));
-	trace_pagesize = getpagesize(); /* pevent_get_page_size() */
-
 	if (pevent_is_file_bigendian(kernel->pevent))
 		endian = KBUFFER_ENDIAN_BIG;
 	if (pevent_get_long_size(kernel->pevent) == 4)
 		longsize = KBUFFER_LSIZE_4;
+	trace_pagesize = pevent_get_page_size(kernel->pevent);
 
 	for (i = 0; i < kernel->nr_cpus; i++) {
 		struct stat stbuf;
@@ -618,32 +798,6 @@ int setup_kernel_data(struct ftrace_kernel *kernel)
 		pr_dbg("failed to access to kernel trace data: %s: %m\n", buf);
 		return -1;
 	}
-
-	fd = open(TRACING_DIR"/events/header_page", O_RDONLY);
-	if (fd < 0)
-		return -1;
-
-	len = read(fd, buf, sizeof(buf));
-	pevent_parse_header_page(kernel->pevent, buf, len, pevent_get_long_size(kernel->pevent));
-	close(fd);
-
-	fd = open(TRACING_DIR"/events/ftrace/funcgraph_entry/format", O_RDONLY);
-	if (fd < 0)
-		return -1;
-
-	len = read(fd, buf, sizeof(buf));
-	pevent_parse_event(kernel->pevent, buf, len, "ftrace");
-	close(fd);
-
-	fd = open(TRACING_DIR"/events/ftrace/funcgraph_exit/format", O_RDONLY);
-	if (fd < 0)
-		return -1;
-
-	len = read(fd, buf, sizeof(buf));
-	pevent_parse_event(kernel->pevent, buf, len, "ftrace");
-	close(fd);
-
-	/* TODO: read /proc/kallsyms and register functions */
 
 	pevent_register_event_handler(kernel->pevent, -1, "ftrace", "funcgraph_entry",
 				      funcgraph_entry_handler, NULL);
@@ -698,7 +852,8 @@ static int prepare_kbuffer(struct ftrace_kernel *kernel, int cpu)
 	kernel->mmaps[cpu] = mmap(NULL, trace_pagesize, PROT_READ, MAP_PRIVATE,
 				  kernel->fds[cpu], kernel->offsets[cpu]);
 	if (kernel->mmaps[cpu] == MAP_FAILED) {
-		pr_dbg("loading kbuffer for cpu %d failed", cpu);
+		pr_dbg("loading kbuffer for cpu %d (fd: %d, offset: %lu, pagesize: %zd) failed\n",
+		       cpu, kernel->fds[cpu], kernel->offsets[cpu], trace_pagesize);
 		return -1;
 	}
 
@@ -837,7 +992,7 @@ static int read_kernel_cpu(struct ftrace_file_handle *handle, int cpu)
 		struct ftrace_session *sess = first_session;
 		struct ftrace_task_handle *task;
 		struct ftrace_trigger tr = {};
-		unsigned long real_addr;
+		uint64_t real_addr;
 		uint64_t time_filter = handle->time_filter;
 
 		curr = &kernel->rstacks[cpu];
@@ -848,6 +1003,9 @@ static int read_kernel_cpu(struct ftrace_file_handle *handle, int cpu)
 		tid = kernel->tids[cpu];
 		task = get_task_handle(handle, tid);
 		if (task == NULL)
+			continue;
+
+		if (!check_time_range(&handle->time_range, curr->time))
 			continue;
 
 		if (prev_tid == -1)
@@ -862,7 +1020,7 @@ static int read_kernel_cpu(struct ftrace_file_handle *handle, int cpu)
 		 * it might set TRACE trigger, which shows
 		 * function even if it's less than the time filter.
 		 */
-		ftrace_match_filter(&sess->filters, real_addr, &tr);
+		uftrace_match_filter(real_addr, &sess->filters, &tr);
 
 		if (curr->type == FTRACE_ENTRY) {
 			/* it needs to wait until matching exit found */
@@ -969,8 +1127,10 @@ int read_kernel_stack(struct ftrace_file_handle *handle,
 	int first_tid = -1;
 	uint64_t first_timestamp = 0;
 	struct ftrace_kernel *kernel = handle->kern;
-	struct ftrace_ret_stack *first_rstack = NULL;
+	struct ftrace_ret_stack *first_rstack;
 
+retry:
+	first_rstack = NULL;
 	for (i = 0; i < kernel->nr_cpus; i++) {
 		uint64_t timestamp;
 
@@ -996,6 +1156,12 @@ int read_kernel_stack(struct ftrace_file_handle *handle,
 		return -1;
 
 	*taskp = get_task_handle(handle, first_tid);
+	if (*taskp == NULL) {
+		/* force re-read on that cpu */
+		kernel->rstack_valid[first_cpu] = false;
+		goto retry;
+	}
+
 	memcpy(&(*taskp)->kstack, first_rstack, sizeof(*first_rstack));
 
 	return first_cpu;

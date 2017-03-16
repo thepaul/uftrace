@@ -25,21 +25,29 @@ class TestBase:
 
     default_cflags = ['-fno-inline', '-fno-builtin', '-fno-omit-frame-pointer']
 
-    def __init__(self, name, result, lang='C', cflags='', ldflags=''):
+    def __init__(self, name, result, lang='C', cflags='', ldflags='', sort='task'):
         self.name = name
         self.result = result
         self.cflags = cflags
         self.ldflags = ldflags
         self.lang = lang
+        self.sort_method = sort
 
-    def build(self, cflags='', ldflags=''):
+    def set_debug(self, dbg):
+        self.debug = dbg
+
+    def pr_debug(self, msg):
+        if self.debug:
+            print(msg)
+
+    def build(self, name, cflags='', ldflags=''):
         if self.lang not in TestBase.supported_lang:
-#            print("%s: unsupported language: %s" % (self.name, self.lang))
+            pr_debug("%s: unsupported language: %s" % (name, self.lang))
             return TestBase.TEST_UNSUPP_LANG
 
         lang = TestBase.supported_lang[self.lang]
-        prog = 't-' + self.name
-        src  = 's-' + self.name + lang['ext']
+        prog = 't-' + name
+        src  = 's-' + name + lang['ext']
 
         build_cflags  = ' '.join(TestBase.default_cflags + [self.cflags, cflags, \
                                   os.getenv(lang['flags'], '')])
@@ -49,18 +57,80 @@ class TestBase:
         build_cmd = '%s -o %s %s %s %s' % \
                     (lang['cc'], prog, build_cflags, src, build_ldflags)
 
-#        print("build command:", build_cmd)
+        self.pr_debug("build command: %s" % build_cmd)
         try:
-            return sp.call(build_cmd.split(), stdout=sp.PIPE, stderr=sp.PIPE)
+            if sp.call(build_cmd.split(), stdout=sp.PIPE, stderr=sp.PIPE) != 0:
+                return TestBase.TEST_BUILD_FAIL
+            return TestBase.TEST_SUCCESS
         except:
             return TestBase.TEST_BUILD_FAIL
+
+    def build_libabc(self, cflags='', ldflags=''):
+        lang = TestBase.supported_lang['C']
+
+        build_cflags  = ' '.join(TestBase.default_cflags + [self.cflags, cflags, \
+                                  os.getenv(lang['flags'], '')])
+        build_ldflags = ' '.join([self.ldflags, ldflags, \
+                                  os.getenv('LDFLAGS', '')])
+
+        lib_cflags = build_cflags + ' -shared -fPIC'
+
+        # build libabc_test_lib.so library
+        build_cmd = '%s -o libabc_test_lib.so %s s-lib.c %s' % \
+                    (lang['cc'], lib_cflags, build_ldflags)
+
+        self.pr_debug("build command for library: %s" % build_cmd)
+        if sp.call(build_cmd.split(), stdout=sp.PIPE) != 0:
+            return TestBase.TEST_BUILD_FAIL
+        return 0
+
+    def build_libfoo(self, name, cflags='', ldflags=''):
+        prog = 't-' + name
+        lang = TestBase.supported_lang['C++']
+
+        build_cflags  = ' '.join(TestBase.default_cflags + [self.cflags, cflags, \
+                                  os.getenv(lang['flags'], '')])
+        build_ldflags = ' '.join([self.ldflags, ldflags, \
+                                  os.getenv('LDFLAGS', '')])
+
+        lib_cflags = build_cflags + ' -shared -fPIC'
+
+        # build lib{foo}.so library
+        build_cmd = '%s -o lib%s.so %s s-lib%s%s %s' % \
+                    (lang['cc'], name, lib_cflags, name, lang['ext'], build_ldflags)
+
+        self.pr_debug("build command for library: %s" % build_cmd)
+        if sp.call(build_cmd.split(), stdout=sp.PIPE) != 0:
+            return TestBase.TEST_BUILD_FAIL
+        return 0
+
+    def build_libmain(self, exename, srcname, libs, cflags='', ldflags=''):
+        if self.lang not in TestBase.supported_lang:
+            self.pr_debug("%s: unsupported language: %s" % (self.name, self.lang))
+            return TestBase.TEST_UNSUPP_LANG
+
+        lang = TestBase.supported_lang[self.lang]
+        prog = 't-' + exename
+        build_cflags  = ' '.join(TestBase.default_cflags +
+                                 [self.cflags, cflags, os.getenv(lang['flags'], '')])
+        build_ldflags = ' '.join([self.ldflags, ldflags, os.getenv('LDFLAGS', '')])
+        exe_ldflags = build_ldflags + ' -Wl,-rpath,$ORIGIN -L. '
+        for lib in libs:
+            exe_ldflags += ' -l' + lib[3:-3]
+
+        build_cmd = '%s -o %s %s %s %s' % (lang['cc'], prog, build_cflags, srcname, exe_ldflags)
+
+        self.pr_debug("build command for executable: %s" % build_cmd)
+        if sp.call(build_cmd.split(), stdout=sp.PIPE) != 0:
+            return TestBase.TEST_BUILD_FAIL
+        return 0
 
     def runcmd(self):
         """ This function returns (shell) command that runs the test.
             A test case can extend this to setup a complex configuration.  """
         return '%s %s' % (TestBase.ftrace, 't-' + self.name)
 
-    def sort(self, output, ignore_children=False):
+    def task_sort(self, output, ignore_children=False):
         """ This function post-processes output of the test to be compared .
             It ignores blank and comment (#) lines and remaining functions.  """
         pids = {}
@@ -96,10 +166,122 @@ class TestBase:
                 result += '\n'.join(pids[pid_list[0]]['result'])
             else:
                 for p in pid_list:
-                    result += '\n'.join(pids[p]['result'])
+                    result += '\n'.join(pids[p]['result']) + '\n'
+                result = result.strip()
         except:
-            pass  # this leads to failuire with 'NG'
+            pass  # this leads to a failure with 'NG'
         return result
+
+    def simple_sort(self, output, ignored):
+        """ This function post-processes output of the test to be compared .
+            It ignores blank and comment (#) lines and remaining functions.  """
+        result = []
+        for ln in output.split('\n'):
+            # ignore blank lines and comments
+            if ln.strip() == '' or ln.startswith('#'):
+                continue
+            func = ln.split('|', 1)[-1]
+            result.append(func)
+
+        return '\n'.join(result)
+
+    def report_sort(self, output, ignored):
+        """ This function post-processes output of the test to be compared .
+            It ignores blank and comment (#) lines and remaining functions.  """
+        result = []
+        for ln in output.split('\n'):
+            if ln.strip() == '':
+                continue
+            line = ln.split()
+            if line[0] == 'Total':
+                continue
+            if line[0].startswith('='):
+                continue
+            # A report line consists of following data
+            # [0]         [1]   [2]        [3]   [4]     [5]
+            # total_time  unit  self_time  unit  called  function
+            if line[5].startswith('__'):
+                continue
+            result.append('%s %s' % (line[4], line[5]))
+
+        return '\n'.join(result)
+
+    def graph_sort(self, output, ignored):
+        """ This function post-processes output of the test to be compared.
+            It ignores blank and comment (#) lines and header lines.  """
+        result = []
+        mode = 0
+        for ln in output.split('\n'):
+            if ln.strip() == '' or ln.startswith('#') or ln.startswith('='):
+                continue
+            # A graph result consists of backtrace and calling functions
+            if ln.startswith('backtrace'):
+                mode = 1
+                continue
+            if ln.startswith('calling'):
+                mode = 2
+                continue
+            if mode == 1:
+                if ln.startswith(' backtrace #'):
+                    result.append(ln.split(',')[0])  # remove time part
+                if ln.startswith('   ['):
+                    result.append(ln.split('(')[0])  # remove '(addr)' part
+            if mode == 2:
+                result.append(ln.split(':')[1])      # remove time part
+
+        return '\n'.join(result)
+
+    def dump_sort(self, output, ignored):
+        """ This function post-processes output of the test to be compared .
+            It ignores blank and comment (#) lines and remaining functions.  """
+        import re
+
+        # A (raw) dump result consists of following data
+        # <timestamp> <tid>: [<type>] <func>(<addr>) depth: <N>
+        mode = 1
+        patt = re.compile(r'[^[]*(?P<type>\[(entry|exit )\]) (?P<func>[_a-z0-9]*)\([0-9a-f]+\) (?P<depth>.*)')
+        result = []
+        for ln in output.split('\n'):
+            if ln.startswith('uftrace'):
+                result.append(ln)
+            else:
+                m = patt.match(ln)
+                if m is None:
+                    continue
+                # ignore __monstartup and __cxa_atexit
+                if m.group('func').startswith('__'):
+                    continue
+                result.append(patt.sub(r'\g<type> \g<depth> \g<func>', ln))
+
+        return '\n'.join(result)
+
+    def chrome_sort(self, output, ignored):
+        """ This function post-processes output of the test to be compared .
+            It ignores blank and comment (#) lines and remaining functions.  """
+        import json
+
+        # A chrome dump results consists of following JSON object:
+        # {"ts": <timestamp>, "ph": <type>, "pid": <number>, "name": <func>}
+        result = []
+        try:
+            o = json.loads(output)
+        except:
+            return ''
+        for ln in o['traceEvents']:
+            if ln['name'].startswith('__'):
+                continue
+            result.append("%s %s" % (ln['ph'], ln['name']))
+        return '\n'.join(result)
+
+    def sort(self, output, ignore_children=False):
+        if not hasattr(TestBase, self.sort_method + '_sort'):
+            print('cannot find the sort function: %s' % self.sort_method)
+            return ''  # this leads to a failure with 'NG'
+        func = TestBase.__dict__[self.sort_method + '_sort']
+        if callable(func):
+            return func(self, output, ignore_children)
+        else:
+            return ''  # this leads to a failure with 'NG'
 
     def pre(self):
         """This function is called before running a testcase"""
@@ -119,7 +301,7 @@ class TestBase:
         ret = TestBase.TEST_SUCCESS
 
         test_cmd = self.runcmd()
-#        print("test command: %s" % test_cmd)
+        self.pr_debug("test command: %s" % test_cmd)
 
         p = sp.Popen(test_cmd, shell=True, stdout=sp.PIPE, stderr=sp.PIPE)
 
@@ -133,7 +315,8 @@ class TestBase:
 
         result_expect = self.sort(self.result)
         signal.alarm(5)
-        result_tested = self.sort(p.communicate()[0].decode())  # for python3
+        result_origin = p.communicate()[0].decode()
+        result_tested = self.sort(result_origin)  # for python3
         signal.alarm(0)
 
         ret = p.wait()
@@ -143,10 +326,16 @@ class TestBase:
             else:
                 return TestBase.TEST_ABNORMAL_EXIT
         if ret > 0:
+            if ret == 2:
+                return TestBase.TEST_ABNORMAL_EXIT
             return TestBase.TEST_NONZERO_RETURN
 
-#        print(result_expect)
-#        print(result_tested)
+        self.pr_debug("=========== %s =============\n%s" % ("expected", result_expect))
+        self.pr_debug("=========== %s =============\n%s" % ("original", result_origin))
+        self.pr_debug("=========== %s =============\n%s" % ("result", result_tested))
+
+        if result_expect.strip() == '':
+            return TestBase.TEST_DIFF_RESULT
 
         if result_expect != result_tested:
             result_expect = self.sort(self.fixup(cflags, self.result))
@@ -211,18 +400,19 @@ result_string = {
     TestBase.TEST_SUCCESS_FIXED:  'OK: Test almost succeeded',
 }
 
-def run_single_case(case, flags, opts, diff):
+def run_single_case(case, flags, opts, diff, dbg):
     result = []
 
     # for python3
     _locals = locals()
     exec("import %s; tc = %s.TestCase()" % (case, case), globals(), _locals)
     tc = _locals['tc']
+    tc.set_debug(dbg)
 
     for flag in flags:
         for opt in opts:
             cflags = ' '.join(["-" + flag, "-" + opt])
-            ret = tc.build(cflags)
+            ret = tc.build(tc.name, cflags)
             if ret == TestBase.TEST_SUCCESS:
                 ret = tc.pre()
                 if ret == TestBase.TEST_SUCCESS:
@@ -260,6 +450,8 @@ def parse_argument():
                         help="profiling with -finstrument-functions option")
     parser.add_argument("-d", "--diff", dest='diff', action='store_true',
                         help="show diff result if not matched")
+    parser.add_argument("-v", "--verbose", dest='debug', action='store_true',
+                        help="show internal command and result for debugging")
 
     return parser.parse_args()
 
@@ -291,7 +483,7 @@ if __name__ == "__main__":
         testcases = sorted(glob.glob('t???_*.py'))
         for tc in testcases:
             name = tc[:-3]  # remove '.py'
-            result = run_single_case(name, flags, opts.split(), arg.diff)
+            result = run_single_case(name, flags, opts.split(), arg.diff, arg.debug)
             print_test_result(name, result)
     else:
         try:
@@ -299,6 +491,7 @@ if __name__ == "__main__":
         except:
             print("cannot find testcase for : %s" % arg.case)
             sys.exit(1)
-        for testcase in sorted(testcases):
-            result = run_single_case(testcase[:-3], flags, opts.split(), arg.diff)
-            print_test_result(testcase[:-3], result)
+        for tc in sorted(testcases):
+            name = tc[:-3]  # remove '.py'
+            result = run_single_case(name, flags, opts.split(), arg.diff, arg.debug)
+            print_test_result(name, result)

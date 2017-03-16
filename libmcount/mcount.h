@@ -130,6 +130,7 @@ struct mcount_thread_data {
 	bool				recursion_guard;
 	bool				plthook_guard;
 	unsigned long			plthook_addr;
+	unsigned long			cygprof_dummy;
 	struct mcount_ret_stack		*rstack;
 	void				*argbuf;
 	struct filter_control		filter;
@@ -159,12 +160,15 @@ extern unsigned long plthook_resolver_addr;
 
 extern void __monstartup(unsigned long low, unsigned long high);
 extern void mcount_return(void);
-extern void mcount_prepare(void);
+extern struct mcount_thread_data * mcount_prepare(void);
 extern uint64_t mcount_gettime(void);
 extern bool mcount_check_rstack(struct mcount_thread_data *mtdp);
 extern void ftrace_send_message(int type, void *data, size_t len);
 extern const char *session_name(void);
 extern int gettid(struct mcount_thread_data *mtdp);
+
+extern void mcount_rstack_restore(void);
+extern void mcount_rstack_reset(void);
 
 extern void prepare_shmem_buffer(struct mcount_thread_data *mtdp);
 extern void get_new_shmem_buffer(struct mcount_thread_data *mtdp);
@@ -174,12 +178,13 @@ extern void shmem_finish(struct mcount_thread_data *mtdp);
 
 extern int hook_pltgot(char *exename, unsigned long offset);
 extern void plthook_setup(struct symtabs *symtabs);
+extern unsigned long plthook_return(void);
 extern void setup_dynsym_indexes(struct symtabs *symtabs);
 extern void destroy_dynsym_indexes(void);
 
 static inline bool mcount_should_stop(void)
 {
-	return !mcount_setup_done || mcount_finished || mtd.recursion_guard;
+	return !mcount_setup_done || mcount_finished;
 }
 
 struct ftrace_trigger;

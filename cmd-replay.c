@@ -12,10 +12,259 @@
 #include "utils/symbol.h"
 #include "utils/filter.h"
 #include "utils/fstack.h"
+#include "utils/list.h"
 
 
 static int column_index;
 static int prev_tid = -1;
+
+enum replay_field_id {
+	REPLAY_F_NONE           = 0,
+	REPLAY_F_DURATION,
+	REPLAY_F_TID,
+	REPLAY_F_ADDR,
+	REPLAY_F_TIMESTAMP,
+	REPLAY_F_TIMEDELTA,
+	REPLAY_F_ELAPSED,
+};
+
+struct replay_field {
+	struct list_head list;
+	enum replay_field_id id;
+	const char *name;
+	const char *header;
+	int length;
+	bool used;
+	void (*print)(struct ftrace_task_handle *task,
+		      struct fstack *fstack, void *arg);
+};
+
+static LIST_HEAD(output_fields);
+
+#define NO_TIME  (void *)1  /* to suppress duration */
+
+static void print_duration(struct ftrace_task_handle *task,
+			   struct fstack *fstack, void *arg)
+{
+	uint64_t d = 0;
+
+	/* any non-NULL argument suppresses the output */
+	if (fstack && arg == NULL)
+		d = fstack->total_time;
+
+	print_time_unit(d);
+}
+
+static void print_tid(struct ftrace_task_handle *task,
+		      struct fstack *fstack, void *arg)
+{
+	pr_out("[%5d]", task->tid);
+}
+
+static void print_addr(struct ftrace_task_handle *task,
+		       struct fstack *fstack, void *arg)
+{
+	/* uftrace records (truncated) 48-bit addresses */
+	int width = sizeof(long) == 4 ? 8 : 12;
+
+	if (fstack == NULL)  /* LOST */
+		pr_out("%*s", width, "");
+	else
+		pr_out("%*lx", width, fstack->addr);
+}
+
+static void print_timestamp(struct ftrace_task_handle *task,
+			    struct fstack *fstack, void *arg)
+{
+	uint64_t  sec = task->timestamp / NSEC_PER_SEC;
+	uint64_t nsec = task->timestamp % NSEC_PER_SEC;
+
+	pr_out("%8"PRIu64".%09"PRIu64, sec, nsec);
+}
+
+static void print_timedelta(struct ftrace_task_handle *task,
+			    struct fstack *fstack, void *arg)
+{
+	uint64_t delta = 0;
+
+	if (task->timestamp_last)
+		delta = task->timestamp - task->timestamp_last;
+
+	print_time_unit(delta);
+}
+
+static void print_elapsed(struct ftrace_task_handle *task,
+			  struct fstack *fstack, void *arg)
+{
+	uint64_t elapsed = task->timestamp - task->h->time_range.first;
+
+	print_time_unit(elapsed);
+}
+
+static struct replay_field field_duration = {
+	.id      = REPLAY_F_DURATION,
+	.name    = "duration",
+	.header  = " DURATION ",
+	.length  = 10,
+	.print   = print_duration,
+	.list    = LIST_HEAD_INIT(field_duration.list),
+};
+
+static struct replay_field field_tid = {
+	.id      = REPLAY_F_TID,
+	.name    = "tid",
+	.header  = "  TID  ",
+	.length  = 7,
+	.print   = print_tid,
+	.list    = LIST_HEAD_INIT(field_tid.list),
+};
+
+static struct replay_field field_addr = {
+	.id      = REPLAY_F_ADDR,
+	.name    = "addr",
+#if __SIZEOF_LONG == 4
+	.header  = "  ADDR  ",
+	.length  = 8,
+#else
+	.header  = "   ADDRESS  ",
+	.length  = 12,
+#endif
+	.print   = print_addr,
+	.list    = LIST_HEAD_INIT(field_addr.list),
+};
+
+static struct replay_field field_time = {
+	.id      = REPLAY_F_TIMESTAMP,
+	.name    = "time",
+	.header  = "     TIMESTAMP    ",
+	.length  = 18,
+	.print   = print_timestamp,
+	.list    = LIST_HEAD_INIT(field_time.list),
+};
+
+static struct replay_field field_delta = {
+	.id      = REPLAY_F_TIMEDELTA,
+	.name    = "delta",
+	.header  = " TIMEDELTA",
+	.length  = 10,
+	.print   = print_timedelta,
+	.list    = LIST_HEAD_INIT(field_delta.list),
+};
+
+static struct replay_field field_elapsed = {
+	.id      = REPLAY_F_ELAPSED,
+	.name    = "elapsed",
+	.header  = "  ELAPSED ",
+	.length  = 10,
+	.print   = print_elapsed,
+	.list    = LIST_HEAD_INIT(field_elapsed.list),
+};
+
+static void print_header(void)
+{
+	struct replay_field *field;
+
+	pr_out("#");
+	list_for_each_entry(field, &output_fields, list)
+		pr_out("%s ", field->header);
+
+	if (!list_empty(&output_fields))
+		pr_out(" ");
+
+	pr_out(" FUNCTION\n");
+}
+
+struct replay_field *field_table[] = {
+	&field_duration,
+	&field_tid,
+	&field_addr,
+	&field_time,
+	&field_delta,
+	&field_elapsed,
+};
+
+static void print_field(struct ftrace_task_handle *task,
+			struct fstack *fstack, void *arg)
+{
+	struct replay_field *field;
+
+	if (list_empty(&output_fields))
+		return;
+
+	pr_out(" ");
+	list_for_each_entry(field, &output_fields, list) {
+		field->print(task, fstack, arg);
+		pr_out(" ");
+	}
+	pr_out("|");
+}
+
+static void print_empty_field(void)
+{
+	struct replay_field *field;
+
+	if (list_empty(&output_fields))
+		return;
+
+	pr_out(" ");
+	list_for_each_entry(field, &output_fields, list)
+		pr_out("%*s ", field->length, "");
+	pr_out("|");
+}
+
+static void add_field(struct replay_field *field)
+{
+	if (field->used)
+		return;
+
+	field->used = true;
+	list_add_tail(&field->list, &output_fields);
+}
+
+static void setup_field(struct opts *opts)
+{
+	struct replay_field *field;
+	unsigned i;
+	char *str, *p, *s;
+
+	if (!strcmp(opts->fields, "none"))
+		return;
+
+	s = str = xstrdup(opts->fields);
+
+	if (*str == '+') {
+		/* prepend default fields */
+		add_field(field_table[0]);  /* duration */
+		add_field(field_table[1]);  /* tid */
+		s++;
+	}
+
+	p = strtok(s, ",");
+	while (p) {
+		for (i = 0; i < ARRAY_SIZE(field_table); i++) {
+			field = field_table[i];
+
+			if (strcmp(field->name, p))
+				continue;
+
+			add_field(field);
+			break;
+		}
+
+		if (i == ARRAY_SIZE(field_table)) {
+			pr_out("uftrace: Unknown field name '%s'\n", p);
+			pr_out("uftrace:   Possible fields are:");
+			for (i = 0; i < ARRAY_SIZE(field_table); i++)
+				pr_out(" %s", field_table[i]->name);
+			pr_out("\n");
+			exit(1);
+		}
+
+		p = strtok(NULL, ",");
+	}
+
+	free(str);
+}
 
 static int task_column_depth(struct ftrace_task_handle *task, struct opts *opts)
 {
@@ -37,16 +286,32 @@ static void print_backtrace(struct ftrace_task_handle *task)
 	char *name;
 
 	for (i = 0; i < task->stack_count - 1; i++) {
+		struct replay_field *field;
+
 		fstack = &task->func_stack[i];
 		sess = find_task_session(task->tid, fstack->total_time);
 
-		if (sess)
+		if (sess || is_kernel_address(fstack->addr)) {
 			sym = find_symtabs(&sess->symtabs, fstack->addr);
+			if (sym == NULL && sess)
+				sym = session_find_dlsym(sess, fstack->total_time,
+							 fstack->addr);
+		}
 		else
 			sym = NULL;
 
+		pr_out(" ");
+		list_for_each_entry(field, &output_fields, list) {
+			if (field->id == REPLAY_F_DURATION)
+				pr_out("%*s", field->length, "backtrace");
+			else
+				field->print(task, fstack, NULL);
+			pr_out(" ");
+		}
+		if (!list_empty(&output_fields))
+			pr_out("|");
+
 		name = symbol_getname(sym, fstack->addr);
-		pr_out("  backtrace [%5d] |", task->tid);
 		pr_gray(" /* [%2d] %s */\n", i, name);
 		symbol_putname(sym, name);
 	}
@@ -60,15 +325,18 @@ static int print_flat_rstack(struct ftrace_file_handle *handle,
 	struct ftrace_ret_stack *rstack = task->rstack;
 	struct ftrace_session *sess = find_task_session(task->tid, rstack->time);
 	struct symtabs *symtabs;
-	struct sym *sym;
+	struct sym *sym = NULL;
 	char *name;
 	struct fstack *fstack;
 
-	if (sess == NULL)
-		return 0;
+	if (sess || is_kernel_address(rstack->addr)) {
+		symtabs = &sess->symtabs;
+		sym = find_symtabs(symtabs, rstack->addr);
+		if (sym == NULL && sess)
+			sym = session_find_dlsym(sess, rstack->time,
+						 rstack->addr);
+	}
 
-	symtabs = &sess->symtabs;
-	sym = find_symtabs(symtabs, rstack->addr);
 	name = symbol_getname(sym, rstack->addr);
 	fstack = &task->func_stack[rstack->depth];
 
@@ -91,8 +359,10 @@ static int print_flat_rstack(struct ftrace_file_handle *handle,
 
 static void print_task_newline(int current_tid)
 {
-	if (prev_tid != -1 && current_tid != prev_tid)
-		pr_out(" %7s %2s %7s |\n", "", "", "");
+	if (prev_tid != -1 && current_tid != prev_tid) {
+		print_empty_field();
+		pr_out("\n");
+	}
 
 	prev_tid = current_tid;
 }
@@ -103,6 +373,7 @@ void get_argspec_string(struct ftrace_task_handle *task,
 {
 	int i = 0, n = 0;
 	char str[64];
+
 	const int null_str = -1;
 	void *data = task->args.data;
 	struct list_head *arg_list = task->args.args;
@@ -294,6 +565,7 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 	struct sym *sym = NULL;
 	enum argspec_string_bits str_mode = 0;
 	char *symname = NULL;
+	char args[1024];
 
 	if (task == NULL)
 		return 0;
@@ -302,11 +574,13 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 		goto lost;
 
 	sess = find_task_session(task->tid, rstack->time);
-	if (sess == NULL && !is_kernel_address(rstack->addr))
-		return 0;
-
-	symtabs = &sess->symtabs;
-	sym = find_symtabs(symtabs, rstack->addr);
+	if (sess || is_kernel_address(rstack->addr)) {
+		symtabs = &sess->symtabs;
+		sym = find_symtabs(symtabs, rstack->addr);
+		if (sym == NULL && sess)
+			sym = session_find_dlsym(sess, rstack->time,
+						 rstack->addr);
+	}
 	symname = symbol_getname(sym, rstack->addr);
 
 	if (rstack->type == FTRACE_ENTRY && symname[strlen(symname) - 1] != ')')
@@ -318,12 +592,14 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 			goto out;
 	}
 
-	char args[1024];
+	task->timestamp_last = task->timestamp;
+	task->timestamp = rstack->time;
+
 	if (rstack->type == FTRACE_ENTRY) {
 		struct ftrace_task_handle *next = NULL;
 		struct fstack *fstack;
 		int rstack_depth = rstack->depth;
-		int depth = task->display_depth;
+		int depth;
 		struct ftrace_trigger tr = {
 			.flags = 0,
 		};
@@ -332,6 +608,9 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 		ret = fstack_entry(task, rstack, &tr);
 		if (ret < 0)
 			goto out;
+
+		/* display depth is set in fstack_entry() */
+		depth = task->display_depth;
 
 		/* give a new line when tid is changed */
 		if (opts->task_newline)
@@ -366,9 +645,8 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 			}
 			get_argspec_string(task, retval, sizeof(retval), str_mode);
 
-			print_time_unit(fstack->total_time);
-
-			pr_out(" [%5d] | %*s", task->tid, depth * 2, "");
+			print_field(task, fstack, NULL);
+			pr_out(" %*s", depth * 2, "");
 			if (tr.flags & TRIGGER_FL_COLOR) {
 				pr_color(tr.color, "%s", symname);
 				pr_out("%s%s\n", args, retval);
@@ -382,8 +660,8 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 		}
 		else {
 			/* function entry */
-			print_time_unit(0UL);
-			pr_out(" [%5d] | %*s", task->tid, depth * 2, "");
+			print_field(task, fstack, NO_TIME);
+			pr_out(" %*s", depth * 2, "");
 			if (tr.flags & TRIGGER_FL_COLOR) {
 				pr_color(tr.color, "%s", symname);
 				pr_out("%s {\n", args);
@@ -417,8 +695,8 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 			if (opts->task_newline)
 				print_task_newline(task->tid);
 
-			print_time_unit(fstack->total_time);
-			pr_out(" [%5d] | %*s}%s", task->tid, depth * 2, "", retval);
+			print_field(task, fstack, NULL);
+			pr_out(" %*s}%s", depth * 2, "", retval);
 			if (opts->comment)
 				pr_gray(" /* %s */\n", symname);
 			else
@@ -441,8 +719,7 @@ lost:
 		if (opts->task_newline)
 			print_task_newline(task->tid);
 
-		print_time_unit(0UL);
-		pr_out(" [%5d] |", task->tid);
+		print_field(task, NULL, NO_TIME);
 
 		if (losts > 0)
 			pr_red(" %*s/* LOST %d records!! */\n",
@@ -458,15 +735,14 @@ out:
 
 static void print_warning(struct ftrace_task_handle *task)
 {
-	print_time_unit(0UL);
-	pr_out(" %7s |", "");
+	print_empty_field();
 	pr_red(" %*s/* inverted time: broken data? */\n",
 	       (task->display_depth + 1) * 2, "");
 }
 
 static bool skip_sys_exit(struct opts *opts, struct ftrace_task_handle *task)
 {
-	unsigned long ip;
+	uint64_t ip;
 
 	if (task->func_stack == NULL)
 		return true;
@@ -479,7 +755,7 @@ static bool skip_sys_exit(struct opts *opts, struct ftrace_task_handle *task)
 	if (is_kernel_address(ip)) {
 		struct sym *sym = find_symtabs(NULL, ip);
 
-		if (!strncmp(sym->name, "sys_exit", 8))
+		if (sym && !strncmp(sym->name, "sys_exit", 8))
 			return true;
 	}
 	return false;
@@ -488,26 +764,45 @@ static bool skip_sys_exit(struct opts *opts, struct ftrace_task_handle *task)
 static void print_remaining_stack(struct opts *opts,
 				  struct ftrace_file_handle *handle)
 {
-	int i;
+	int i, k;
 	int total = 0;
 
 	for (i = 0; i < handle->nr_tasks; i++) {
-		if (skip_sys_exit(opts, &handle->tasks[i]))
+		struct ftrace_task_handle *task = &handle->tasks[i];
+		int zero_count = 0;
+
+		if (skip_sys_exit(opts, task))
 			continue;
 
-		total += handle->tasks[i].stack_count;
+		for (k = 0; k < task->stack_count; k++) {
+			if (task->func_stack[k].addr)
+				break;
+			zero_count++;
+		}
+
+		total += task->stack_count - zero_count;
 	}
 
 	if (total == 0)
 		return;
 
 	pr_out("\nuftrace stopped tracing with remaining functions");
-	pr_out("\n===============================================\n");
+	pr_out("\n================================================\n");
 
 	for (i = 0; i < handle->nr_tasks; i++) {
 		struct ftrace_task_handle *task = &handle->tasks[i];
+		int zero_count = 0;
 
 		if (task->stack_count == 0)
+			continue;
+
+		for (k = 0; k < task->stack_count; k++) {
+			if (task->func_stack[k].addr)
+				break;
+			zero_count++;
+		}
+
+		if (zero_count == task->stack_count)
 			continue;
 
 		if (skip_sys_exit(opts, task))
@@ -519,7 +814,7 @@ static void print_remaining_stack(struct opts *opts,
 			struct fstack *fstack = &task->func_stack[task->stack_count];
 			uint64_t time = fstack->total_time;
 			struct ftrace_session *sess = find_task_session(task->tid, time);
-			unsigned long ip = fstack->addr;
+			uint64_t ip = fstack->addr;
 			struct symtabs *symtabs;
 			struct sym *sym;
 			char *symname;
@@ -530,11 +825,16 @@ static void print_remaining_stack(struct opts *opts,
 			} else
 				sym = NULL;
 
+			if (sym == NULL && sess)
+				sym = session_find_dlsym(sess, time, ip);
 			symname = symbol_getname(sym, ip);
 
-			pr_out("[%d] %s\n", task->stack_count, symname);
+			pr_out("[%d] %s\n", task->stack_count - zero_count, symname);
 
 			symbol_putname(sym, symname);
+
+			if (task->stack_count == zero_count)
+				break;
 		}
 		pr_out("\n");
 	}
@@ -560,16 +860,17 @@ int command_replay(int argc, char *argv[], struct opts *opts)
 		kern.skip_out = opts->kernel_skip_out;
 		if (setup_kernel_data(&kern) == 0) {
 			handle.kern = &kern;
-			load_kernel_symbol();
+			load_kernel_symbol(opts->dirname);
 		}
 	}
 
 	fstack_setup_filters(opts, &handle);
+	setup_field(opts);
 
 	if (!opts->flat)
-		pr_out("# DURATION    TID     FUNCTION\n");
+		print_header();
 
-	while (read_rstack(&handle, &task) == 0 && !ftrace_done) {
+	while (read_rstack(&handle, &task) == 0 && !uftrace_done) {
 		struct ftrace_ret_stack *rstack = task->rstack;
 		uint64_t curr_time = rstack->time;
 

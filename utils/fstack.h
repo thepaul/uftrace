@@ -36,6 +36,7 @@ struct ftrace_task_handle {
 	bool valid;
 	bool done;
 	bool lost_seen;
+	bool fstack_set;
 	bool display_depth_set;
 	FILE *fp;
 	struct sym *func;
@@ -52,6 +53,8 @@ struct ftrace_task_handle {
 	int user_display_depth;
 	int column_index;
 	enum context ctx;
+	uint64_t timestamp;
+	uint64_t timestamp_last;
 	struct filter {
 		int	in_count;
 		int	out_count;
@@ -59,7 +62,7 @@ struct ftrace_task_handle {
 		struct time_filter_stack *time;
 	} filter;
 	struct fstack {
-		unsigned long addr;
+		uint64_t addr;
 		bool valid;
 		int orig_depth;
 		unsigned long flags;
@@ -88,6 +91,7 @@ enum argspec_string_bits {
 };
 
 extern bool fstack_enabled;
+extern bool live_disabled;
 
 void setup_task_handle(struct ftrace_file_handle *handle,
 		       struct ftrace_task_handle *task, int tid);
@@ -102,8 +106,6 @@ int peek_rstack(struct ftrace_file_handle *handle,
 void fstack_consume(struct ftrace_file_handle *handle,
 		    struct ftrace_task_handle *task);
 
-struct ftrace_ret_stack *
-get_task_ustack(struct ftrace_file_handle *handle, int idx);
 int read_task_ustack(struct ftrace_file_handle *handle,
 		     struct ftrace_task_handle *task);
 int read_task_args(struct ftrace_task_handle *task,

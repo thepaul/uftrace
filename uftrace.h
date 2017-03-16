@@ -25,6 +25,7 @@
 #define OPT_RSTACK_DEFAULT  1024
 #define OPT_DEPTH_MAX       OPT_RSTACK_MAX
 #define OPT_DEPTH_DEFAULT   OPT_RSTACK_DEFAULT
+#define OPT_FIELD_DEFAULT   (char *)"duration,tid"
 
 struct ftrace_file_header {
 	char magic[UFTRACE_MAGIC_LEN];
@@ -102,6 +103,13 @@ struct ftrace_info {
 	float load15;
 };
 
+enum {
+	UFTRACE_EXIT_SUCCESS	= 0,
+	UFTRACE_EXIT_FAILURE,
+	UFTRACE_EXIT_SIGNALED,
+	UFTRACE_EXIT_UNKNOWN,
+};
+
 struct ftrace_kernel;
 
 struct ftrace_file_handle {
@@ -114,7 +122,10 @@ struct ftrace_file_handle {
 	struct ftrace_task_handle *tasks;
 	int nr_tasks;
 	int depth;
+	bool needs_byte_swap;
+	bool needs_bit_swap;
 	uint64_t time_filter;
+	struct uftrace_time_range time_range;
 };
 
 #define UFTRACE_MODE_INVALID 0
@@ -142,6 +153,7 @@ struct opts {
 	char *args;
 	char *retval;
 	char *diff;
+	char *fields;
 	int mode;
 	int idx;
 	int depth;
@@ -181,6 +193,7 @@ struct opts {
 	bool kernel;
 	bool kernel_skip_out;
 	bool kernel_only;
+	struct uftrace_time_range range;
 };
 
 static inline bool opts_has_filter(struct opts *opts)
@@ -198,7 +211,7 @@ int command_recv(int argc, char *argv[], struct opts *opts);
 int command_dump(int argc, char *argv[], struct opts *opts);
 int command_graph(int argc, char *argv[], struct opts *opts);
 
-extern volatile bool ftrace_done;
+extern volatile bool uftrace_done;
 extern struct ftrace_proc_maps *proc_maps;
 
 int open_data_file(struct opts *opts, struct ftrace_file_handle *handle);
@@ -206,14 +219,17 @@ void close_data_file(struct opts *opts, struct ftrace_file_handle *handle);
 int read_task_file(char *dirname, bool needs_session, bool sym_rel_addr);
 int read_task_txt_file(char *dirname, bool needs_session, bool sym_rel_addr);
 
+#define SESSION_ID_LEN  16
+
 struct ftrace_session {
 	struct rb_node		 node;
-	char			 sid[16];
+	char			 sid[SESSION_ID_LEN];
 	uint64_t		 start_time;
 	int			 pid, tid;
 	struct symtabs		 symtabs;
 	struct rb_root		 filters;
 	struct rb_root		 fixups;
+	struct list_head	 dlopen_libs;
 	int 			 namelen;
 	char 			 exename[];
 };
@@ -222,6 +238,14 @@ struct ftrace_sess_ref {
 	struct ftrace_sess_ref	*next;
 	struct ftrace_session	*sess;
 	uint64_t		 start, end;
+};
+
+struct uftrace_dlopen_list {
+	struct list_head	list;
+	uint64_t		time;
+	unsigned long		base;
+	struct symtabs		symtabs;
+	char			name[];
 };
 
 struct ftrace_task {
@@ -248,6 +272,7 @@ struct ftrace_task {
 #define FTRACE_MSG_SEND_SYM      13U
 #define FTRACE_MSG_SEND_INFO     14U
 #define FTRACE_MSG_SEND_END      15U
+#define FTRACE_MSG_DLOPEN        16U
 
 /* msg format for communicating by pipe */
 struct ftrace_msg {
@@ -271,6 +296,15 @@ struct ftrace_msg_sess {
 	char exename[];
 };
 
+struct ftrace_msg_dlopen {
+	struct ftrace_msg_task task;
+	uint64_t base_addr;
+	char sid[16];
+	int  unused;
+	int  namelen;
+	char exename[];
+};
+
 extern struct ftrace_session *first_session;
 
 void create_session(struct ftrace_msg_sess *msg, char *dirname, char *exename,
@@ -280,6 +314,12 @@ struct ftrace_session *find_task_session(int pid, uint64_t timestamp);
 void create_task(struct ftrace_msg_task *msg, bool fork, bool needs_session);
 struct ftrace_task *find_task(int tid);
 void read_session_map(char *dirname, struct symtabs *symtabs, char *sid);
+struct ftrace_session * get_session_from_sid(char sid[]);
+void session_add_dlopen(struct ftrace_session *sess, const char *dirname,
+			uint64_t timestamp, unsigned long base_addr,
+			const char *libname);
+struct sym * session_find_dlsym(struct ftrace_session *sess, uint64_t timestamp,
+				unsigned long addr);
 
 typedef int (*walk_sessions_cb_t)(struct ftrace_session *session, void *arg);
 void walk_sessions(walk_sessions_cb_t callback, void *arg);
@@ -304,6 +344,8 @@ void write_task_info(const char *dirname, struct ftrace_msg_task *tmsg);
 void write_fork_info(const char *dirname, struct ftrace_msg_task *tmsg);
 void write_session_info(const char *dirname, struct ftrace_msg_sess *smsg,
 			const char *exename);
+void write_dlopen_info(const char *dirname, struct ftrace_msg_dlopen *dmsg,
+		       const char *libname);
 
 enum ftrace_ret_stack_type {
 	FTRACE_ENTRY,
@@ -311,24 +353,24 @@ enum ftrace_ret_stack_type {
 	FTRACE_LOST,
 };
 
-#define FTRACE_UNUSED_V3  0xa
-#define FTRACE_UNUSED_V4  0x5
-#define FTRACE_UNUSED     FTRACE_UNUSED_V4
+#define RECORD_MAGIC_V3  0xa
+#define RECORD_MAGIC_V4  0x5
+#define RECORD_MAGIC     RECORD_MAGIC_V4
 
 /* reduced version of mcount_ret_stack */
 struct ftrace_ret_stack {
 	uint64_t time;
 	uint64_t type:   2;
 	uint64_t more:   1;
-	uint64_t unused: 3;
+	uint64_t magic:  3;
 	uint64_t depth:  10;
 	uint64_t addr:   48;
 };
 
 static inline bool is_v3_compat(struct ftrace_ret_stack *stack)
 {
-	/* (FTRACE_UNUSED_V4 << 1 | more) == FTRACE_UNUSED_V3 */
-	return stack->unused == FTRACE_UNUSED && stack->more == 0;
+	/* (RECORD_MAGIC_V4 << 1 | more) == RECORD_MAGIC_V3 */
+	return stack->magic == RECORD_MAGIC && stack->more == 0;
 }
 
 struct fstack_arguments {

@@ -10,11 +10,11 @@
 #include "utils/utils.h"
 
 
-volatile bool ftrace_done;
+volatile bool uftrace_done;
 
 void sighandler(int sig)
 {
-	ftrace_done = true;
+	uftrace_done = true;
 }
 
 void setup_signal(void)
@@ -165,6 +165,8 @@ int create_directory(char *dirname)
 	}
 
 	ret = mkdir(dirname, 0755);
+	if (ret < 0)
+		pr_log("creating directory failed: %m\n");
 
 out:
 	free(oldname);
@@ -226,4 +228,33 @@ char *read_exename(void)
 	}
 
 	return exename;
+}
+
+bool check_time_range(struct uftrace_time_range *range, uint64_t timestamp)
+{
+	/* maybe it's called before first timestamp set */
+	if (!range->first)
+		range->first = timestamp;
+
+	if (range->start) {
+		uint64_t start = range->start;
+
+		if (range->start_elapsed)
+			start += range->first;
+
+		if (start > timestamp)
+			return false;
+	}
+
+	if (range->stop) {
+		uint64_t stop = range->stop;
+
+		if (range->stop_elapsed)
+			stop += range->first;
+
+		if (stop < timestamp)
+			return false;
+	}
+
+	return true;
 }

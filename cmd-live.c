@@ -6,6 +6,7 @@
 
 #include "uftrace.h"
 #include "utils/utils.h"
+#include "utils/fstack.h"
 #include "libmcount/mcount.h"
 
 
@@ -32,18 +33,21 @@ static void cleanup_tempdir(void)
 
 		snprintf(path, sizeof(path), "%s/%s", tmp_dirname, ent->d_name);
 		if (unlink(path) < 0)
-			pr_err("unlink failed: %s: %m\n", path);
+			pr_err("unlink failed: %s", path);
 	}
 
 	closedir(dp);
 
 	if (rmdir(tmp_dirname) < 0)
-		pr_err("rmdir failed: %s: %m\n", tmp_dirname);
+		pr_err("rmdir failed: %s", tmp_dirname);
 	tmp_dirname = NULL;
 }
 
 static void reset_live_opts(struct opts *opts)
 {
+	/* this is needed to set display_depth at replay */
+	live_disabled = opts->disabled;
+
 	/*
 	 * These options are handled in record and no need to do it in
 	 * replay again.
@@ -51,6 +55,7 @@ static void reset_live_opts(struct opts *opts)
 	opts->filter	= NULL;
 	opts->depth	= MCOUNT_DEFAULT_DEPTH;
 	opts->disabled	= false;
+	opts->threshold = 0;
 }
 
 static void sigsegv_handler(int sig)
@@ -67,6 +72,7 @@ int command_live(int argc, char *argv[], struct opts *opts)
 	struct sigaction sa = {
 		.sa_flags = SA_RESETHAND,
 	};
+	int ret;
 
 	if (fd < 0)
 		pr_err("cannot create temp name");
@@ -83,20 +89,29 @@ int command_live(int argc, char *argv[], struct opts *opts)
 
 	opts->dirname = template;
 
-	if (command_record(argc, argv, opts) == 0 && !opts->nop) {
+	ret = command_record(argc, argv, opts);
+	if (!opts->nop) {
+		int ret2;
+
+		reset_live_opts(opts);
+
 		pr_dbg("live-record finished.. \n");
 		if (opts->report) {
 			pr_out("#\n# uftrace report\n#\n");
-			command_report(argc, argv, opts);
+			ret2 = command_report(argc, argv, opts);
+			if (ret == UFTRACE_EXIT_SUCCESS)
+				ret = ret2;
+
 			pr_out("\n#\n# uftrace replay\n#\n");
 		}
 
 		pr_dbg("start live-replaying...\n");
-		reset_live_opts(opts);
-		command_replay(argc, argv, opts);
+		ret2 = command_replay(argc, argv, opts);
+		if (ret == UFTRACE_EXIT_SUCCESS)
+			ret = ret2;
 	}
 
 	cleanup_tempdir();
 
-	return 0;
+	return ret;
 }

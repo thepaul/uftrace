@@ -1,0 +1,48 @@
+uftrace v0.6.2
+--------------
+* dlopen() support:
+  can show functions from dynamic loaded library using dlopen()
+
+* kernel tracing update:
+  save kernel metadata so that it can be viewed from a different machine
+  adjust tracer settings to reduce lost kernel data
+
+* filter change:
+  remove '+' sign in elapsed time for --time-range option
+  allow to use 'm' or 'min' to specify elapsed time
+
+And many bug fixes and improvements.  Thanks for all contributors:
+  Abder Benbachir, Geneviève Bastien, Honggyu Kim, Taeung Song,
+  Wonseok Ko
+
+
+uftrace v0.6.1
+--------------
+* kernel option change:
+  The -K option is same as --kernel-depth
+  The --kernel-skip-out is deprecated and use
+  The --kernel-full is to show kernel functions outside of user functions
+  The --kernel-only option was added
+
+* replay change:
+  add --output-fields option to customize the info on the left side
+  currently time, delta, elapsed, duration, tid and addr fields are supported
+
+* filter change:
+  apply time filter on replay
+  add --time-range option to limit data analysis
+  report, graph and dump honors same filter on replay
+  add 'time' trigger to set a different threshold on specific functions
+
+* flame-graph support:
+  "uftrace dump --flame-graph" creates a SVG file
+  use --sample-time option to control sampling frequency in the output
+
+* build change:
+  improve build process to facilitate distro packaging
+  configure script checks dependency and shows warning
+
+
+uftrace v0.6
+============
+* project open!

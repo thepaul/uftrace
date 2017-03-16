@@ -412,10 +412,10 @@ static void print_raw_task_rstack(struct uftrace_dump_ops *ops,
 	struct uftrace_raw_dump *raw = container_of(ops, typeof(*raw), ops);
 
 	pr_time(frs->time);
-	pr_out("%5d: [%s] %s(%lx) depth: %u\n",
+	pr_out("%5d: [%s] %s(%"PRIx64") depth: %u\n",
 	       task->tid, frs->type == FTRACE_EXIT ? "exit " :
 	       frs->type == FTRACE_ENTRY ? "entry" : "lost ",
-	       name, (unsigned long)frs->addr, frs->depth);
+	       name, frs->addr, frs->depth);
 	pr_hex(&raw->file_offset, frs, sizeof(*frs));
 
 	if (frs->more) {
@@ -463,10 +463,10 @@ static void print_raw_kernel_rstack(struct uftrace_dump_ops *ops,
 	struct uftrace_raw_dump *raw = container_of(ops, typeof(*raw), ops);
 
 	pr_time(frs->time);
-	pr_out("%5d: [%s] %s(%lx) depth: %u\n",
+	pr_out("%5d: [%s] %s(%"PRIx64") depth: %u\n",
 	       tid, frs->type == FTRACE_EXIT ? "exit " :
 	       frs->type == FTRACE_ENTRY ? "entry" : "lost",
-	       name, (unsigned long)frs->addr, frs->depth);
+	       name, frs->addr, frs->depth);
 
 	if (debug) {
 		/* this is only needed for hex dump */
@@ -533,8 +533,8 @@ static void print_chrome_task_rstack(struct uftrace_dump_ops *ops,
 
 	if (frs->type == FTRACE_ENTRY) {
 		ph = 'B';
-		pr_out("{\"ts\":%lu,\"ph\":\"%c\",\"pid\":%d,\"name\":\"%s\"",
-			frs->time / 1000, ph, task->tid, name);
+		pr_out("{\"ts\":%"PRIu64".%03d,\"ph\":\"%c\",\"pid\":%d,\"name\":\"%s\"",
+			frs->time / 1000, frs->time % 1000, ph, task->tid, name);
 		if (frs->more) {
 			str_mode |= HAS_MORE;
 			get_argspec_string(task, spec_buf, sizeof(spec_buf), str_mode);
@@ -546,8 +546,8 @@ static void print_chrome_task_rstack(struct uftrace_dump_ops *ops,
 	}
 	else if (frs->type == FTRACE_EXIT) {
 		ph = 'E';
-		pr_out("{\"ts\":%lu,\"ph\":\"%c\",\"pid\":%d,\"name\":\"%s\"",
-			frs->time / 1000, ph, task->tid, name);
+		pr_out("{\"ts\":%"PRIu64".%03d,\"ph\":\"%c\",\"pid\":%d,\"name\":\"%s\"",
+			frs->time / 1000, frs->time % 1000, ph, task->tid, name);
 		if (frs->more) {
 			str_mode |= IS_RETVAL | HAS_MORE;
 			get_argspec_string(task, spec_buf, sizeof(spec_buf), str_mode);
@@ -598,7 +598,7 @@ static void print_chrome_footer(struct uftrace_dump_ops *ops,
 	ctime_r(&statbuf.st_mtime, buf);
 	buf[strlen(buf) - 1] = '\0';
 
-	pr_out("\n], \"metadata\": {\n");
+	pr_out("\n], \"displayTimeUnit\": \"ns\", \"metadata\": {\n");
 	if (handle->hdr.info_mask & (1UL << CMDLINE))
 		pr_out("\"command_line\":\"%s\",\n", handle->info.cmdline);
 	pr_out("\"recorded_time\":\"%s\"\n", buf);
@@ -870,7 +870,7 @@ static void do_dump_file(struct uftrace_dump_ops *ops, struct opts *opts,
 
 		ops->task_start(ops, task);
 
-		while (!read_task_ustack(handle, task) && !ftrace_done) {
+		while (!read_task_ustack(handle, task) && !uftrace_done) {
 			struct ftrace_ret_stack *frs = &task->ustack;
 			struct ftrace_session *sess = find_task_session(tid, frs->time);
 			struct symtabs *symtabs;
@@ -879,6 +879,9 @@ static void do_dump_file(struct uftrace_dump_ops *ops, struct opts *opts,
 
 			/* consume the rstack as it didn't call read_rstack() */
 			fstack_consume(handle, task);
+
+			if (!check_time_range(&handle->time_range, frs->time))
+				continue;
 
 			if (prev_time > frs->time)
 				ops->inverted_time(ops, task);
@@ -890,6 +893,11 @@ static void do_dump_file(struct uftrace_dump_ops *ops, struct opts *opts,
 			if (sess) {
 				symtabs = &sess->symtabs;
 				sym = find_symtabs(symtabs, frs->addr);
+
+				if (sym == NULL)
+					sym = session_find_dlsym(sess,
+								 frs->time,
+								 frs->addr);
 			}
 
 			name = symbol_getname(sym, frs->addr);
@@ -898,7 +906,7 @@ static void do_dump_file(struct uftrace_dump_ops *ops, struct opts *opts,
 		}
 	}
 
-	if (!opts->kernel || handle->kern == NULL || ftrace_done)
+	if (!opts->kernel || handle->kern == NULL || uftrace_done)
 		goto footer;
 
 	ops->kernel_start(ops, handle->kern);
@@ -911,7 +919,7 @@ static void do_dump_file(struct uftrace_dump_ops *ops, struct opts *opts,
 
 		ops->cpu_start(ops, kernel, i);
 
-		while (!read_kernel_cpu_data(kernel, i) && !ftrace_done) {
+		while (!read_kernel_cpu_data(kernel, i) && !uftrace_done) {
 			int tid = kernel->tids[i];
 			int losts = kernel->missed_events[i];
 
@@ -919,6 +927,9 @@ static void do_dump_file(struct uftrace_dump_ops *ops, struct opts *opts,
 				ops->lost(ops, frs->time, tid, losts);
 				kernel->missed_events[i] = 0;
 			}
+
+			if (!check_time_range(&handle->time_range, frs->time))
+				continue;
 
 			sym = find_symtabs(NULL, frs->addr);
 			name = symbol_getname(sym, frs->addr);
@@ -933,49 +944,112 @@ footer:
 	ops->footer(ops, handle, opts);
 }
 
+static bool check_task_rstack(struct ftrace_task_handle *task,
+			      struct opts *opts)
+{
+	struct ftrace_ret_stack *frs = task->rstack;
+
+	if (opts->kernel) {
+		if (opts->kernel_skip_out) {
+			if (!task->user_stack_count &&
+			    is_kernel_address(frs->addr))
+				return false;
+		}
+
+		if (opts->kernel_only &&
+		    !is_kernel_address(frs->addr))
+			return false;
+	}
+
+	if (!fstack_check_filter(task))
+		return false;
+
+	return true;
+}
+
+static void dump_replay_task(struct uftrace_dump_ops *ops,
+			     struct ftrace_task_handle *task)
+{
+	struct ftrace_ret_stack *frs = task->rstack;
+	struct ftrace_session *sess;
+	struct sym *sym = NULL;
+	char *name;
+
+	sess = find_task_session(task->tid, frs->time);
+	if (sess || is_kernel_address(frs->addr)) {
+		sym = find_symtabs(&sess->symtabs, frs->addr);
+		if (sym == NULL && sess)
+			sym = session_find_dlsym(sess, frs->time,
+						 frs->addr);
+	}
+
+	name = symbol_getname(sym, frs->addr);
+	ops->task_rstack(ops, task, name);
+	symbol_putname(sym, name);
+}
+
 static void do_dump_replay(struct uftrace_dump_ops *ops, struct opts *opts,
 			   struct ftrace_file_handle *handle)
 {
 	uint64_t prev_time = 0;
 	struct ftrace_task_handle *task;
+	int i;
 
 	ops->header(ops, handle, opts);
 
-	while (!read_rstack(handle, &task) && !ftrace_done) {
+	while (!read_rstack(handle, &task) && !uftrace_done) {
 		struct ftrace_ret_stack *frs = task->rstack;
-		struct ftrace_session *sess;
-		struct symtabs *symtabs;
-		struct sym *sym = NULL;
-		char *name;
 
-		if (opts->kernel) {
-			if (opts->kernel_skip_out) {
-				if (!task->user_stack_count &&
-				    is_kernel_address(frs->addr))
-					continue;
-			}
-
-			if (opts->kernel_only &&
-			    !is_kernel_address(frs->addr))
-				continue;
-		}
-
-		sess = find_task_session(task->tid, frs->time);
-		if (sess || is_kernel_address(frs->addr)) {
-			symtabs = &sess->symtabs;
-			sym = find_symtabs(symtabs, frs->addr);
-		}
+		if (!check_task_rstack(task, opts))
+			continue;
 
 		if (prev_time > frs->time)
 			ops->inverted_time(ops, task);
 		prev_time = frs->time;
 
-		if (!fstack_check_filter(task))
+		dump_replay_task(ops, task);
+	}
+
+	/* add duration of remaining functions */
+	for (i = 0; i < handle->nr_tasks; i++) {
+		uint64_t last_time;
+
+		task = &handle->tasks[i];
+
+		if (task->stack_count == 0)
 			continue;
 
-		name = symbol_getname(sym, frs->addr);
-		ops->task_rstack(ops, task, name);
-		symbol_putname(sym, name);
+		last_time = task->rstack->time;
+
+		if (handle->time_range.stop)
+			last_time = handle->time_range.stop;
+
+		while (--task->stack_count >= 0) {
+			struct fstack *fstack;
+
+			fstack = &task->func_stack[task->stack_count];
+
+			if (fstack->addr == 0)
+				continue;
+
+			if (fstack->total_time > last_time)
+				continue;
+
+			fstack->total_time = last_time - fstack->total_time;
+			if (fstack->child_time > fstack->total_time)
+				fstack->total_time = fstack->child_time;
+
+			if (task->stack_count > 0)
+				fstack[-1].child_time += fstack->total_time;
+
+			task->rstack = &task->ustack;
+			task->rstack->time = last_time;
+			task->rstack->type = FTRACE_EXIT;
+			task->rstack->addr = fstack->addr;
+
+			if (check_task_rstack(task, opts))
+				dump_replay_task(ops, task);
+		}
 	}
 
 	ops->footer(ops, handle, opts);
@@ -996,7 +1070,7 @@ int command_dump(int argc, char *argv[], struct opts *opts)
 		kern.skip_out = opts->kernel_skip_out;
 		if (setup_kernel_data(&kern) == 0) {
 			handle.kern = &kern;
-			load_kernel_symbol();
+			load_kernel_symbol(opts->dirname);
 		}
 	}
 

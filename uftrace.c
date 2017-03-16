@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <ctype.h>
 
 /* This should be defined before #include "utils.h" */
 #define PR_FMT "uftrace"
@@ -139,6 +140,8 @@ static struct argp_option ftrace_options[] = {
 	{ "kernel-only", OPT_kernel_only, 0, 0, "Dump kernel data only" },
 	{ "flame-graph", OPT_flame_graph, 0, 0, "Dump recorded data in FlameGraph format" },
 	{ "sample-time", OPT_sample_time, "TIME", 0, "Show flame graph with this sampliing time" },
+	{ "output-fields", 'f', "FIELD", 0, "Show FIELDs in the replay output" },
+	{ "time-range", 'r', "TIME~TIME", 0, "Show output within the TIME(timestamp or elapsed time) range only" },
 	{ 0 }
 };
 
@@ -209,24 +212,24 @@ static const char * false_str[] = {
 	"false", "no", "off", "n", "0",
 };
 
-static int parse_color(char *arg)
+static enum color_setting parse_color(char *arg)
 {
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(true_str); i++) {
 		if (!strcmp(arg, true_str[i]))
-			return 1;
+			return COLOR_ON;
 	}
 
 	for (i = 0; i < ARRAY_SIZE(false_str); i++) {
 		if (!strcmp(arg, false_str[i]))
-			return 0;
+			return COLOR_OFF;
 	}
 
 	if (!strcmp(arg, "auto"))
-		return -1;
+		return COLOR_AUTO;
 
-	return -2;
+	return COLOR_UNKNOWN;
 }
 
 static int parse_demangle(char *arg)
@@ -289,22 +292,146 @@ static void parse_debug_domain(char *arg)
 	free(saved_str);
 }
 
-static uint64_t parse_time(char *arg)
+static int get_digits(uint64_t num)
 {
-	char *unit;
+	int digits = 0;
+
+	do {
+		num /= 10;
+		digits++;
+	} while (num != 0);
+
+	return digits;
+}
+
+static uint64_t parse_min(uint64_t min, uint64_t decimal, int decimal_places)
+{
+	uint64_t nsec = min * 60 * NSEC_PER_SEC;
+
+	if (decimal) {
+		decimal_places += get_digits(decimal);
+		decimal *= 6;
+
+		/* decide a unit from the number of decimal places */
+		switch (decimal_places) {
+		case 1:
+			nsec += decimal * NSEC_PER_SEC;
+			break;
+		case 2:
+			decimal *= 10;
+		case 3:
+			decimal *= 10;
+			nsec += decimal * NSEC_PER_MSEC;
+			break;
+		default:
+			break;
+		}
+	}
+	return nsec;
+}
+
+static uint64_t parse_time(char *arg, int limited_digits)
+{
+	char *unit, *pos;
+	int i, decimal_places = 0, exp = 0;
+	uint64_t limited, decimal = 0;
 	uint64_t val = strtoull(arg, &unit, 0);
 
+	pos = strchr(arg, '.');
+	if (pos != NULL) {
+		while (*(++pos) == '0')
+			decimal_places++;
+		decimal = strtoull(pos, &unit, 0);
+	}
+
+	limited = 10;
+	for (i = 1; i < limited_digits; i++)
+		limited *= 10;
+	if (val >= limited)
+		pr_err_ns("Limited %d digits (before and after decimal point)\n",
+			  limited_digits);
+	/* ignore more digits than limited digits before decimal point */
+	while (decimal >= limited)
+		decimal /=10;
+
+	/*
+	 * if the unit is omitted, it is regarded as default unit 'ns'.
+	 * so ignore it before decimal point.
+	 */
 	if (unit == NULL || *unit == '\0')
 		return val;
 
-	if (!strcasecmp(unit, "us") || !strcasecmp(unit, "usec"))
-		val *= 1000;
+	if (!strcasecmp(unit, "ns") || !strcasecmp(unit, "nsec"))
+		return val;
+	else if (!strcasecmp(unit, "us") || !strcasecmp(unit, "usec"))
+		exp = 3; /* 10^3*/
 	else if (!strcasecmp(unit, "ms") || !strcasecmp(unit, "msec"))
-		val *= 1000 * 1000;
+		exp = 6; /* 10^6 */
 	else if (!strcasecmp(unit, "s") || !strcasecmp(unit, "sec"))
-		val *= 1000 * 1000 * 1000;
+		exp = 9; /* 10^9 */
+	else if (!strcasecmp(unit, "m") || !strcasecmp(unit, "min"))
+		return parse_min(val, decimal, decimal_places);
+	else
+		pr_warn("The unit '%s' isn't supported\n", unit);
 
+	for (i = 0; i < exp; i++)
+		val *= 10;
+
+	if (decimal) {
+		decimal_places += get_digits(decimal);
+
+		for (i = decimal_places; i < exp; i++)
+			decimal *= 10;
+		val += decimal;
+	}
 	return val;
+}
+
+static bool has_time_unit(const char *str)
+{
+	if (isalpha(str[strlen(str) - 1]))
+		return true;
+	else
+		return false;
+}
+
+static uint64_t parse_timestamp(char *str, bool *elapsed)
+{
+	char *time;
+	uint64_t nsec;
+
+	if (*str == '\0')
+		return 0;
+
+	if (has_time_unit(str)) {
+		*elapsed = true;
+		return parse_time(str, 3);
+	}
+
+	if (asprintf(&time, "%ssec", str) < 0)
+		return -1;
+	nsec = parse_time(time, 9);
+	free(time);
+	return nsec;
+}
+
+static bool parse_time_range(struct uftrace_time_range *range, char *arg)
+{
+	char *str, *pos;
+
+	str = xstrdup(arg);
+
+	pos = strchr(str, '~');
+	if (pos == NULL)
+		return false;
+
+	*pos++ = '\0';
+
+	range->start = parse_timestamp(str, &range->start_elapsed);
+	range->stop  = parse_timestamp(pos, &range->stop_elapsed);
+
+	free(str);
+	return true;
 }
 
 static error_t parse_option(int key, char *arg, struct argp_state *state)
@@ -374,7 +501,11 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		break;
 
 	case 't':
-		opts->threshold = parse_time(arg);
+		opts->threshold = parse_time(arg, 3);
+		if (opts->range.start || opts->range.stop) {
+			pr_use("--time-range cannot be used with --time-filter\n");
+			opts->range.start = opts->range.stop = 0;
+		}
 		break;
 
 	case 'A':
@@ -383,6 +514,19 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 
 	case 'R':
 		opts->retval = opt_add_string(opts->retval, arg);
+		break;
+
+	case 'f':
+		opts->fields = arg;
+		break;
+
+	case 'r':
+		if (!parse_time_range(&opts->range, arg))
+			pr_use("invalid time range: %s (ignoring...)\n", arg);
+		if (opts->threshold) {
+			pr_use("--time-filter cannot be used with --time-range\n");
+			opts->threshold = 0;
+		}
 		break;
 
 	case OPT_flat:
@@ -456,9 +600,9 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 
 	case OPT_color:
 		opts->color = parse_color(arg);
-		if (opts->color == -2) {
+		if (opts->color == COLOR_UNKNOWN) {
 			pr_use("unknown color setting: %s (ignoring..)\n", arg);
-			opts->color = -1;
+			opts->color = COLOR_AUTO;
 		}
 		break;
 
@@ -574,7 +718,7 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		break;
 
 	case OPT_sample_time:
-		opts->sample_time = parse_time(arg);
+		opts->sample_time = parse_time(arg, 9);
 		break;
 
 	case ARGP_KEY_ARG:
@@ -653,10 +797,11 @@ int main(int argc, char *argv[])
 		.max_stack	= OPT_RSTACK_DEFAULT,
 		.port		= UFTRACE_RECV_PORT,
 		.use_pager	= true,
-		.color		= -1,  /* default to 'auto' (turn on if terminal) */
+		.color		= COLOR_AUTO,  /* default to 'auto' (turn on if terminal) */
 		.column_offset	= 8,
 		.comment	= true,
 		.kernel_skip_out= true,
+		.fields         = OPT_FIELD_DEFAULT,
 	};
 	struct argp argp = {
 		.options = ftrace_options,
@@ -664,6 +809,7 @@ int main(int argc, char *argv[])
 		.args_doc = "[record|replay|live|report|info|dump|recv|graph] [<program>]",
 		.doc = "uftrace -- function (graph) tracer for userspace",
 	};
+	int ret = -1;
 
 	/* this must be done before argp_parse() */
 	logfp = stderr;
@@ -699,35 +845,39 @@ int main(int argc, char *argv[])
 	setup_color(opts.color);
 	setup_signal();
 
+	if (opts.mode == UFTRACE_MODE_RECORD)
+		opts.use_pager = false;
+
 	if (opts.use_pager)
 		start_pager();
 
 	switch (opts.mode) {
 	case UFTRACE_MODE_RECORD:
-		command_record(argc, argv, &opts);
+		ret = command_record(argc, argv, &opts);
 		break;
 	case UFTRACE_MODE_REPLAY:
-		command_replay(argc, argv, &opts);
+		ret = command_replay(argc, argv, &opts);
 		break;
 	case UFTRACE_MODE_LIVE:
-		command_live(argc, argv, &opts);
+		ret = command_live(argc, argv, &opts);
 		break;
 	case UFTRACE_MODE_REPORT:
-		command_report(argc, argv, &opts);
+		ret = command_report(argc, argv, &opts);
 		break;
 	case UFTRACE_MODE_INFO:
-		command_info(argc, argv, &opts);
+		ret = command_info(argc, argv, &opts);
 		break;
 	case UFTRACE_MODE_RECV:
-		command_recv(argc, argv, &opts);
+		ret = command_recv(argc, argv, &opts);
 		break;
 	case UFTRACE_MODE_DUMP:
-		command_dump(argc, argv, &opts);
+		ret = command_dump(argc, argv, &opts);
 		break;
 	case UFTRACE_MODE_GRAPH:
-		command_graph(argc, argv, &opts);
+		ret = command_graph(argc, argv, &opts);
 		break;
 	case UFTRACE_MODE_INVALID:
+		ret = 1;
 		break;
 	}
 
@@ -736,6 +886,6 @@ int main(int argc, char *argv[])
 	if (opts.logfile)
 		fclose(logfp);
 
-	return 0;
+	return ret;
 }
 #endif /* UNIT_TEST */

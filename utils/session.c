@@ -111,6 +111,7 @@ void create_session(struct ftrace_msg_sess *msg, char *dirname, char *exename,
 	memcpy(s->exename, exename, s->namelen);
 	s->exename[s->namelen] = 0;
 	s->filters = RB_ROOT;
+	INIT_LIST_HEAD(&s->dlopen_libs);
 
 	pr_dbg2("new session: pid = %d, session = %.16s\n",
 		s->pid, s->sid);
@@ -188,6 +189,63 @@ void walk_sessions(walk_sessions_cb_t callback, void *arg)
 	}
 }
 
+struct ftrace_session * get_session_from_sid(char sid[])
+{
+	struct rb_node *n = rb_first(&sessions);
+	struct ftrace_session *s;
+
+	while (n) {
+		s = rb_entry(n, struct ftrace_session, node);
+
+		if (!memcmp(s->sid, sid, sizeof(s->sid)) != 0)
+			return s;
+
+		n = rb_next(n);
+	}
+	return NULL;
+}
+
+void session_add_dlopen(struct ftrace_session *sess, const char *dirname,
+			uint64_t timestamp, unsigned long base_addr,
+			const char *libname)
+{
+	struct uftrace_dlopen_list *udl, *pos;
+
+	udl = xmalloc(sizeof(*udl) + strlen(libname) + 1);
+	udl->time = timestamp;
+	udl->base = base_addr;
+	strcpy(udl->name, libname);
+
+	memset(&udl->symtabs, 0, sizeof(udl->symtabs));
+	udl->symtabs.flags = SYMTAB_FL_DEMANGLE | SYMTAB_FL_SKIP_DYNAMIC;
+
+	load_dlopen_symtabs(&udl->symtabs, base_addr, libname);
+
+	list_for_each_entry(pos, &sess->dlopen_libs, list) {
+		if (pos->time > timestamp)
+			break;
+	}
+	list_add_tail(&udl->list, &pos->list);
+}
+
+struct sym * session_find_dlsym(struct ftrace_session *sess, uint64_t timestamp,
+				unsigned long addr)
+{
+	struct uftrace_dlopen_list *pos, *udl = NULL;
+	struct sym *sym = NULL;
+
+	list_for_each_entry(pos, &sess->dlopen_libs, list) {
+		if (pos->time > timestamp)
+			break;
+
+		udl = pos;
+	}
+	if (udl)
+		sym = find_symtabs(&udl->symtabs, addr);
+
+	return sym;
+}
+
 static struct rb_root task_tree = RB_ROOT;
 
 static void add_session_ref(struct ftrace_task *task, struct ftrace_session *sess,
@@ -195,7 +253,10 @@ static void add_session_ref(struct ftrace_task *task, struct ftrace_session *ses
 {
 	struct ftrace_sess_ref *ref;
 
-	assert(sess);
+	if (sess == NULL) {
+		pr_dbg("task %d/%d has no session\n", task->tid, task->pid);
+		return;
+	}
 
 	if (task->sess_last) {
 		task->sess_last->next = ref = xmalloc(sizeof(*ref));

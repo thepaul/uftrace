@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
+#include <sys/epoll.h>
 
 #include "uftrace.h"
 #include "libmcount/mcount.h"
@@ -24,7 +25,7 @@
 #include "utils/list.h"
 #include "utils/filter.h"
 
-#define SHMEM_NAME_SIZE (64 - (int)sizeof(void*))
+#define SHMEM_NAME_SIZE (64 - (int)sizeof(struct list_head))
 
 struct shmem_list {
 	struct list_head list;
@@ -48,8 +49,8 @@ static LIST_HEAD(writer_list);
 
 static pthread_mutex_t free_list_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t write_list_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t write_cond = PTHREAD_COND_INITIALIZER;
 static bool buf_done;
+static int thread_ctl[2];
 
 
 static bool can_use_fast_libmcount(struct opts *opts)
@@ -80,8 +81,7 @@ static char *build_debug_domain_string(void)
 static void setup_child_environ(struct opts *opts, int pfd)
 {
 	char buf[4096];
-	const char *old_preload = getenv("LD_PRELOAD");
-	const char *old_libpath = getenv("LD_LIBRARY_PATH");
+	char *old_preload, *old_libpath;
 	bool must_use_multi_thread = check_libpthread(opts->exename);
 
 	if (opts->lib_path)
@@ -108,11 +108,17 @@ static void setup_child_environ(struct opts *opts, int pfd)
 	}
 	pr_dbg("using %s library for tracing\n", buf);
 
+	old_preload = getenv("LD_PRELOAD");
 	if (old_preload) {
-		strcat(buf, ":");
-		strcat(buf, old_preload);
+		size_t len = strlen(buf) + strlen(old_preload) + 2;
+		char *preload = xmalloc(len);
+
+		snprintf(preload, len, "%s:%s", buf, old_preload);
+		setenv("LD_PRELOAD", preload, 1);
+		free(preload);
 	}
-	setenv("LD_PRELOAD", buf, 1);
+	else
+		setenv("LD_PRELOAD", buf, 1);
 
 	if (opts->lib_path) {
 		strcpy(buf, opts->lib_path);
@@ -126,11 +132,17 @@ static void setup_child_environ(struct opts *opts, int pfd)
 	strcat(buf, INSTALL_LIB_PATH);
 #endif
 
+	old_libpath = getenv("LD_LIBRARY_PATH");
 	if (old_libpath) {
-		strcat(buf, ":");
-		strcat(buf, old_libpath);
+		size_t len = strlen(buf) + strlen(old_libpath) + 2;
+		char *libpath = xmalloc(len);
+
+		snprintf(libpath, len, "%s:%s", buf, old_libpath);
+		setenv("LD_LIBRARY_PATH", libpath, 1);
+		free(libpath);
 	}
-	setenv("LD_LIBRARY_PATH", buf, 1);
+	else
+		setenv("LD_LIBRARY_PATH", buf, 1);
 
 	if (opts->filter)
 		setenv("UFTRACE_FILTER", opts->filter, 1);
@@ -194,7 +206,7 @@ static void setup_child_environ(struct opts *opts, int pfd)
 	if(opts->disabled)
 		setenv("UFTRACE_DISABLED", "1", 1);
 
-	if (log_color) {
+	if (log_color == COLOR_ON) {
 		snprintf(buf, sizeof(buf), "%d", log_color);
 		setenv("UFTRACE_COLOR", buf, 1);
 	}
@@ -399,7 +411,8 @@ void *writer_thread(void *arg)
 	struct buf_list *buf, *pos;
 	struct writer_arg *warg = arg;
 	struct opts *opts = warg->opts;
-	int i;
+	struct pollfd pollfd[warg->nr_cpu + 1];
+	int i, dummy;
 
 	if (opts->rt_prio) {
 		struct sched_param param = {
@@ -410,39 +423,43 @@ void *writer_thread(void *arg)
 			pr_log("set scheduling param failed\n");
 	}
 
+	pollfd[0].fd = thread_ctl[0];
+	pollfd[0].events = POLLIN;
+
+	for (i = 0; i < warg->nr_cpu; i++) {
+		pollfd[i + 1].fd = warg->kern->traces[warg->cpus[i]];
+		pollfd[i + 1].events = POLLIN;
+	}
+
 	pr_dbg2("start writer thread %d\n", warg->idx);
-	while (true) {
+	while (!buf_done) {
 		LIST_HEAD(head);
+		bool check_list = false;
+
+		if (poll(pollfd, warg->nr_cpu + 1, 1000) < 0)
+			goto out;
+
+		for (i = 0; i < warg->nr_cpu + 1; i++) {
+			if (pollfd[i].revents & POLLIN) {
+				if (i == 0)
+					check_list = true;
+				else
+					record_kernel_trace_pipe(warg->kern,
+								 warg->cpus[i-1]);
+			}
+		}
+
+		if (!check_list)
+			continue;
+
+		if (read(thread_ctl[0], &dummy, sizeof(dummy)) < 0) {
+			if (errno == EAGAIN && errno == EINTR)
+				continue;
+			/* other errors are problematic */
+			break;
+		}
 
 		pthread_mutex_lock(&write_list_lock);
-		while (list_empty(&buf_write_list)) {
-			struct timespec timeout;
-
-			if (buf_done) {
-				pthread_mutex_unlock(&write_list_lock);
-				/* escape from nested loop */
-				goto out;
-			}
-
-			/* check kernel data every 1ms */
-			clock_gettime(CLOCK_REALTIME, &timeout);
-			if (opts->kernel) {
-				timeout.tv_nsec += 100000;
-
-				if (timeout.tv_nsec > NSEC_PER_SEC) {
-					timeout.tv_nsec -= NSEC_PER_SEC;
-					timeout.tv_sec++;
-				}
-			}
-			else {
-				timeout.tv_sec++;
-			}
-
-			pthread_cond_timedwait(&write_cond, &write_list_lock,
-					       &timeout);
-			if (opts->kernel)
-				break;
-		}
 
 		if (!list_empty(&buf_write_list)) {
 			/* pick first unhandled buf  */
@@ -462,13 +479,6 @@ void *writer_thread(void *arg)
 
 		pthread_mutex_unlock(&write_list_lock);
 
-		if (opts->kernel) {
-			for (i = 0; i < warg->nr_cpu; i++) {
-				record_kernel_trace_pipe(warg->kern,
-							 warg->cpus[i]);
-			}
-		}
-
 		while (!list_empty(&head)) {
 			write_buf_list(&head, opts, warg);
 
@@ -486,15 +496,19 @@ void *writer_thread(void *arg)
 			if (!opts->kernel)
 				continue;
 
+			poll(&pollfd[1], warg->nr_cpu, 0);
+
 			for (i = 0; i < warg->nr_cpu; i++) {
-				record_kernel_trace_pipe(warg->kern,
-							 warg->cpus[i]);
+				if (pollfd[i+1].revents & POLLIN) {
+					record_kernel_trace_pipe(warg->kern,
+								 warg->cpus[i]);
+				}
 			}
 		}
 	}
-out:
 	pr_dbg2("stop writer thread %d\n", warg->idx);
 
+out:
 	free(warg);
 	return NULL;
 }
@@ -545,9 +559,12 @@ static void copy_to_buffer(struct mcount_shmem_buffer *shm, char *sess_id)
 		}
 	}
 	if (list_no_entry(writer, &writer_list, list)) {
+		int kick = 1;
+
 		/* no writer is dealing with the tid */
 		list_add_tail(&buf->list, &buf_write_list);
-		pthread_cond_signal(&write_cond);
+		if (write(thread_ctl[1], &kick, sizeof(kick)) < 0 && !buf_done)
+			pr_err("copying to buffer failed");
 	}
 	pthread_mutex_unlock(&write_list_lock);
 }
@@ -605,10 +622,9 @@ static int record_mmap_file(const char *dirname, char *sess_id, int bufsize)
 
 static void stop_all_writers(void)
 {
-	pthread_mutex_lock(&write_list_lock);
 	buf_done = true;
-	pthread_cond_broadcast(&write_cond);
-	pthread_mutex_unlock(&write_list_lock);
+	close(thread_ctl[1]);
+	thread_ctl[1] = -1;
 }
 
 static void record_remaining_buffer(struct opts *opts, int sock)
@@ -794,6 +810,7 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 	struct ftrace_msg msg;
 	struct ftrace_msg_task tmsg;
 	struct ftrace_msg_sess sess;
+	struct ftrace_msg_dlopen dmsg;
 	char *exename;
 	int lost;
 
@@ -943,6 +960,23 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 			pr_err("reading pipe failed");
 
 		shmem_lost_count += lost;
+		break;
+
+	case FTRACE_MSG_DLOPEN:
+		if (msg.len < sizeof(dmsg))
+			pr_err_ns("invalid message length\n");
+
+		if (read_all(pfd, &dmsg, sizeof(dmsg)) < 0)
+			pr_err("reading pipe failed");
+
+		exename = xmalloc(dmsg.namelen + 1);
+		if (read_all(pfd, exename, dmsg.namelen) < 0)
+			pr_err("reading pipe failed");
+		exename[dmsg.namelen] = '\0';
+
+		pr_dbg2("MSG DLOPEN: %d: %#lx %s\n", dmsg.task.tid, dmsg.base_addr, exename);
+
+		write_dlopen_info(dirname, &dmsg, exename);
 		break;
 
 	default:
@@ -1148,10 +1182,10 @@ static void save_module_symbols(struct opts *opts, struct symtabs *symtabs)
 	char sid[20] = { 0, };
 	int i, maps;
 
-	ftrace_setup_filter_module(opts->filter, &modules);
-	ftrace_setup_filter_module(opts->trigger, &modules);
-	ftrace_setup_filter_module(opts->args, &modules);
-	ftrace_setup_filter_module(opts->retval, &modules);
+	ftrace_setup_filter_module(opts->filter, &modules, symtabs->filename);
+	ftrace_setup_filter_module(opts->trigger, &modules, symtabs->filename);
+	ftrace_setup_filter_module(opts->args, &modules, symtabs->filename);
+	ftrace_setup_filter_module(opts->retval, &modules, symtabs->filename);
 
 	if (list_empty(&modules))
 		return;
@@ -1244,9 +1278,8 @@ static void print_child_usage(struct rusage *ru)
 "\tThis machine type (%u) is not supported currently.\n"		\
 "\tSorry about that!\n"
 
-#define ARGUMENT_MSG  "-A and/or -R option can be used only for binaries\n" \
-"\tbuilt with -pg flag.  Use --force option if you want to proceed\n"   \
-"\twith no argument and/or return value info.\n"
+#define ARGUMENT_MSG  "uftrace: -A or -R might not work for binaries"	\
+" with -finstrument-functions\n"
 
 static void check_binary(struct opts *opts)
 {
@@ -1303,7 +1336,7 @@ static void check_binary(struct opts *opts)
 		}
 		else if (chk == 2 && (opts->args || opts->retval)) {
 			/* arg/retval doesn't support -finstrument-functions */
-			pr_err_ns(ARGUMENT_MSG);
+			pr_out(ARGUMENT_MSG);
 		}
 		else if (chk < 0) {
 			pr_err_ns("Cannot check '%s'\n", opts->exename);
@@ -1334,6 +1367,7 @@ int command_record(int argc, char *argv[], struct opts *opts)
 	int sock = -1;
 	int nr_cpu;
 	int i, k;
+	int ret = UFTRACE_EXIT_SUCCESS;
 
 	if (pipe(pfd) < 0)
 		pr_err("cannot setup internal pipe");
@@ -1395,16 +1429,18 @@ int command_record(int argc, char *argv[], struct opts *opts)
 		kern.bufsize = opts->kernel_bufsize;
 
 		if (!opts->nr_thread) {
-			if (opts->kernel_depth >= 16)
+			if (opts->kernel_depth >= 4)
 				opts->nr_thread = nr_cpu;
-			else if (opts->kernel_depth >= 8)
+			else if (opts->kernel_depth >= 2)
 				opts->nr_thread = nr_cpu / 2;
 		}
 
 		if (!opts->kernel_bufsize) {
-			if (opts->kernel_depth >= 16)
+			if (opts->kernel_depth >= 8)
 				kern.bufsize = 4096 * 1024;
-			else if (opts->kernel_depth >= 8)
+			else if (opts->kernel_depth >= 4)
+				kern.bufsize = 3072 * 1024;
+			else if (opts->kernel_depth >= 2)
 				kern.bufsize = 2048 * 1024;
 		}
 
@@ -1422,6 +1458,15 @@ int command_record(int argc, char *argv[], struct opts *opts)
 	pr_dbg("creating %d thread(s) for recording\n", opts->nr_thread);
 	writers = xmalloc(opts->nr_thread * sizeof(*writers));
 
+//	thread_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (pipe(thread_ctl) < 0)
+		pr_err("cannot create an eventfd for writer thread");
+
+	if (opts->kernel && start_kernel_tracing(&kern) < 0) {
+		opts->kernel = false;
+		pr_log("kernel tracing disabled due to an error\n");
+	}
+
 	for (i = 0; i < opts->nr_thread; i++) {
 		struct writer_arg *warg;
 		int cpu_per_thread = DIV_ROUND_UP(nr_cpu, opts->nr_thread);
@@ -1432,6 +1477,7 @@ int command_record(int argc, char *argv[], struct opts *opts)
 		warg->idx  = i;
 		warg->sock = sock;
 		warg->kern = &kern;
+		warg->nr_cpu = 0;
 		INIT_LIST_HEAD(&warg->list);
 		INIT_LIST_HEAD(&warg->bufs);
 
@@ -1449,18 +1495,13 @@ int command_record(int argc, char *argv[], struct opts *opts)
 		pthread_create(&writers[i], NULL, writer_thread, warg);
 	}
 
-	if (opts->kernel && start_kernel_tracing(&kern) < 0) {
-		opts->kernel = false;
-		pr_log("kernel tracing disabled due to an error\n");
-	}
-
 	/* signal child that I'm ready */
 	if (write(efd, &go, sizeof(go)) != (ssize_t)sizeof(go))
 		pr_err("signal to child failed");
 
 	close(efd);
 
-	while (!ftrace_done) {
+	while (!uftrace_done) {
 		struct pollfd pollfd = {
 			.fd = pfd[0],
 			.events = POLLIN,
@@ -1482,7 +1523,7 @@ int command_record(int argc, char *argv[], struct opts *opts)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts2);
 
-	while (!ftrace_done) {
+	while (!uftrace_done) {
 		if (ioctl(pfd[0], FIONREAD, &remaining) < 0)
 			break;
 
@@ -1506,15 +1547,25 @@ int command_record(int argc, char *argv[], struct opts *opts)
 
 	if (child_exited) {
 		wait4(pid, &status, WNOHANG, &usage);
-		if (WIFEXITED(status))
+		if (WIFEXITED(status)) {
 			pr_dbg("child terminated with exit code: %d\n",
 			       WEXITSTATUS(status));
-		else
+
+			if (!WEXITSTATUS(status))
+				ret = UFTRACE_EXIT_SUCCESS;
+			else
+				ret = UFTRACE_EXIT_FAILURE;
+		}
+		else {
 			pr_yellow("child terminated by signal: %d: %s\n",
 				  WTERMSIG(status), strsignal(WTERMSIG(status)));
-	} else {
+			ret = UFTRACE_EXIT_SIGNALED;
+		}
+	}
+	else {
 		status = -1;
 		getrusage(RUSAGE_CHILDREN, &usage);
+		ret = UFTRACE_EXIT_UNKNOWN;
 	}
 
 	stop_all_writers();
@@ -1534,6 +1585,7 @@ int command_record(int argc, char *argv[], struct opts *opts)
 
 	for (i = 0; i < opts->nr_thread; i++)
 		pthread_join(writers[i], NULL);
+	close(thread_ctl[0]);
 
 	flush_shmem_list(opts->dirname, opts->bufsize);
 	record_remaining_buffer(opts, sock);
@@ -1561,5 +1613,5 @@ int command_record(int argc, char *argv[], struct opts *opts)
 		chown_directory(opts->dirname);
 
 	unload_symtabs(&symtabs);
-	return 0;
+	return ret;
 }

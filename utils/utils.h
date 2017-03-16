@@ -37,6 +37,7 @@
 #define unlikely(x)  __builtin_expect(!!(x), 0)
 
 #define NSEC_PER_SEC  1000000000
+#define NSEC_PER_MSEC 1000000
 
 extern int debug;
 extern FILE *logfp;
@@ -55,6 +56,13 @@ enum debug_domain {
 };
 extern int dbg_domain[DBG_DOMAIN_MAX];
 
+enum color_setting {
+	COLOR_UNKNOWN,
+	COLOR_AUTO,
+	COLOR_OFF,
+	COLOR_ON,
+};
+
 #define COLOR_CODE_RED      'R'
 #define COLOR_CODE_GREEN    'G'
 #define COLOR_CODE_BLUE     'B'
@@ -72,9 +80,9 @@ extern void __pr_err_s(const char *fmt, ...) __attribute__((noreturn));
 extern void __pr_warn(const char *fmt, ...);
 extern void __pr_color(char code, const char *fmt, ...);
 
-extern int log_color;
-extern int out_color;
-extern void setup_color(int color);
+extern enum color_setting log_color;
+extern enum color_setting out_color;
+extern void setup_color(enum color_setting color);
 extern void setup_signal(void);
 
 #ifndef PR_FMT
@@ -115,7 +123,7 @@ extern void setup_signal(void);
 	__pr_err(PR_FMT ": %s:%d:%s\n ERROR: " fmt,		\
 		 __FILE__, __LINE__, __func__, ## __VA_ARGS__)
 
-#define pr_warn(fmt, ...)	__pr_warn(fmt, ## __VA_ARGS__)
+#define pr_warn(fmt, ...)	__pr_warn("WARN: " fmt, ## __VA_ARGS__)
 
 #define pr_cont(fmt, ...)	__pr_log(fmt, ## __VA_ARGS__)
 #define pr_out(fmt, ...)	__pr_out(fmt, ## __VA_ARGS__)
@@ -190,6 +198,29 @@ extern void setup_signal(void);
 #define htonq(x)  htobe64(x)
 #define ntohq(x)  be64toh(x)
 
+/* this comes from /usr/include/elf.h */
+#ifndef ELFDATA2LSB
+# define ELFDATA2LSB	1		/* 2's complement, little endian */
+# define ELFDATA2MSB	2		/* 2's complement, big endian */
+#endif
+
+static inline int get_elf_endian(void)
+{
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+	return ELFDATA2LSB;
+#else
+	return ELFDATA2MSB;
+#endif
+}
+
+struct uftrace_time_range {
+	uint64_t first;
+	uint64_t start;
+	uint64_t stop;
+	bool start_elapsed;
+	bool stop_elapsed;
+};
+
 struct iovec;
 
 int read_all(int fd, void *buf, size_t size);
@@ -207,5 +238,7 @@ void print_diff_percent(uint64_t base_nsec, uint64_t delta_nsec);
 
 void start_pager(void);
 void wait_for_pager(void);
+
+bool check_time_range(struct uftrace_time_range *range, uint64_t timestamp);
 
 #endif /* __FTRACE_UTILS_H__ */

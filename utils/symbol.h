@@ -10,6 +10,7 @@
 #define FTRACE_SYMBOL_H
 
 #include <stdint.h>
+#include <limits.h>
 
 #include "utils.h"
 #include "list.h"
@@ -24,7 +25,7 @@ enum symtype {
 };
 
 struct sym {
-	unsigned long addr;
+	uint64_t addr;
 	unsigned size;
 	enum symtype type;
 	char *name;
@@ -54,11 +55,14 @@ enum symtab_flag {
 	SYMTAB_FL_DEMANGLE	= (1U << 0),
 	SYMTAB_FL_USE_SYMFILE	= (1U << 1),
 	SYMTAB_FL_ADJ_OFFSET	= (1U << 2),
+	SYMTAB_FL_SKIP_NORMAL	= (1U << 3),
+	SYMTAB_FL_SKIP_DYNAMIC	= (1U << 4),
 };
 
 struct symtabs {
 	bool loaded;
 	const char *dirname;
+	const char *filename;
 	enum symtab_flag flags;
 	struct symtab symtab;
 	struct symtab dsymtab;
@@ -71,13 +75,23 @@ struct symtabs {
 # define KADDR_SHIFT  31
 #endif
 
-static inline bool is_kernel_address(unsigned long addr)
-{
-	return !!(addr & (1UL << KADDR_SHIFT));
-}
-unsigned long get_real_address(unsigned long addr);
+uint64_t kernel_base_addr;
 
-struct sym * find_symtabs(struct symtabs *symtabs, unsigned long addr);
+static inline bool is_kernel_address(uint64_t addr)
+{
+	return addr >= kernel_base_addr;
+}
+
+static inline uint64_t get_real_address(uint64_t addr)
+{
+	if (is_kernel_address(addr) && kernel_base_addr > UINT_MAX)
+		return addr | (-1ULL << KADDR_SHIFT);
+	return addr;
+}
+
+void set_kernel_base(char *dirname, const char *session_id);
+
+struct sym * find_symtabs(struct symtabs *symtabs, uint64_t addr);
 struct sym * find_symname(struct symtab *symtab, const char *name);
 void load_symtabs(struct symtabs *symtabs, const char *dirname,
 		  const char *filename);
@@ -86,6 +100,8 @@ void print_symtabs(struct symtabs *symtabs);
 
 void load_module_symtabs(struct symtabs *symtabs, struct list_head *head);
 void save_module_symtabs(struct symtabs *symtabs, struct list_head *head);
+void load_dlopen_symtabs(struct symtabs *symtabs, unsigned long offset,
+			 const char *filename);
 
 bool check_libpthread(const char *filename);
 int check_trace_functions(const char *filename);
@@ -96,14 +112,16 @@ size_t count_dynsym(struct symtabs *symtabs);
 struct ftrace_proc_maps *find_map_by_name(struct symtabs *symtabs,
 					  const char *prefix);
 
-int load_kernel_symbol(void);
+int save_kernel_symbol(char *dirname);
+int load_kernel_symbol(char *dirname);
+
 struct symtab * get_kernel_symtab(void);
 int load_symbol_file(struct symtabs *symtabs, const char *symfile,
 		     unsigned long offset);
 void save_symbol_file(struct symtabs *symtabs, const char *dirname,
 		      const char *exename);
 
-char *symbol_getname(struct sym *sym, unsigned long addr);
+char *symbol_getname(struct sym *sym, uint64_t addr);
 void symbol_putname(struct sym *sym, char *name);
 
 struct dynsym_idxlist {
