@@ -40,11 +40,11 @@ struct ftrace_task_handle {
 	bool display_depth_set;
 	FILE *fp;
 	struct sym *func;
-	struct ftrace_task *t;
+	struct uftrace_task *t;
 	struct ftrace_file_handle *h;
-	struct ftrace_ret_stack ustack;
-	struct ftrace_ret_stack kstack;
-	struct ftrace_ret_stack *rstack;
+	struct uftrace_record ustack;
+	struct uftrace_record kstack;
+	struct uftrace_record *rstack;
 	struct uftrace_rstack_list rstack_list;
 	int stack_count;
 	int lost_count;
@@ -109,17 +109,21 @@ void fstack_consume(struct ftrace_file_handle *handle,
 int read_task_ustack(struct ftrace_file_handle *handle,
 		     struct ftrace_task_handle *task);
 int read_task_args(struct ftrace_task_handle *task,
-		   struct ftrace_ret_stack *rstack,
+		   struct uftrace_record *rstack,
 		   bool is_retval);
 
+static inline bool is_kernel_record(struct ftrace_task_handle *task,
+				    struct uftrace_record *rec)
+{
+	return rec == &task->kstack;
+}
+
 void setup_task_filter(char *tid_filter, struct ftrace_file_handle *handle);
-int setup_fstack_filters(char *filter_str, char *trigger_str);
-void setup_fstack_args(char *argspec);
-void fstack_prepare_fixup(void);
+void setup_fstack_args(char *argspec, struct ftrace_file_handle *handle);
 int fstack_setup_filters(struct opts *opts, struct ftrace_file_handle *handle);
 
 int fstack_entry(struct ftrace_task_handle *task,
-		 struct ftrace_ret_stack *rstack,
+		 struct uftrace_record *rstack,
 		 struct ftrace_trigger *tr);
 void fstack_exit(struct ftrace_task_handle *task);
 int fstack_update(int type, struct ftrace_task_handle *task,

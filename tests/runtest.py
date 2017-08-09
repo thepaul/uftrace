@@ -40,6 +40,19 @@ class TestBase:
         if self.debug:
             print(msg)
 
+    def build_it(self, build_cmd):
+        try:
+            p = sp.Popen(build_cmd.split(), stderr=sp.PIPE)
+            if p.wait() != 0:
+                self.pr_debug(p.communicate()[1].decode(errors='ignore'))
+                return TestBase.TEST_BUILD_FAIL
+            return TestBase.TEST_SUCCESS
+        except OSError as e:
+            self.pr_debug(e.strerror)
+            return TestBase.TEST_BUILD_FAIL
+        except:
+            return TestBase.TEST_BUILD_FAIL
+
     def build(self, name, cflags='', ldflags=''):
         if self.lang not in TestBase.supported_lang:
             pr_debug("%s: unsupported language: %s" % (name, self.lang))
@@ -58,12 +71,7 @@ class TestBase:
                     (lang['cc'], prog, build_cflags, src, build_ldflags)
 
         self.pr_debug("build command: %s" % build_cmd)
-        try:
-            if sp.call(build_cmd.split(), stdout=sp.PIPE, stderr=sp.PIPE) != 0:
-                return TestBase.TEST_BUILD_FAIL
-            return TestBase.TEST_SUCCESS
-        except:
-            return TestBase.TEST_BUILD_FAIL
+        return self.build_it(build_cmd)
 
     def build_libabc(self, cflags='', ldflags=''):
         lang = TestBase.supported_lang['C']
@@ -80,9 +88,7 @@ class TestBase:
                     (lang['cc'], lib_cflags, build_ldflags)
 
         self.pr_debug("build command for library: %s" % build_cmd)
-        if sp.call(build_cmd.split(), stdout=sp.PIPE) != 0:
-            return TestBase.TEST_BUILD_FAIL
-        return 0
+        return self.build_it(build_cmd)
 
     def build_libfoo(self, name, cflags='', ldflags=''):
         prog = 't-' + name
@@ -100,9 +106,7 @@ class TestBase:
                     (lang['cc'], name, lib_cflags, name, lang['ext'], build_ldflags)
 
         self.pr_debug("build command for library: %s" % build_cmd)
-        if sp.call(build_cmd.split(), stdout=sp.PIPE) != 0:
-            return TestBase.TEST_BUILD_FAIL
-        return 0
+        return self.build_it(build_cmd)
 
     def build_libmain(self, exename, srcname, libs, cflags='', ldflags=''):
         if self.lang not in TestBase.supported_lang:
@@ -121,9 +125,7 @@ class TestBase:
         build_cmd = '%s -o %s %s %s %s' % (lang['cc'], prog, build_cflags, srcname, exe_ldflags)
 
         self.pr_debug("build command for executable: %s" % build_cmd)
-        if sp.call(build_cmd.split(), stdout=sp.PIPE) != 0:
-            return TestBase.TEST_BUILD_FAIL
-        return 0
+        return self.build_it(build_cmd)
 
     def runcmd(self):
         """ This function returns (shell) command that runs the test.
@@ -315,7 +317,7 @@ class TestBase:
 
         result_expect = self.sort(self.result)
         signal.alarm(5)
-        result_origin = p.communicate()[0].decode()
+        result_origin = p.communicate()[0].decode(errors='ignore')
         result_tested = self.sort(result_origin)  # for python3
         signal.alarm(0)
 
@@ -351,7 +353,7 @@ class TestBase:
                 f.close()
                 p = sp.Popen(['diff', '-U1', 'expect', 'result'], stdout=sp.PIPE)
                 print("%s: diff result of %s" % (name, cflags))
-                print(p.communicate()[0].decode())
+                print(p.communicate()[0].decode(errors='ignore'))
                 os.remove('expect')
                 os.remove('result')
             return TestBase.TEST_DIFF_RESULT
@@ -369,9 +371,9 @@ colored_result = {
     TestBase.TEST_UNSUPP_LANG:    YELLOW + 'LA' + NORMAL,
     TestBase.TEST_BUILD_FAIL:     YELLOW + 'BI' + NORMAL,
     TestBase.TEST_ABNORMAL_EXIT:  RED    + 'SG' + NORMAL,
-    TestBase.TEST_TIME_OUT:       YELLOW + 'TM' + NORMAL,
+    TestBase.TEST_TIME_OUT:       RED    + 'TM' + NORMAL,
     TestBase.TEST_DIFF_RESULT:    RED    + 'NG' + NORMAL,
-    TestBase.TEST_NONZERO_RETURN: YELLOW + 'NZ' + NORMAL,
+    TestBase.TEST_NONZERO_RETURN: RED    + 'NZ' + NORMAL,
     TestBase.TEST_SKIP:           YELLOW + 'SK' + NORMAL,
     TestBase.TEST_SUCCESS_FIXED:  YELLOW + 'OK' + NORMAL,
 }
@@ -389,15 +391,15 @@ text_result = {
 }
 
 result_string = {
-    TestBase.TEST_SUCCESS:        'OK: Test succeeded',
-    TestBase.TEST_UNSUPP_LANG:    'LA: Unsupported Language',
-    TestBase.TEST_BUILD_FAIL:     'BI: Build failed',
-    TestBase.TEST_ABNORMAL_EXIT:  'SG: Abnormal exit by signal',
-    TestBase.TEST_TIME_OUT:       'TM: Test ran too long',
-    TestBase.TEST_DIFF_RESULT:    'NG: Different test result',
-    TestBase.TEST_NONZERO_RETURN: 'NZ: Non-zero return value',
-    TestBase.TEST_SKIP:           'SK: Skipped',
-    TestBase.TEST_SUCCESS_FIXED:  'OK: Test almost succeeded',
+    TestBase.TEST_SUCCESS:        'Test succeeded',
+    TestBase.TEST_UNSUPP_LANG:    'Unsupported Language',
+    TestBase.TEST_BUILD_FAIL:     'Build failed',
+    TestBase.TEST_ABNORMAL_EXIT:  'Abnormal exit by signal',
+    TestBase.TEST_TIME_OUT:       'Test ran too long',
+    TestBase.TEST_DIFF_RESULT:    'Different test result',
+    TestBase.TEST_NONZERO_RETURN: 'Non-zero return value',
+    TestBase.TEST_SKIP:           'Skipped',
+    TestBase.TEST_SUCCESS_FIXED:  'Test succeeded (with some fixup)',
 }
 
 def run_single_case(case, flags, opts, diff, dbg):
@@ -422,14 +424,14 @@ def run_single_case(case, flags, opts, diff, dbg):
 
     return result
 
-def print_test_result(case, result):
-    if sys.stdout.isatty():
+def print_test_result(case, result, color):
+    if sys.stdout.isatty() and color:
         result_list = [colored_result[r] for r in result]
     else:
         result_list = [text_result[r] for r in result]
 
     output = case[1:4]
-    output += ' %-16s' % case[5:] + ': ' + ' '.join(result_list) + '\n'
+    output += ' %-20s' % case[5:] + ': ' + ' '.join(result_list) + '\n'
     sys.stdout.write(output)
 
 
@@ -452,17 +454,29 @@ def parse_argument():
                         help="show diff result if not matched")
     parser.add_argument("-v", "--verbose", dest='debug', action='store_true',
                         help="show internal command and result for debugging")
+    parser.add_argument("-n", "--no-color", dest='color', action='store_false',
+                        help="suppress color in the output")
 
     return parser.parse_args()
 
 if __name__ == "__main__":
     arg = parse_argument()
 
+    if arg.case == 'all':
+        testcases = glob.glob('t???_*.py')
+    else:
+        try:
+            testcases = glob.glob('t*' + arg.case + '*.py')
+        finally:
+            if len(testcases) == 0:
+                print("cannot find testcase for : %s" % arg.case)
+                sys.exit(0)
+
     opts = ' '.join(sorted(['O'+o for o in arg.opts]))
     optslen = len(opts);
 
-    header1 = '%-20s ' % 'Test case'
-    header2 = '-' * 20 + ':'
+    header1 = '%-24s ' % 'Test case'
+    header2 = '-' * 24 + ':'
     empty = '                      '
 
     if arg.pg_flag:
@@ -479,19 +493,38 @@ if __name__ == "__main__":
     print(header1)
     print(header2)
 
-    if arg.case == 'all':
-        testcases = sorted(glob.glob('t???_*.py'))
-        for tc in testcases:
-            name = tc[:-3]  # remove '.py'
-            result = run_single_case(name, flags, opts.split(), arg.diff, arg.debug)
-            print_test_result(name, result)
-    else:
-        try:
-            testcases = glob.glob('t*' + arg.case + '*.py')
-        except:
-            print("cannot find testcase for : %s" % arg.case)
-            sys.exit(1)
-        for tc in sorted(testcases):
-            name = tc[:-3]  # remove '.py'
-            result = run_single_case(name, flags, opts.split(), arg.diff, arg.debug)
-            print_test_result(name, result)
+    total = 0
+    res = []
+    res.append(TestBase.TEST_SUCCESS)
+    res.append(TestBase.TEST_SUCCESS_FIXED)
+    res.append(TestBase.TEST_DIFF_RESULT)
+    res.append(TestBase.TEST_NONZERO_RETURN)
+    res.append(TestBase.TEST_ABNORMAL_EXIT)
+    res.append(TestBase.TEST_TIME_OUT)
+    res.append(TestBase.TEST_BUILD_FAIL)
+    res.append(TestBase.TEST_UNSUPP_LANG)
+    res.append(TestBase.TEST_SKIP)
+
+    stats = dict.fromkeys(res, 0)
+
+    for tc in sorted(testcases):
+        name = tc[:-3]  # remove '.py'
+        result = run_single_case(name, flags, opts.split(), arg.diff, arg.debug)
+        print_test_result(name, result, arg.color)
+        for r in result:
+            stats[r] += 1
+            total += 1
+
+    success = stats[TestBase.TEST_SUCCESS] + stats[TestBase.TEST_SUCCESS_FIXED]
+    percent = 100.0 * success / total
+
+    print("")
+    print("runtime test stats")
+    print("====================")
+    print("total %5d  Tests executed (success: %.2f%%)" % (total, percent))
+    for r in res:
+        if sys.stdout.isatty() and arg.color:
+            result = colored_result[r]
+        else:
+            result = text_result[r]
+        print("  %s: %5d  %s" % (result, stats[r], result_string[r]))

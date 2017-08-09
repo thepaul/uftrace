@@ -1,11 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
-#include <string.h>
 #include <inttypes.h>
 #include <stdio_ext.h>
 #include <assert.h>
-#include <ctype.h>
 
 #include "uftrace.h"
 #include "utils/utils.h"
@@ -14,12 +12,14 @@
 #include "utils/fstack.h"
 #include "utils/list.h"
 
+#include "libtraceevent/event-parse.h"
+
 
 static int column_index;
 static int prev_tid = -1;
 
 enum replay_field_id {
-	REPLAY_F_NONE           = 0,
+	REPLAY_F_NONE           = -1,
 	REPLAY_F_DURATION,
 	REPLAY_F_TID,
 	REPLAY_F_ADDR,
@@ -174,6 +174,7 @@ static void print_header(void)
 	pr_out(" FUNCTION\n");
 }
 
+/* index of this table should be matched to replay_field_id */
 struct replay_field *field_table[] = {
 	&field_duration,
 	&field_tid,
@@ -227,6 +228,19 @@ static void setup_field(struct opts *opts)
 	unsigned i;
 	char *str, *p, *s;
 
+	/* default fields */
+	if (opts->fields == NULL) {
+		if (opts->range.start > 0 || opts->range.stop > 0) {
+			if (opts->range.start_elapsed || opts->range.stop_elapsed)
+				add_field(field_table[REPLAY_F_ELAPSED]);
+			else
+				add_field(field_table[REPLAY_F_TIMESTAMP]);
+		}
+		add_field(field_table[REPLAY_F_DURATION]);
+		add_field(field_table[REPLAY_F_TID]);
+		return;
+	}
+
 	if (!strcmp(opts->fields, "none"))
 		return;
 
@@ -234,8 +248,8 @@ static void setup_field(struct opts *opts)
 
 	if (*str == '+') {
 		/* prepend default fields */
-		add_field(field_table[0]);  /* duration */
-		add_field(field_table[1]);  /* tid */
+		add_field(field_table[REPLAY_F_DURATION]);
+		add_field(field_table[REPLAY_F_TID]);
 		s++;
 	}
 
@@ -279,26 +293,18 @@ static int task_column_depth(struct ftrace_task_handle *task, struct opts *opts)
 
 static void print_backtrace(struct ftrace_task_handle *task)
 {
+	struct uftrace_session_link *sessions = &task->h->sessions;
 	int i;
-	struct ftrace_session *sess;
-	struct fstack *fstack;
-	struct sym *sym;
-	char *name;
 
 	for (i = 0; i < task->stack_count - 1; i++) {
 		struct replay_field *field;
+		struct fstack *fstack;
+		struct sym *sym;
+		char *name;
 
 		fstack = &task->func_stack[i];
-		sess = find_task_session(task->tid, fstack->total_time);
-
-		if (sess || is_kernel_address(fstack->addr)) {
-			sym = find_symtabs(&sess->symtabs, fstack->addr);
-			if (sym == NULL && sess)
-				sym = session_find_dlsym(sess, fstack->total_time,
-							 fstack->addr);
-		}
-		else
-			sym = NULL;
+		sym = task_find_sym_addr(sessions, task,
+					 fstack->total_time, fstack->addr);
 
 		pr_out(" ");
 		list_for_each_entry(field, &output_fields, list) {
@@ -317,40 +323,54 @@ static void print_backtrace(struct ftrace_task_handle *task)
 	}
 }
 
+static void print_event(struct ftrace_task_handle *task,
+			struct uftrace_record *urec)
+{
+	struct event_format *event;
+
+	event = pevent_find_event(task->h->kernel.pevent, urec->addr);
+	pr_out("[%s:%s] %.*s", event->system, event->name,
+	       task->args.len, task->args.data);
+}
+
 static int print_flat_rstack(struct ftrace_file_handle *handle,
 			     struct ftrace_task_handle *task,
 			     struct opts *opts)
 {
 	static int count;
-	struct ftrace_ret_stack *rstack = task->rstack;
-	struct ftrace_session *sess = find_task_session(task->tid, rstack->time);
-	struct symtabs *symtabs;
+	struct uftrace_record *rstack = task->rstack;
+	struct uftrace_session_link *sessions = &task->h->sessions;
 	struct sym *sym = NULL;
 	char *name;
 	struct fstack *fstack;
 
-	if (sess || is_kernel_address(rstack->addr)) {
-		symtabs = &sess->symtabs;
-		sym = find_symtabs(symtabs, rstack->addr);
-		if (sym == NULL && sess)
-			sym = session_find_dlsym(sess, rstack->time,
-						 rstack->addr);
-	}
-
+	sym = task_find_sym(sessions, task, rstack);
 	name = symbol_getname(sym, rstack->addr);
 	fstack = &task->func_stack[rstack->depth];
 
-	if (rstack->type == FTRACE_ENTRY) {
+	switch (rstack->type) {
+	case UFTRACE_ENTRY:
 		pr_out("[%d] ==> %d/%d: ip (%s), time (%"PRIu64")\n",
 		       count++, task->tid, rstack->depth,
 		       name, rstack->time);
-	} else if (rstack->type == FTRACE_EXIT) {
+		break;
+
+	case UFTRACE_EXIT:
 		pr_out("[%d] <== %d/%d: ip (%s), time (%"PRIu64":%"PRIu64")\n",
 		       count++, task->tid, rstack->depth,
 		       name, rstack->time, fstack->total_time);
-	} else if (rstack->type == FTRACE_LOST) {
+		break;
+
+	case UFTRACE_LOST:
 		pr_out("[%d] XXX %d: lost %d records\n",
 		       count++, task->tid, (int)rstack->addr);
+		break;
+
+	case UFTRACE_EVENT:
+		pr_out("[%d] ", count++);
+		print_event(task, rstack);
+		pr_out("\n");
+		break;
 	}
 
 	symbol_putname(sym, name);
@@ -372,7 +392,7 @@ void get_argspec_string(struct ftrace_task_handle *task,
 		        enum argspec_string_bits str_mode)
 {
 	int i = 0, n = 0;
-	char str[64];
+	char *str = NULL;
 
 	const int null_str = -1;
 	void *data = task->args.data;
@@ -403,12 +423,11 @@ void get_argspec_string(struct ftrace_task_handle *task,
 			args[n] = '\0';
 		}
 		return;
-	} else if (!needs_escape)
-		needs_semi_colon = true;
+	}
 
 	assert(arg_list && !list_empty(arg_list));
 
-	if (!is_retval)
+	if (needs_paren)
 		args[n++] = '(';
 	else if (needs_assignment) {
 		args[n++] = ' ';
@@ -469,10 +488,24 @@ void get_argspec_string(struct ftrace_task_handle *task,
 
 		if (spec->fmt == ARG_FMT_STR) {
 			unsigned short slen;
+			unsigned short newline = 0;
+			char last_ch;
+
 			memcpy(&slen, data, 2);
 
+			last_ch = *((char *)data + slen + 1);
+			if (last_ch == '\n')
+				newline = 1;
+
+			str = xmalloc(slen + newline + 1);
 			memcpy(str, data + 2, slen);
 			str[slen] = '\0';
+
+			if (newline) {
+				str[slen - 1] = '\\';
+				str[slen]     = 'n';
+				str[slen + 1] = '\0';
+			}
 
 			if (!memcmp(str, &null_str, sizeof(null_str)))
 				n += snprintf(args + n, len, "NULL");
@@ -480,11 +513,12 @@ void get_argspec_string(struct ftrace_task_handle *task,
 				/* quotation mark has to be escaped by backslash
 				   in chrome trace json format */
 				n += snprintf(args + n, len, "\\\"%.*s\\\"",
-					      slen, str);
+					      slen + newline, str);
 			else
 				n += snprintf(args + n, len, "\"%.*s\"",
-					      slen, str);
+					      slen + newline, str);
 
+			free(str);
 			size = slen + 2;
 		}
 		else if (spec->fmt == ARG_FMT_CHAR) {
@@ -545,7 +579,8 @@ void get_argspec_string(struct ftrace_task_handle *task,
 		if (is_retval)
 			break;
 	}
-	if (!is_retval) {
+
+	if (needs_paren) {
 		args[n] = ')';
 		args[n+1] = '\0';
 	} else {
@@ -559,9 +594,8 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 			      struct ftrace_task_handle *task,
 			      struct opts *opts)
 {
-	struct ftrace_ret_stack *rstack = task->rstack;
-	struct ftrace_session *sess;
-	struct symtabs *symtabs;
+	struct uftrace_record *rstack = task->rstack;
+	struct uftrace_session_link *sessions = &handle->sessions;
 	struct sym *sym = NULL;
 	enum argspec_string_bits str_mode = 0;
 	char *symname = NULL;
@@ -570,32 +604,27 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 	if (task == NULL)
 		return 0;
 
-	if (rstack->type == FTRACE_LOST)
+	if (rstack->type == UFTRACE_LOST)
 		goto lost;
 
-	sess = find_task_session(task->tid, rstack->time);
-	if (sess || is_kernel_address(rstack->addr)) {
-		symtabs = &sess->symtabs;
-		sym = find_symtabs(symtabs, rstack->addr);
-		if (sym == NULL && sess)
-			sym = session_find_dlsym(sess, rstack->time,
-						 rstack->addr);
-	}
+	sym = task_find_sym(sessions, task, rstack);
 	symname = symbol_getname(sym, rstack->addr);
 
-	if (rstack->type == FTRACE_ENTRY && symname[strlen(symname) - 1] != ')')
-		str_mode |= NEEDS_PAREN;
+	if (rstack->type == UFTRACE_ENTRY) {
+		if(symname[strlen(symname) - 1] != ')' || rstack->more)
+			str_mode |= NEEDS_PAREN;
+	}
 
 	if (opts->kernel_skip_out) {
 		/* skip kernel functions outside user functions */
-		if (!task->user_stack_count && is_kernel_address(rstack->addr))
+		if (!task->user_stack_count && is_kernel_record(task, rstack))
 			goto out;
 	}
 
 	task->timestamp_last = task->timestamp;
 	task->timestamp = rstack->time;
 
-	if (rstack->type == FTRACE_ENTRY) {
+	if (rstack->type == UFTRACE_ENTRY) {
 		struct ftrace_task_handle *next = NULL;
 		struct fstack *fstack;
 		int rstack_depth = rstack->depth;
@@ -632,7 +661,7 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 
 		if (task == next &&
 		    next->rstack->depth == rstack_depth &&
-		    next->rstack->type == FTRACE_EXIT) {
+		    next->rstack->type == UFTRACE_EXIT) {
 			char retval[1024];
 
 			/* leaf function - also consume return record */
@@ -669,17 +698,17 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 			else
 				pr_out("%s%s {\n", symname, args);
 
-			fstack_update(FTRACE_ENTRY, task, fstack);
+			fstack_update(UFTRACE_ENTRY, task, fstack);
 		}
 	}
-	else if (rstack->type == FTRACE_EXIT) {
+	else if (rstack->type == UFTRACE_EXIT) {
 		struct fstack *fstack;
 
 		/* function exit */
 		fstack = &task->func_stack[task->stack_count];
 
 		if (!(fstack->flags & FSTACK_FL_NORECORD) && fstack_enabled) {
-			int depth = fstack_update(FTRACE_EXIT, task, fstack);
+			int depth = fstack_update(UFTRACE_EXIT, task, fstack);
 			char *retval = args;
 
 			depth += task_column_depth(task, opts);
@@ -688,6 +717,7 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 			if (rstack->more) {
 				str_mode |= HAS_MORE;
 				str_mode |= NEEDS_ASSIGNMENT;
+				str_mode |= NEEDS_SEMI_COLON;
 			}
 			get_argspec_string(task, retval, sizeof(args), str_mode);
 
@@ -705,7 +735,7 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 
 		fstack_exit(task);
 	}
-	else if (rstack->type == FTRACE_LOST) {
+	else if (rstack->type == UFTRACE_LOST) {
 		int depth, losts;
 lost:
 		depth = task->display_depth + 1;
@@ -728,6 +758,26 @@ lost:
 			pr_red(" %*s/* LOST some records!! */\n",
 			       depth * 2, "");
 	}
+	else if (rstack->type == UFTRACE_EVENT) {
+		int depth;
+
+		depth = task->display_depth;
+
+		/* skip kernel event messages outside of user functions */
+		if (opts->kernel_skip_out && task->user_stack_count == 0 &&
+		    is_kernel_record(task, rstack))
+			return 0;
+
+		/* give a new line when tid is changed */
+		if (opts->task_newline)
+			print_task_newline(task->tid);
+
+		print_field(task, NULL, NO_TIME);
+
+		pr_out(" %*s/* ", depth * 2, "");
+		print_event(task, rstack);
+		pr_out(" */\n");
+	}
 out:
 	symbol_putname(sym, symname);
 	return 0;
@@ -743,21 +793,21 @@ static void print_warning(struct ftrace_task_handle *task)
 static bool skip_sys_exit(struct opts *opts, struct ftrace_task_handle *task)
 {
 	uint64_t ip;
+	struct sym *sym;
 
 	if (task->func_stack == NULL)
 		return true;
 
 	/* skip 'sys_exit[_group] at last for kernel tracing */
-	if (!opts->kernel || task->user_stack_count != 0)
+	if (!has_kernel_data(&task->h->kernel) || task->user_stack_count != 0)
 		return false;
 
 	ip = task->func_stack[0].addr;
-	if (is_kernel_address(ip)) {
-		struct sym *sym = find_symtabs(NULL, ip);
+	sym = find_symtabs(&task->h->sessions.first->symtabs, ip);
 
-		if (sym && !strncmp(sym->name, "sys_exit", 8))
-			return true;
-	}
+	if (sym && !strncmp(sym->name, "sys_exit", 8))
+		return true;
+
 	return false;
 }
 
@@ -766,6 +816,7 @@ static void print_remaining_stack(struct opts *opts,
 {
 	int i, k;
 	int total = 0;
+	struct uftrace_session_link *sessions = &handle->sessions;
 
 	for (i = 0; i < handle->nr_tasks; i++) {
 		struct ftrace_task_handle *task = &handle->tasks[i];
@@ -813,20 +864,11 @@ static void print_remaining_stack(struct opts *opts,
 		while (task->stack_count-- > 0) {
 			struct fstack *fstack = &task->func_stack[task->stack_count];
 			uint64_t time = fstack->total_time;
-			struct ftrace_session *sess = find_task_session(task->tid, time);
 			uint64_t ip = fstack->addr;
-			struct symtabs *symtabs;
 			struct sym *sym;
 			char *symname;
 
-			if (sess || is_kernel_address(ip)) {
-				symtabs = &sess->symtabs;
-				sym = find_symtabs(symtabs, ip);
-			} else
-				sym = NULL;
-
-			if (sym == NULL && sess)
-				sym = session_find_dlsym(sess, time, ip);
+			sym = task_find_sym_addr(sessions, task, time, ip);
 			symname = symbol_getname(sym, ip);
 
 			pr_out("[%d] %s\n", task->stack_count - zero_count, symname);
@@ -846,7 +888,6 @@ int command_replay(int argc, char *argv[], struct opts *opts)
 	uint64_t prev_time = 0;
 	struct ftrace_file_handle handle;
 	struct ftrace_task_handle *task;
-	struct ftrace_kernel kern;
 
 	__fsetlocking(outfp, FSETLOCKING_BYCALLER);
 	__fsetlocking(logfp, FSETLOCKING_BYCALLER);
@@ -855,15 +896,6 @@ int command_replay(int argc, char *argv[], struct opts *opts)
 	if (ret < 0)
 		return -1;
 
-	if (opts->kernel && (handle.hdr.feat_mask & KERNEL)) {
-		kern.output_dir = opts->dirname;
-		kern.skip_out = opts->kernel_skip_out;
-		if (setup_kernel_data(&kern) == 0) {
-			handle.kern = &kern;
-			load_kernel_symbol(opts->dirname);
-		}
-	}
-
 	fstack_setup_filters(opts, &handle);
 	setup_field(opts);
 
@@ -871,11 +903,11 @@ int command_replay(int argc, char *argv[], struct opts *opts)
 		print_header();
 
 	while (read_rstack(&handle, &task) == 0 && !uftrace_done) {
-		struct ftrace_ret_stack *rstack = task->rstack;
+		struct uftrace_record *rstack = task->rstack;
 		uint64_t curr_time = rstack->time;
 
 		/* skip user functions if --kernel-only is set */
-		if (opts->kernel_only && !is_kernel_address(rstack->addr))
+		if (opts->kernel_only && !is_kernel_record(task, rstack))
 			continue;
 
 		/*
@@ -899,9 +931,6 @@ int command_replay(int argc, char *argv[], struct opts *opts)
 	}
 
 	print_remaining_stack(opts, &handle);
-
-	if (handle.kern)
-		finish_kernel_data(handle.kern);
 
 	close_data_file(opts, &handle);
 

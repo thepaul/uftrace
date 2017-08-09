@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <unistd.h>
-#include <string.h>
 #include <assert.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -72,7 +71,7 @@ void prepare_shmem_buffer(struct mcount_thread_data *mtdp)
 
 	/* set idx 0 as current buffer */
 	snprintf(buf, sizeof(buf), SHMEM_SESSION_FMT, session_name(), tid, 0);
-	ftrace_send_message(FTRACE_MSG_REC_START, buf, strlen(buf));
+	ftrace_send_message(UFTRACE_MSG_REC_START, buf, strlen(buf));
 
 	shmem->done = false;
 	shmem->curr = 0;
@@ -151,18 +150,18 @@ reuse:
 		 session_name(), gettid(mtdp), idx);
 
 	pr_dbg2("new buffer: [%d] %s\n", idx, buf);
-	ftrace_send_message(FTRACE_MSG_REC_START, buf, strlen(buf));
+	ftrace_send_message(UFTRACE_MSG_REC_START, buf, strlen(buf));
 
 	if (shmem->losts) {
-		struct ftrace_ret_stack *frstack = (void *)curr_buf->data;
+		struct uftrace_record *frstack = (void *)curr_buf->data;
 
 		frstack->time   = 0;
-		frstack->type   = FTRACE_LOST;
+		frstack->type   = UFTRACE_LOST;
 		frstack->magic  = RECORD_MAGIC;
 		frstack->more   = 0;
 		frstack->addr   = shmem->losts;
 
-		ftrace_send_message(FTRACE_MSG_LOST, &shmem->losts,
+		ftrace_send_message(UFTRACE_MSG_LOST, &shmem->losts,
 				    sizeof(shmem->losts));
 
 		curr_buf->size = sizeof(*frstack);
@@ -177,7 +176,7 @@ void finish_shmem_buffer(struct mcount_thread_data *mtdp, int idx)
 	snprintf(buf, sizeof(buf), SHMEM_SESSION_FMT,
 		 session_name(), gettid(mtdp), idx);
 
-	ftrace_send_message(FTRACE_MSG_REC_END, buf, strlen(buf));
+	ftrace_send_message(UFTRACE_MSG_REC_END, buf, strlen(buf));
 }
 
 void clear_shmem_buffer(struct mcount_thread_data *mtdp)
@@ -346,10 +345,10 @@ void save_retval(struct mcount_thread_data *mtdp,
 #endif
 
 static int record_ret_stack(struct mcount_thread_data *mtdp,
-			    enum ftrace_ret_stack_type type,
+			    enum uftrace_record_type type,
 			    struct mcount_ret_stack *mrstack)
 {
-	struct ftrace_ret_stack *frstack;
+	struct uftrace_record *frstack;
 	uint64_t timestamp = mrstack->start_time;
 	struct mcount_shmem *shmem = &mtdp->shmem;
 	const size_t maxsize = (size_t)shmem_bufsize - sizeof(**shmem->buffer);
@@ -359,8 +358,8 @@ static int record_ret_stack(struct mcount_thread_data *mtdp,
 	uint64_t *buf;
 	uint64_t rec;
 
-	if ((type == FTRACE_ENTRY && mrstack->flags & MCOUNT_FL_ARGUMENT) ||
-	    (type == FTRACE_EXIT  && mrstack->flags & MCOUNT_FL_RETVAL)) {
+	if ((type == UFTRACE_ENTRY && mrstack->flags & MCOUNT_FL_ARGUMENT) ||
+	    (type == UFTRACE_EXIT  && mrstack->flags & MCOUNT_FL_RETVAL)) {
 		argbuf = get_argbuf(mtdp, mrstack);
 		if (argbuf)
 			size += *(unsigned *)argbuf;
@@ -381,7 +380,7 @@ static int record_ret_stack(struct mcount_thread_data *mtdp,
 		curr_buf = shmem->buffer[shmem->curr];
 	}
 
-	if (type == FTRACE_EXIT)
+	if (type == UFTRACE_EXIT)
 		timestamp = mrstack->end_time;
 
 #if 0
@@ -429,7 +428,7 @@ static int record_ret_stack(struct mcount_thread_data *mtdp,
 	}
 
 	pr_dbg3("rstack[%d] %s %lx\n", mrstack->depth,
-	       type == FTRACE_ENTRY? "ENTRY" : "EXIT ", mrstack->child_ip);
+	       type == UFTRACE_ENTRY? "ENTRY" : "EXIT ", mrstack->child_ip);
 	return 0;
 }
 
@@ -438,7 +437,7 @@ int record_trace_data(struct mcount_thread_data *mtdp,
 		      long *retval)
 {
 	struct mcount_ret_stack *non_written_mrstack = NULL;
-	struct ftrace_ret_stack *frstack;
+	struct uftrace_record *frstack;
 	size_t size = 0;
 	int count = 0;
 
@@ -485,7 +484,7 @@ int record_trace_data(struct mcount_thread_data *mtdp,
 
 	while (non_written_mrstack && non_written_mrstack < mrstack) {
 		if (!(non_written_mrstack->flags & SKIP_FLAGS)) {
-			if (record_ret_stack(mtdp, FTRACE_ENTRY,
+			if (record_ret_stack(mtdp, UFTRACE_ENTRY,
 					     non_written_mrstack)) {
 				mtdp->shmem.losts += count - 1;
 				return 0;
@@ -497,7 +496,7 @@ int record_trace_data(struct mcount_thread_data *mtdp,
 	}
 
 	if (!(mrstack->flags & (MCOUNT_FL_WRITTEN | SKIP_FLAGS))) {
-		if (record_ret_stack(mtdp, FTRACE_ENTRY, non_written_mrstack))
+		if (record_ret_stack(mtdp, UFTRACE_ENTRY, non_written_mrstack))
 			return 0;
 
 		count--;
@@ -507,7 +506,7 @@ int record_trace_data(struct mcount_thread_data *mtdp,
 		if (retval)
 			save_retval(mtdp, mrstack, retval);
 
-		if (record_ret_stack(mtdp, FTRACE_EXIT, mrstack))
+		if (record_ret_stack(mtdp, UFTRACE_EXIT, mrstack))
 			return 0;
 
 		count--;
@@ -523,7 +522,6 @@ void record_proc_maps(char *dirname, const char *sess_id,
 	FILE *ifp, *ofp;
 	char buf[4096];
 	struct ftrace_proc_maps *prev_map = NULL;
-	char *last_module = NULL;
 
 	ifp = fopen("/proc/self/maps", "r");
 	if (ifp == NULL)
@@ -549,9 +547,6 @@ void record_proc_maps(char *dirname, const char *sess_id,
 
 		/* skip non-executable mappings */
 		if (prot[2] != 'x')
-			goto next;
-
-		if (last_module && !strcmp(path, last_module))
 			goto next;
 
 		/* save map for the executable */

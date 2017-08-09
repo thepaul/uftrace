@@ -1,7 +1,7 @@
 /*
- * utiltily functions and macros for ftrace
+ * utiltily functions and macros for uftrace
  *
- * Copyright (C) 2014-2016, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
+ * Copyright (C) 2014-2017, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
  *
  * Released under the GPL v2.
  */
@@ -14,6 +14,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <endian.h>
+#include <string.h>
+#include <ctype.h>
 
 
 #ifndef container_of
@@ -44,7 +46,7 @@ extern FILE *logfp;
 extern FILE *outfp;
 
 enum debug_domain {
-	DBG_FTRACE	= 0,
+	DBG_UFTRACE	= 0,
 	DBG_SYMBOL,
 	DBG_DEMANGLE,
 	DBG_FILTER,
@@ -52,6 +54,7 @@ enum debug_domain {
 	DBG_SESSION,
 	DBG_KERNEL,
 	DBG_MCOUNT,
+	DBG_DYNAMIC,
 	DBG_DOMAIN_MAX,
 };
 extern int dbg_domain[DBG_DOMAIN_MAX];
@@ -90,7 +93,7 @@ extern void setup_signal(void);
 #endif
 
 #ifndef PR_DOMAIN
-# define PR_DOMAIN  DBG_FTRACE
+# define PR_DOMAIN  DBG_UFTRACE
 #endif
 
 #define pr_dbg(fmt, ...) 					\
@@ -224,6 +227,7 @@ struct uftrace_time_range {
 struct iovec;
 
 int read_all(int fd, void *buf, size_t size);
+int pread_all(int fd, void *buf, size_t size, off_t off);
 int fread_all(void *byf, size_t size, FILE *fp);
 int write_all(int fd, void *buf, size_t size);
 int writev_all(int fd, struct iovec *iov, int count);
@@ -240,5 +244,8 @@ void start_pager(void);
 void wait_for_pager(void);
 
 bool check_time_range(struct uftrace_time_range *range, uint64_t timestamp);
+uint64_t parse_time(char *arg, int limited_digits);
+
+char * strjoin(char *left, char *right, char *delim);
 
 #endif /* __FTRACE_UTILS_H__ */

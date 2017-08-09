@@ -1,7 +1,7 @@
 /*
- * debug routines for ftrace
+ * debug routines for uftrace
  *
- * Copyright (C) 2014, LG Electronics, Namhyung Kim <namhyung@gmail.com>
+ * Copyright (C) 2014-2017, LG Electronics, Namhyung Kim <namhyung@gmail.com>
  *
  * Released under the GPL v2.
  */
@@ -9,7 +9,6 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <unistd.h>
-#include <string.h>
 #include <errno.h>
 #include <assert.h>
 #include <limits.h>
@@ -204,7 +203,7 @@ void print_time_unit(uint64_t delta_nsec)
 		return;
 	}
 
-	for (idx = 0; idx < ARRAY_SIZE(unit); idx++) {
+	for (idx = 0; idx < ARRAY_SIZE(units); idx++) {
 		delta_small = delta % limit[idx];
 		delta = delta / limit[idx];
 

@@ -1,7 +1,7 @@
 /*
  * uftrace - Function (Graph) Tracer for Userspace
  *
- * Copyright (C) 2014-2016  LG Electornics, Namhyung Kim <namhyung.kim@lge.com>
+ * Copyright (C) 2014-2017  LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,13 +19,11 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <argp.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <ctype.h>
 
 /* This should be defined before #include "utils.h" */
 #define PR_FMT "uftrace"
@@ -142,6 +140,7 @@ static struct argp_option ftrace_options[] = {
 	{ "sample-time", OPT_sample_time, "TIME", 0, "Show flame graph with this sampliing time" },
 	{ "output-fields", 'f', "FIELD", 0, "Show FIELDs in the replay output" },
 	{ "time-range", 'r', "TIME~TIME", 0, "Show output within the TIME(timestamp or elapsed time) range only" },
+	{ "patch", 'P', "FUNC", 0, "Apply dynamic patching for FUNCs" },
 	{ 0 }
 };
 
@@ -176,32 +175,22 @@ static unsigned long parse_size(char *str)
 	return size;
 }
 
-static char * opt_add_string(char *old, char *new)
+static char * opt_add_string(char *old_opt, char *new_opt)
 {
-	size_t oldlen = old ? strlen(old) : 0;
-	size_t newlen = strlen(new);
-	char *opt;
-
-	opt = xrealloc(old, oldlen + newlen + 2);
-	if (old)
-		opt[oldlen++] = ';';
-	strcpy(opt + oldlen, new);
-	return opt;
+	return strjoin(old_opt, new_opt, ";");
 }
 
-static char * opt_add_prefix_string(char *old, char *prefix, char *new)
+static char * opt_add_prefix_string(char *old_opt, char *prefix, char *new_opt)
 {
-	size_t oldlen = old ? strlen(old) : 0;
-	size_t prelen = strlen(prefix);
-	size_t newlen = strlen(new);
-	char *opt;
+	new_opt = strjoin(xstrdup(prefix), new_opt, "");
 
-	opt = xrealloc(old, oldlen + prelen + newlen + 2);
-	if (old)
-		opt[oldlen++] = ';';
-	strcpy(opt + oldlen, prefix);
-	strcpy(opt + oldlen + prelen, new);
-	return opt;
+	if (old_opt) {
+		old_opt = strjoin(old_opt, new_opt, ";");
+		free(new_opt);
+		new_opt = old_opt;
+	}
+
+	return new_opt;
 }
 
 static const char * true_str[] = {
@@ -268,8 +257,10 @@ static void parse_debug_domain(char *arg)
 			level = strtol(tmp, NULL, 0);
 		}
 
-		if (!strcmp(tok, "ftrace"))
-			dbg_domain[DBG_FTRACE] = level;
+		if (!strcmp(tok, "ftrace"))  /* for backward compatibility */
+			dbg_domain[DBG_UFTRACE] = level;
+		else if (!strcmp(tok, "uftrace"))
+			dbg_domain[DBG_UFTRACE] = level;
 		else if (!strcmp(tok, "symbol"))
 			dbg_domain[DBG_SYMBOL] = level;
 		else if (!strcmp(tok, "demangle"))
@@ -284,107 +275,14 @@ static void parse_debug_domain(char *arg)
 			dbg_domain[DBG_KERNEL] = level;
 		else if (!strcmp(tok, "mcount"))
 			dbg_domain[DBG_MCOUNT] = level;
+		else if (!strcmp(tok, "dynamic"))
+			dbg_domain[DBG_DYNAMIC] = level;
 
 		str = NULL;
 	}
 
 	dbg_domain_set = true;
 	free(saved_str);
-}
-
-static int get_digits(uint64_t num)
-{
-	int digits = 0;
-
-	do {
-		num /= 10;
-		digits++;
-	} while (num != 0);
-
-	return digits;
-}
-
-static uint64_t parse_min(uint64_t min, uint64_t decimal, int decimal_places)
-{
-	uint64_t nsec = min * 60 * NSEC_PER_SEC;
-
-	if (decimal) {
-		decimal_places += get_digits(decimal);
-		decimal *= 6;
-
-		/* decide a unit from the number of decimal places */
-		switch (decimal_places) {
-		case 1:
-			nsec += decimal * NSEC_PER_SEC;
-			break;
-		case 2:
-			decimal *= 10;
-		case 3:
-			decimal *= 10;
-			nsec += decimal * NSEC_PER_MSEC;
-			break;
-		default:
-			break;
-		}
-	}
-	return nsec;
-}
-
-static uint64_t parse_time(char *arg, int limited_digits)
-{
-	char *unit, *pos;
-	int i, decimal_places = 0, exp = 0;
-	uint64_t limited, decimal = 0;
-	uint64_t val = strtoull(arg, &unit, 0);
-
-	pos = strchr(arg, '.');
-	if (pos != NULL) {
-		while (*(++pos) == '0')
-			decimal_places++;
-		decimal = strtoull(pos, &unit, 0);
-	}
-
-	limited = 10;
-	for (i = 1; i < limited_digits; i++)
-		limited *= 10;
-	if (val >= limited)
-		pr_err_ns("Limited %d digits (before and after decimal point)\n",
-			  limited_digits);
-	/* ignore more digits than limited digits before decimal point */
-	while (decimal >= limited)
-		decimal /=10;
-
-	/*
-	 * if the unit is omitted, it is regarded as default unit 'ns'.
-	 * so ignore it before decimal point.
-	 */
-	if (unit == NULL || *unit == '\0')
-		return val;
-
-	if (!strcasecmp(unit, "ns") || !strcasecmp(unit, "nsec"))
-		return val;
-	else if (!strcasecmp(unit, "us") || !strcasecmp(unit, "usec"))
-		exp = 3; /* 10^3*/
-	else if (!strcasecmp(unit, "ms") || !strcasecmp(unit, "msec"))
-		exp = 6; /* 10^6 */
-	else if (!strcasecmp(unit, "s") || !strcasecmp(unit, "sec"))
-		exp = 9; /* 10^9 */
-	else if (!strcasecmp(unit, "m") || !strcasecmp(unit, "min"))
-		return parse_min(val, decimal, decimal_places);
-	else
-		pr_warn("The unit '%s' isn't supported\n", unit);
-
-	for (i = 0; i < exp; i++)
-		val *= 10;
-
-	if (decimal) {
-		decimal_places += get_digits(decimal);
-
-		for (i = decimal_places; i < exp; i++)
-			decimal *= 10;
-		val += decimal;
-	}
-	return val;
 }
 
 static bool has_time_unit(const char *str)
@@ -422,8 +320,10 @@ static bool parse_time_range(struct uftrace_time_range *range, char *arg)
 	str = xstrdup(arg);
 
 	pos = strchr(str, '~');
-	if (pos == NULL)
+	if (pos == NULL) {
+		free(str);
 		return false;
+	}
 
 	*pos++ = '\0';
 
@@ -527,6 +427,10 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 			pr_use("--time-filter cannot be used with --time-range\n");
 			opts->threshold = 0;
 		}
+		break;
+
+	case 'P':
+		opts->patch = opt_add_string(opts->patch, arg);
 		break;
 
 	case OPT_flat:
@@ -702,7 +606,7 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		}
 		break;
 
-	case OPT_kernel_skip_out:
+	case OPT_kernel_skip_out:  /* deprecated */
 		opts->kernel = true;
 		opts->kernel_skip_out = true;
 		break;
@@ -710,6 +614,7 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 	case OPT_kernel_full:
 		opts->kernel = true;
 		opts->kernel_skip_out = false;
+		/* see setup_kernel_tracing() also */
 		break;
 
 	case OPT_kernel_only:
@@ -801,7 +706,7 @@ int main(int argc, char *argv[])
 		.column_offset	= 8,
 		.comment	= true,
 		.kernel_skip_out= true,
-		.fields         = OPT_FIELD_DEFAULT,
+		.fields         = NULL,
 	};
 	struct argp argp = {
 		.options = ftrace_options,
@@ -845,7 +750,7 @@ int main(int argc, char *argv[])
 	setup_color(opts.color);
 	setup_signal();
 
-	if (opts.mode == UFTRACE_MODE_RECORD)
+	if (opts.mode == UFTRACE_MODE_RECORD || opts.mode == UFTRACE_MODE_RECV)
 		opts.use_pager = false;
 
 	if (opts.use_pager)

@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <string.h>
 #include <inttypes.h>
 #include <assert.h>
 
@@ -108,29 +107,26 @@ static void insert_entry(struct rb_root *root, struct trace_entry *te, bool thre
 static bool fill_entry(struct trace_entry *te, struct ftrace_task_handle *task,
 		       uint64_t time, uint64_t addr, struct opts *opts)
 {
-	struct ftrace_session *sess;
+	struct uftrace_session_link *sessions = &task->h->sessions;
+	struct uftrace_session *sess;
 	struct sym *sym;
 	struct fstack *fstack;
 	int i;
 
+	sess = sessions->first;
+
 	/* skip user functions if --kernel-only is set */
-	if (opts->kernel_only && !is_kernel_address(addr))
+	if (opts->kernel_only && !is_kernel_address(&sess->symtabs, addr))
 		return false;
 
 	if (opts->kernel_skip_out) {
 		/* skip kernel functions outside user functions */
-		if (is_kernel_address(task->func_stack[0].addr) &&
-		    is_kernel_address(addr))
+		if (task->user_stack_count == 0 &&
+		    is_kernel_address(&sess->symtabs, addr))
 			return false;
 	}
 
-	sess = find_task_session(task->tid, time);
-	if (sess == NULL && !is_kernel_address(addr))
-		return false;
-
-	sym = find_symtabs(&sess->symtabs, addr);
-	if (sym == NULL)
-		sym = session_find_dlsym(sess, time, addr);
+	sym = task_find_sym_addr(sessions, task, time, addr);
 
 	fstack = &task->func_stack[task->stack_count];
 
@@ -160,7 +156,7 @@ static void build_function_tree(struct ftrace_file_handle *handle,
 				struct rb_root *root, struct opts *opts)
 {
 	struct trace_entry te;
-	struct ftrace_ret_stack *rstack;
+	struct uftrace_record *rstack;
 	struct ftrace_task_handle *task;
 	struct fstack *fstack;
 	int i;
@@ -168,16 +164,17 @@ static void build_function_tree(struct ftrace_file_handle *handle,
 	while (read_rstack(handle, &task) >= 0 && !uftrace_done) {
 		rstack = task->rstack;
 
-		if (rstack->type != FTRACE_LOST)
+		if (rstack->type != UFTRACE_LOST)
 			task->timestamp_last = rstack->time;
 
 		if (!fstack_check_filter(task))
 			continue;
 
-		if (rstack->type == FTRACE_ENTRY)
+		if (rstack->type == UFTRACE_ENTRY ||
+		    rstack->type == UFTRACE_EVENT)
 			continue;
 
-		if (rstack->type == FTRACE_LOST) {
+		if (rstack->type == UFTRACE_LOST) {
 			/* add partial duration of functions before LOST */
 			while (task->stack_count >= task->user_stack_count) {
 				fstack = &task->func_stack[task->stack_count];
@@ -195,7 +192,7 @@ static void build_function_tree(struct ftrace_file_handle *handle,
 			continue;
 		}
 
-		/* rstack->type == FTRACE_EXIT */
+		/* rstack->type == UFTRACE_EXIT */
 		if (fill_entry(&te, task, rstack->time, rstack->addr, opts))
 			insert_entry(root, &te, false);
 	}
@@ -588,11 +585,12 @@ static void report_functions(struct ftrace_file_handle *handle, struct opts *opt
 
 static struct sym * find_task_sym(struct ftrace_file_handle *handle,
 				  struct ftrace_task_handle *task,
-				  struct ftrace_ret_stack *rstack)
+				  struct uftrace_record *rstack)
 {
 	struct sym *sym;
 	struct ftrace_task_handle *main_task = &handle->tasks[0];
-	struct ftrace_session *sess = find_task_session(task->tid, rstack->time);
+	struct uftrace_session *sess = find_task_session(&handle->sessions,
+							 task->tid, rstack->time);
 	struct symtabs *symtabs = &sess->symtabs;
 
 	if (task->func)
@@ -634,7 +632,7 @@ static void print_thread(struct trace_entry *entry)
 static void report_threads(struct ftrace_file_handle *handle, struct opts *opts)
 {
 	struct trace_entry te;
-	struct ftrace_ret_stack *rstack;
+	struct uftrace_record *rstack;
 	struct rb_root name_tree = RB_ROOT;
 	struct ftrace_task_handle *task;
 	struct fstack *fstack;
@@ -643,19 +641,19 @@ static void report_threads(struct ftrace_file_handle *handle, struct opts *opts)
 
 	while (read_rstack(handle, &task) >= 0 && !uftrace_done) {
 		rstack = task->rstack;
-		if (rstack->type == FTRACE_ENTRY && task->func)
+		if (rstack->type == UFTRACE_ENTRY && task->func)
 			continue;
-		if (rstack->type == FTRACE_LOST)
+		if (rstack->type == UFTRACE_LOST)
 			continue;
 
 		/* skip user functions if --kernel-only is set */
-		if (opts->kernel_only && !is_kernel_address(rstack->addr))
+		if (opts->kernel_only && !is_kernel_record(task, rstack))
 			continue;
 
 		if (opts->kernel_skip_out) {
 			/* skip kernel functions outside user functions */
-			if (is_kernel_address(task->func_stack[0].addr) &&
-			    is_kernel_address(rstack->addr))
+			if (task->user_stack_count == 0 &&
+			    is_kernel_record(task, rstack))
 				continue;
 		}
 
@@ -664,8 +662,9 @@ static void report_threads(struct ftrace_file_handle *handle, struct opts *opts)
 		te.pid = task->tid;
 		te.sym = find_task_sym(handle, task, rstack);
 		te.addr = rstack->addr;
+		te.time_recursive = 0;
 
-		if (rstack->type == FTRACE_ENTRY) {
+		if (rstack->type == UFTRACE_ENTRY) {
 			te.time_total = te.time_self = 0;
 			te.nr_called = 0;
 		}
@@ -1029,7 +1028,6 @@ int command_report(int argc, char *argv[], struct opts *opts)
 {
 	int ret;
 	struct ftrace_file_handle handle;
-	struct ftrace_kernel kern;
 
 	if (opts->avg_total && opts->avg_self) {
 		pr_out("--avg-total and --avg-self options should not be used together.\n");
@@ -1042,15 +1040,6 @@ int command_report(int argc, char *argv[], struct opts *opts)
 	ret = open_data_file(opts, &handle);
 	if (ret < 0)
 		return -1;
-
-	if (opts->kernel && (handle.hdr.feat_mask & KERNEL)) {
-		kern.output_dir = opts->dirname;
-		kern.skip_out = opts->kernel_skip_out;
-		if (setup_kernel_data(&kern) == 0) {
-			handle.kern = &kern;
-			load_kernel_symbol(opts->dirname);
-		}
-	}
 
 	fstack_setup_filters(opts, &handle);
 
@@ -1075,9 +1064,6 @@ int command_report(int argc, char *argv[], struct opts *opts)
 		report_diff(&handle, opts);
 	else
 		report_functions(&handle, opts);
-
-	if (handle.kern)
-		finish_kernel_data(handle.kern);
 
 	close_data_file(opts, &handle);
 

@@ -1,14 +1,13 @@
 /*
- * symbol management routines for ftrace
+ * symbol management routines for uftrace
  *
- * Copyright (C) 2014-2016, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
+ * Copyright (C) 2014-2017, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
  *
  * Released under the GPL v2.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <stdbool.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -107,7 +106,7 @@ bool check_libpthread(const char *filename)
 	}
 
 	if (dyn_sec == NULL)
-		return false;
+		goto out;
 
 	dyn_data = elf_getdata(dyn_sec, NULL);
 	if (dyn_data == NULL)
@@ -581,6 +580,7 @@ int check_trace_functions(const char *filename)
 	size_t shstr_idx, dynstr_idx = 0;
 	const char *trace_funcs[] = {
 		"mcount",
+		"_mcount",
 		"__fentry__",
 		"__gnu_mcount_nc",
 		"__cyg_profile_func_enter",
@@ -733,12 +733,26 @@ void load_symtabs(struct symtabs *symtabs, const char *dirname,
 void load_dlopen_symtabs(struct symtabs *symtabs, unsigned long offset,
 			 const char *filename)
 {
+	const char *dirname = symtabs->dirname;
+
 	if (symtabs->loaded)
 		return;
 
-	if (!(symtabs->flags & SYMTAB_FL_SKIP_NORMAL))
+	/* try .sym files first */
+	if (dirname != NULL && (symtabs->flags & SYMTAB_FL_USE_SYMFILE)) {
+		char *symfile = NULL;
+
+		xasprintf(&symfile, "%s/%s.sym", dirname, basename(filename));
+		if (access(symfile, F_OK) == 0)
+			load_symbol_file(symtabs, symfile, offset);
+
+		free(symfile);
+	}
+	if (symtabs->symtab.nr_sym == 0 &&
+	    !(symtabs->flags & SYMTAB_FL_SKIP_NORMAL))
 		load_symtab(&symtabs->symtab, filename, offset, symtabs->flags);
-	if (!(symtabs->flags & SYMTAB_FL_SKIP_DYNAMIC))
+	if (symtabs->dsymtab.nr_sym == 0 &&
+	    !(symtabs->flags & SYMTAB_FL_SKIP_DYNAMIC))
 		load_dynsymtab(&symtabs->dsymtab, filename, offset, symtabs->flags);
 
 	symtabs->loaded = true;
@@ -819,7 +833,7 @@ int load_symbol_file(struct symtabs *symtabs, const char *symfile,
 		if (pos)
 			*pos = '\0';
 
-		addr = strtoul(line, &pos, 16);
+		addr = strtoull(line, &pos, 16);
 
 		if (*pos++ != ' ') {
 			pr_dbg2("invalid symbol file format before type\n");
@@ -1027,7 +1041,7 @@ static int load_module_symbol(struct symtab *symtab, const char *symfile,
 		if (pos)
 			*pos = '\0';
 
-		addr = strtoul(line, &pos, 16);
+		addr = strtoull(line, &pos, 16);
 
 		if (*pos++ != ' ') {
 			pr_dbg2("invalid symbol file format before type\n");
@@ -1285,7 +1299,7 @@ struct sym * find_symtabs(struct symtabs *symtabs, uint64_t addr)
 	struct ftrace_proc_maps *maps;
 	struct sym *sym;
 
-	if (is_kernel_address(addr)) {
+	if (is_kernel_address(symtabs, addr)) {
 		struct symtab *ktab = get_kernel_symtab();
 		uint64_t kaddr = get_real_address(addr);
 
@@ -1443,14 +1457,15 @@ static uint64_t get_kernel_base(char *str)
 	}
 }
 
-void set_kernel_base(char *dirname, const char *session_id)
+void set_kernel_base(struct symtabs *symtabs, const char *session_id)
 {
 	FILE *fp;
 	char buf[4096];
 	char line[200];
+	uint64_t kernel_base_addr = -1ULL;
 
 	snprintf(buf, sizeof(buf), "%s/sid-%.*s.map",
-		 dirname, SESSION_ID_LEN, session_id);
+		 symtabs->dirname, SESSION_ID_LEN, session_id);
 
 	fp = fopen(buf, "r");
 	if (fp == NULL)
@@ -1462,4 +1477,6 @@ void set_kernel_base(char *dirname, const char *session_id)
 		}
 	}
 	fclose(fp);
+
+	symtabs->kernel_base = kernel_base_addr;
 }

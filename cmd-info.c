@@ -1,16 +1,14 @@
 /*
  * uftrace info command related routines
  *
- * Copyright (C) 2014-2016, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
+ * Copyright (C) 2014-2017, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
  *
  * Released under the GPL v2.
  */
 
 #include <stdio.h>
 #include <unistd.h>
-#include <string.h>
 #include <assert.h>
-#include <ctype.h>
 #include <sys/utsname.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
@@ -60,7 +58,7 @@ static int fill_exe_name(void *arg)
 static int read_exe_name(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
-	struct ftrace_info *info = &handle->info;
+	struct uftrace_info *info = &handle->info;
 	char buf[4096];
 
 	if (fgets(buf, sizeof(buf), handle->fp) == NULL)
@@ -169,7 +167,7 @@ static int convert_to_int(unsigned char hex)
 static int read_exe_build_id(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
-	struct ftrace_info *info = &handle->info;
+	struct uftrace_info *info = &handle->info;
 	char build_id_str[BUILD_ID_STR_SIZE];
 	char buf[4096];
 	int i;
@@ -206,7 +204,7 @@ static int fill_exit_status(void *arg)
 static int read_exit_status(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
-	struct ftrace_info *info = &handle->info;
+	struct uftrace_info *info = &handle->info;
 	char buf[4096];
 
 	if (fgets(buf, sizeof(buf), handle->fp) == NULL)
@@ -246,7 +244,7 @@ static int fill_cmdline(void *arg)
 static int read_cmdline(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
-	struct ftrace_info *info = &handle->info;
+	struct uftrace_info *info = &handle->info;
 	char buf[4096];
 
 	if (fgets(buf, sizeof(buf), handle->fp) == NULL)
@@ -279,7 +277,7 @@ static int fill_cpuinfo(void *arg)
 static int read_cpuinfo(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
-	struct ftrace_info *info = &handle->info;
+	struct uftrace_info *info = &handle->info;
 	char buf[4096];
 	int i, lines;
 
@@ -313,8 +311,10 @@ static int read_cpuinfo(void *arg)
 static int fill_meminfo(void *arg)
 {
 	struct fill_handler_arg *fha = arg;
-	long mem_total, mem_total_small;
-	long mem_free, mem_free_small;
+	long mem_total = 0;
+	long mem_total_small;
+	long mem_free = 0;
+	long mem_free_small;
 	char *units[] = { "KB", "MB", "GB", "TB" };
 	char *unit;
 	char buf[1024];
@@ -333,6 +333,7 @@ static int fill_meminfo(void *arg)
 		else
 			break;
 	}
+	fclose(fp);
 
 	mem_total_small = (mem_total % 1024) / 103; /* 103 ~= 1024 / 10 */
 	mem_free_small = (mem_free % 1024) / 103;
@@ -358,7 +359,7 @@ static int fill_meminfo(void *arg)
 static int read_meminfo(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
-	struct ftrace_info *info = &handle->info;
+	struct uftrace_info *info = &handle->info;
 	char buf[4096];
 
 	if (fgets(buf, sizeof(buf), handle->fp) == NULL)
@@ -419,7 +420,7 @@ static int fill_osinfo(void *arg)
 static int read_osinfo(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
-	struct ftrace_info *info = &handle->info;
+	struct uftrace_info *info = &handle->info;
 	char buf[4096];
 	int i, lines;
 
@@ -456,7 +457,7 @@ struct tid_list {
 	int *tid;
 };
 
-static int build_tid_list(struct ftrace_task *t, void *arg)
+static int build_tid_list(struct uftrace_task *t, void *arg)
 {
 	struct tid_list *list = arg;
 
@@ -474,13 +475,17 @@ static int fill_taskinfo(void *arg)
 	struct tid_list tlist = {
 		.nr = 0,
 	};
+	struct uftrace_session_link link = {
+		.root  = RB_ROOT,
+		.tasks = RB_ROOT,
+	};
 	int i;
 
-	if (read_task_txt_file(fha->opts->dirname, false, false) < 0 &&
-	    read_task_file(fha->opts->dirname, false, false) < 0)
+	if (read_task_txt_file(&link, fha->opts->dirname, false, false) < 0 &&
+	    read_task_file(&link, fha->opts->dirname, false, false) < 0)
 		return -1;
 
-	walk_tasks(build_tid_list, &tlist);
+	walk_tasks(&link, build_tid_list, &tlist);
 
 	dprintf(fha->fd, "taskinfo:lines=2\n");
 	dprintf(fha->fd, "taskinfo:nr_tid=%d\n", tlist.nr);
@@ -499,7 +504,7 @@ static int fill_taskinfo(void *arg)
 static int read_taskinfo(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
-	struct ftrace_info *info = &handle->info;
+	struct uftrace_info *info = &handle->info;
 	char buf[4096];
 	int i, lines;
 
@@ -531,8 +536,10 @@ static int read_taskinfo(void *arg)
 				int tid = strtol(tids_str, &endp, 10);
 				tids[nr_tid++] = tid;
 
-				if (*endp != ',' && *endp != '\n')
+				if (*endp != ',' && *endp != '\n') {
+					free(tids);
 					return -1;
+				}
 
 				tids_str = endp + 1;
 			}
@@ -567,7 +574,7 @@ static int fill_usageinfo(void *arg)
 static int read_usageinfo(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
-	struct ftrace_info *info = &handle->info;
+	struct uftrace_info *info = &handle->info;
 	char buf[4096];
 	int i, lines;
 
@@ -613,8 +620,10 @@ static int fill_loadinfo(void *arg)
 	if (fp == NULL)
 		return -1;
 
-	if (fscanf(fp, "%f %f %f", &loadavg[0], &loadavg[1], &loadavg[2]) != 3)
+	if (fscanf(fp, "%f %f %f", &loadavg[0], &loadavg[1], &loadavg[2]) != 3) {
+		fclose(fp);
 		return -1;
+	}
 
 	dprintf(fha->fd, "loadinfo:%.02f / %.02f / %.02f\n",
 		loadavg[0], loadavg[1], loadavg[2]);
@@ -626,7 +635,7 @@ static int fill_loadinfo(void *arg)
 static int read_loadinfo(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
-	struct ftrace_info *info = &handle->info;
+	struct uftrace_info *info = &handle->info;
 	char buf[4096];
 
 	if (fgets(buf, sizeof(buf), handle->fp) == NULL)
@@ -658,7 +667,7 @@ static int fill_arg_spec(void *arg)
 static int read_arg_spec(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
-	struct ftrace_info *info = &handle->info;
+	struct uftrace_info *info = &handle->info;
 	char buf[4096];
 
 	if (fgets(buf, sizeof(buf), handle->fp) == NULL)
@@ -672,7 +681,7 @@ static int read_arg_spec(void *arg)
 }
 
 struct ftrace_info_handler {
-	enum ftrace_info_bits bit;
+	enum uftrace_info_bits bit;
 	int (*handler)(void *arg);
 };
 
@@ -745,7 +754,7 @@ int read_ftrace_info(uint64_t info_mask, struct ftrace_file_handle *handle)
 	return 0;
 }
 
-void clear_ftrace_info(struct ftrace_info *info)
+void clear_ftrace_info(struct uftrace_info *info)
 {
 	free(info->exename);
 	free(info->cmdline);
@@ -760,7 +769,6 @@ void clear_ftrace_info(struct ftrace_info *info)
 
 int command_info(int argc, char *argv[], struct opts *opts)
 {
-	int ret;
 	char buf[PATH_MAX];
 	struct stat statbuf;
 	struct ftrace_file_handle handle;
@@ -878,5 +886,5 @@ int command_info(int argc, char *argv[], struct opts *opts)
 out:
 	close_data_file(opts, &handle);
 
-	return ret;
+	return 0;
 }

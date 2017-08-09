@@ -1,7 +1,7 @@
 /*
  * Very simple (and incomplete by design) C++ name demangler.
  *
- * Copyright (C) 2015-2016, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
+ * Copyright (C) 2015-2017, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
  *
  * Released under the GPL v2.
  *
@@ -9,8 +9,6 @@
  */
 
 #include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
 #include <assert.h>
 
 /* This should be defined before #include "utils.h" */
@@ -1473,16 +1471,6 @@ static char *demangle_full(char *str)
  */
 char *demangle(char *str)
 {
-	static const size_t size_of_gsi = sizeof("_GLOBAL__sub_I") - 1;
-
-	/* skip global initialize (constructor?) functions */
-	if (strncmp(str, "_GLOBAL__sub_I", size_of_gsi) == 0) {
-		str += size_of_gsi;
-
-		while (*str++ != '_')
-			continue;
-	}
-
 	switch (demangler) {
 	case DEMANGLE_SIMPLE:
 		return demangle_simple(str);

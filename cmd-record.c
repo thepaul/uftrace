@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <unistd.h>
@@ -55,9 +54,13 @@ static int thread_ctl[2];
 
 static bool can_use_fast_libmcount(struct opts *opts)
 {
-	if (opts->filter || opts->trigger || opts->args || opts->retval || debug)
+	if (debug)
 		return false;
 	if (opts->depth != MCOUNT_DEFAULT_DEPTH)
+		return false;
+	if (getenv("UFTRACE_FILTER") || getenv("UFTRACE_TRIGGER") ||
+	    getenv("UFTRACE_ARGUMENT") || getenv("UFTRACE_RETVAL") ||
+	    getenv("UFTRACE_PATCH"))
 		return false;
 	return true;
 }
@@ -84,42 +87,6 @@ static void setup_child_environ(struct opts *opts, int pfd)
 	char *old_preload, *old_libpath;
 	bool must_use_multi_thread = check_libpthread(opts->exename);
 
-	if (opts->lib_path)
-		snprintf(buf, sizeof(buf), "%s/libmcount/", opts->lib_path);
-	else
-		buf[0] = '\0';  /* to make strcat() work */
-
-	if (opts->nop) {
-		strcat(buf, "libmcount-nop.so");
-	}
-	else if (opts->libmcount_single && !must_use_multi_thread) {
-		if (can_use_fast_libmcount(opts))
-			strcat(buf, "libmcount-fast-single.so");
-		else
-			strcat(buf, "libmcount-single.so");
-	}
-	else {
-		if (must_use_multi_thread && opts->libmcount_single)
-			pr_dbg("--libmcount-single is off because it calls pthread_create()\n");
-		if (can_use_fast_libmcount(opts))
-			strcat(buf, "libmcount-fast.so");
-		else
-			strcat(buf, "libmcount.so");
-	}
-	pr_dbg("using %s library for tracing\n", buf);
-
-	old_preload = getenv("LD_PRELOAD");
-	if (old_preload) {
-		size_t len = strlen(buf) + strlen(old_preload) + 2;
-		char *preload = xmalloc(len);
-
-		snprintf(preload, len, "%s:%s", buf, old_preload);
-		setenv("LD_PRELOAD", preload, 1);
-		free(preload);
-	}
-	else
-		setenv("LD_PRELOAD", buf, 1);
-
 	if (opts->lib_path) {
 		strcpy(buf, opts->lib_path);
 		strcat(buf, "/libmcount:");
@@ -144,17 +111,50 @@ static void setup_child_environ(struct opts *opts, int pfd)
 	else
 		setenv("LD_LIBRARY_PATH", buf, 1);
 
-	if (opts->filter)
-		setenv("UFTRACE_FILTER", opts->filter, 1);
+	if (opts->filter) {
+		char *filter_str = uftrace_clear_kernel(opts->filter);
 
-	if (opts->trigger)
-		setenv("UFTRACE_TRIGGER", opts->trigger, 1);
+		if (filter_str) {
+			setenv("UFTRACE_FILTER", filter_str, 1);
+			free(filter_str);
+		}
+	}
 
-	if (opts->args)
-		setenv("UFTRACE_ARGUMENT", opts->args, 1);
+	if (opts->trigger) {
+		char *trigger_str = uftrace_clear_kernel(opts->trigger);
 
-	if (opts->retval)
-		setenv("UFTRACE_RETVAL", opts->retval, 1);
+		if (trigger_str) {
+			setenv("UFTRACE_TRIGGER", trigger_str, 1);
+			free(trigger_str);
+		}
+	}
+
+	if (opts->args) {
+		char *arg_str = uftrace_clear_kernel(opts->args);
+
+		if (arg_str) {
+			setenv("UFTRACE_ARGUMENT", arg_str, 1);
+			free(arg_str);
+		}
+	}
+
+	if (opts->retval) {
+		char *retval_str = uftrace_clear_kernel(opts->retval);
+
+		if (retval_str) {
+			setenv("UFTRACE_RETVAL", retval_str, 1);
+			free(retval_str);
+		}
+	}
+
+	if (opts->patch) {
+		char *patch_str = uftrace_clear_kernel(opts->patch);
+
+		if (patch_str) {
+			setenv("UFTRACE_PATCH", patch_str, 1);
+			free(patch_str);
+		}
+	}
 
 	if (opts->depth != OPT_DEPTH_DEFAULT) {
 		snprintf(buf, sizeof(buf), "%d", opts->depth);
@@ -213,6 +213,47 @@ static void setup_child_environ(struct opts *opts, int pfd)
 
 	snprintf(buf, sizeof(buf), "%d", demangler);
 	setenv("UFTRACE_DEMANGLE", buf, 1);
+
+	if (opts->kernel && check_kernel_pid_filter())
+		setenv("UFTRACE_KERNEL_PID_UPDATE", "1", 1);
+
+	if (opts->lib_path)
+		snprintf(buf, sizeof(buf), "%s/libmcount/", opts->lib_path);
+	else
+		buf[0] = '\0';  /* to make strcat() work */
+
+	if (opts->nop) {
+		strcat(buf, "libmcount-nop.so");
+	}
+	else if (opts->libmcount_single && !must_use_multi_thread) {
+		if (can_use_fast_libmcount(opts))
+			strcat(buf, "libmcount-fast-single.so");
+		else
+			strcat(buf, "libmcount-single.so");
+	}
+	else {
+		if (must_use_multi_thread && opts->libmcount_single)
+			pr_dbg("--libmcount-single is off because it calls pthread_create()\n");
+		if (can_use_fast_libmcount(opts))
+			strcat(buf, "libmcount-fast.so");
+		else
+			strcat(buf, "libmcount.so");
+	}
+	pr_dbg("using %s library for tracing\n", buf);
+
+	old_preload = getenv("LD_PRELOAD");
+	if (old_preload) {
+		size_t len = strlen(buf) + strlen(old_preload) + 2;
+		char *preload = xmalloc(len);
+
+		snprintf(preload, len, "%s:%s", buf, old_preload);
+		setenv("LD_PRELOAD", preload, 1);
+		free(preload);
+	}
+	else
+		setenv("LD_PRELOAD", buf, 1);
+
+	setenv("XRAY_OPTIONS", "patch_premain=false", 1);
 }
 
 static uint64_t calc_feat_mask(struct opts *opts)
@@ -248,7 +289,7 @@ static int fill_file_header(struct opts *opts, int status, struct rusage *rusage
 	int fd, efd;
 	int ret = -1;
 	char *filename = NULL;
-	struct ftrace_file_header hdr;
+	struct uftrace_file_header hdr;
 	char elf_ident[EI_NIDENT];
 
 	xasprintf(&filename, "%s/info", opts->dirname);
@@ -307,6 +348,9 @@ close_fd:
 	return ret;
 }
 
+/* size including NUL at the end */
+#define MSG_ID_SIZE  36
+
 static void parse_msg_id(char *id, uint64_t *sid, int *tid, int *seq)
 {
 	uint64_t _sid;
@@ -359,16 +403,18 @@ static void write_buffer(struct buf_list *buf, struct opts *opts, int sock)
 	struct mcount_shmem_buffer *shmbuf = buf->shmem_buf;
 
 	if (!opts->host)
-		return write_buffer_file(opts->dirname, buf);
+		write_buffer_file(opts->dirname, buf);
+	else
+		send_trace_data(sock, buf->tid, shmbuf->data, shmbuf->size);
 
-	send_trace_data(sock, buf->tid, shmbuf->data, shmbuf->size);
+	shmbuf->size = 0;
 }
 
 struct writer_arg {
 	struct list_head	list;
 	struct list_head	bufs;
 	struct opts		*opts;
-	struct ftrace_kernel	*kern;
+	struct uftrace_kernel	*kern;
 	int			sock;
 	int			idx;
 	int			tid;
@@ -445,7 +491,8 @@ void *writer_thread(void *arg)
 					check_list = true;
 				else
 					record_kernel_trace_pipe(warg->kern,
-								 warg->cpus[i-1]);
+								 warg->cpus[i-1],
+								 warg->sock);
 			}
 		}
 
@@ -501,7 +548,8 @@ void *writer_thread(void *arg)
 			for (i = 0; i < warg->nr_cpu; i++) {
 				if (pollfd[i+1].revents & POLLIN) {
 					record_kernel_trace_pipe(warg->kern,
-								 warg->cpus[i]);
+								 warg->cpus[i],
+								 warg->sock);
 				}
 			}
 		}
@@ -569,7 +617,7 @@ static void copy_to_buffer(struct mcount_shmem_buffer *shm, char *sess_id)
 	pthread_mutex_unlock(&write_list_lock);
 }
 
-static int record_mmap_file(const char *dirname, char *sess_id, int bufsize)
+static void record_mmap_file(const char *dirname, char *sess_id, int bufsize)
 {
 	int fd;
 	struct shmem_list *sl;
@@ -579,7 +627,7 @@ static int record_mmap_file(const char *dirname, char *sess_id, int bufsize)
 	fd = shm_open(sess_id, O_RDWR, 0600);
 	if (fd < 0) {
 		pr_dbg("open shmem buffer failed: %s: %m\n", sess_id);
-		return 0;
+		return;
 	}
 
 	shmem_buf = mmap(NULL, bufsize, PROT_READ | PROT_WRITE,
@@ -614,10 +662,11 @@ static int record_mmap_file(const char *dirname, char *sess_id, int bufsize)
 		if (shmem_buf->size) {
 			/* shmem_buf will be unmapped */
 			copy_to_buffer(shmem_buf, sess_id);
+			return;
 		}
 	}
 
-	return 0;
+	munmap(shmem_buf, bufsize);
 }
 
 static void stop_all_writers(void)
@@ -689,7 +738,7 @@ static void unlink_shmem_list(void)
 		num = scandir("/dev/shm/", &shmem_bufs, filter_shmem, alphasort);
 		for (i = 0; i < num; i++) {
 			sid[0] = '/';
-			strcpy(&sid[1], shmem_bufs[i]->d_name);
+			strncpy(&sid[1], shmem_bufs[i]->d_name, MSG_ID_SIZE);
 			pr_dbg3("unlink %s\n", sid);
 			shm_unlink(sid);
 			free(shmem_bufs[i]);
@@ -802,27 +851,35 @@ static bool check_tid_list(void)
 	return true;
 }
 
+struct dlopen_list {
+	struct list_head list;
+	char *libname;
+};
+
+static LIST_HEAD(dlopen_libs);
+
 static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 {
 	char buf[128];
 	struct shmem_list *sl, *tmp;
 	struct tid_list *tl, *pos;
-	struct ftrace_msg msg;
-	struct ftrace_msg_task tmsg;
-	struct ftrace_msg_sess sess;
-	struct ftrace_msg_dlopen dmsg;
+	struct uftrace_msg msg;
+	struct uftrace_msg_task tmsg;
+	struct uftrace_msg_sess sess;
+	struct uftrace_msg_dlopen dmsg;
+	struct dlopen_list *dlib;
 	char *exename;
 	int lost;
 
 	if (read_all(pfd, &msg, sizeof(msg)) < 0)
 		pr_err("reading pipe failed:");
 
-	if (msg.magic != FTRACE_MSG_MAGIC)
+	if (msg.magic != UFTRACE_MSG_MAGIC)
 		pr_err_ns("invalid message received: %x\n", msg.magic);
 
 	switch (msg.type) {
-	case FTRACE_MSG_REC_START:
-		if (msg.len > SHMEM_NAME_SIZE)
+	case UFTRACE_MSG_REC_START:
+		if (msg.len >= SHMEM_NAME_SIZE)
 			pr_err_ns("invalid message length\n");
 
 		sl = xmalloc(sizeof(*sl));
@@ -837,8 +894,8 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 		list_add_tail(&sl->list, &shmem_list_head);
 		break;
 
-	case FTRACE_MSG_REC_END:
-		if (msg.len > SHMEM_NAME_SIZE)
+	case UFTRACE_MSG_REC_END:
+		if (msg.len >= SHMEM_NAME_SIZE)
 			pr_err_ns("invalid message length\n");
 
 		if (read_all(pfd, buf, msg.len) < 0)
@@ -849,7 +906,7 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 
 		/* remove from shmem_list */
 		list_for_each_entry_safe(sl, tmp, &shmem_list_head, list) {
-			if (!strncmp(sl->id, buf, SHMEM_NAME_SIZE)) {
+			if (!memcmp(sl->id, buf, SHMEM_NAME_SIZE)) {
 				list_del(&sl->list);
 				free(sl);
 				break;
@@ -859,14 +916,14 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 		record_mmap_file(dirname, buf, bufsize);
 		break;
 
-	case FTRACE_MSG_TID:
+	case UFTRACE_MSG_TASK:
 		if (msg.len != sizeof(tmsg))
 			pr_err_ns("invalid message length\n");
 
 		if (read_all(pfd, &tmsg, sizeof(tmsg)) < 0)
 			pr_err("reading pipe failed");
 
-		pr_dbg2("MSG  TID : %d/%d\n", tmsg.pid, tmsg.tid);
+		pr_dbg2("MSG TASK : %d/%d\n", tmsg.pid, tmsg.tid);
 
 		/* check existing tid (due to exec) */
 		list_for_each_entry(pos, &tid_list_head, list) {
@@ -882,7 +939,7 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 		write_task_info(dirname, &tmsg);
 		break;
 
-	case FTRACE_MSG_FORK_START:
+	case UFTRACE_MSG_FORK_START:
 		if (msg.len != sizeof(tmsg))
 			pr_err_ns("invalid message length\n");
 
@@ -894,7 +951,7 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 		add_tid_list(tmsg.pid, -1);
 		break;
 
-	case FTRACE_MSG_FORK_END:
+	case UFTRACE_MSG_FORK_END:
 		if (msg.len != sizeof(tmsg))
 			pr_err_ns("invalid message length\n");
 
@@ -932,7 +989,7 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 		write_fork_info(dirname, &tmsg);
 		break;
 
-	case FTRACE_MSG_SESSION:
+	case UFTRACE_MSG_SESSION:
 		if (msg.len < sizeof(sess))
 			pr_err_ns("invalid message length\n");
 
@@ -950,9 +1007,10 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 		pr_dbg2("MSG SESSION: %d: %s (%s)\n", sess.task.tid, exename, buf);
 
 		write_session_info(dirname, &sess, exename);
+		free(exename);
 		break;
 
-	case FTRACE_MSG_LOST:
+	case UFTRACE_MSG_LOST:
 		if (msg.len < sizeof(lost))
 			pr_err_ns("invalid message length\n");
 
@@ -962,7 +1020,7 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 		shmem_lost_count += lost;
 		break;
 
-	case FTRACE_MSG_DLOPEN:
+	case UFTRACE_MSG_DLOPEN:
 		if (msg.len < sizeof(dmsg))
 			pr_err_ns("invalid message length\n");
 
@@ -976,7 +1034,12 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 
 		pr_dbg2("MSG DLOPEN: %d: %#lx %s\n", dmsg.task.tid, dmsg.base_addr, exename);
 
+		dlib = xmalloc(sizeof(*dlib));
+		dlib->libname = exename;
+		list_add_tail(&dlib->list, &dlopen_libs);
+
 		write_dlopen_info(dirname, &dmsg, exename);
+		/* exename will be freed with the dlib */
 		break;
 
 	default:
@@ -985,62 +1048,9 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 	}
 }
 
-static void send_task_file(int sock, const char *dirname, struct symtabs *symtabs)
+static void send_task_file(int sock, const char *dirname)
 {
-	FILE *fp;
-	char *filename = NULL;
-	struct ftrace_msg msg;
-	struct ftrace_msg_task tmsg;
-	struct ftrace_msg_sess smsg;
-	int namelen;
-	char *exename;
-
-	xasprintf(&filename, "%s/task", dirname);
-
-	fp = fopen(filename, "r");
-	if (fp == NULL)
-		pr_err("open task file failed");
-
-	while (fread_all(&msg, sizeof(msg), fp) == 0) {
-		if (msg.magic  != FTRACE_MSG_MAGIC) {
-			pr_err_ns("invalid message in task file: %x\n",
-				  msg.magic);
-		}
-
-		switch (msg.type) {
-		case FTRACE_MSG_TID:
-		case FTRACE_MSG_FORK_END:
-			if (fread_all(&tmsg, sizeof(tmsg), fp) < 0)
-				pr_err("read task message failed");
-
-			send_trace_task(sock, &msg, &tmsg);
-			break;
-
-		case FTRACE_MSG_SESSION:
-			if (fread_all(&smsg, sizeof(smsg), fp) < 0)
-				pr_err("read session message failed");
-
-			namelen = ALIGN(smsg.namelen, 8);
-			exename = xmalloc(namelen);
-			if (fread_all(exename, namelen, fp) < 0)
-				pr_err("read exename failed");
-
-			send_trace_session(sock, &msg, &smsg, exename, namelen);
-			save_symbol_file(symtabs, dirname, exename);
-			free(exename);
-			break;
-
-		default:
-			pr_err_ns("unknown task file message: %d\n", msg.type);
-			break;
-		}
-	}
-
-	if (!feof(fp))
-		pr_err_ns("read task file failed\n");
-
-	fclose(fp);
-	free(filename);
+	send_trace_metadata(sock, dirname, "task.txt");
 }
 
 /* find "sid-XXX.map" file */
@@ -1055,42 +1065,15 @@ static int filter_map(const struct dirent *de)
 static void send_map_files(int sock, const char *dirname)
 {
 	int i, maps;
-	int map_fd;
-	uint64_t sid;
 	struct dirent **map_list;
-	struct stat stbuf;
-	void *map;
-	int len;
-	char buf[PATH_MAX];
 
 	maps = scandir(dirname, &map_list, filter_map, alphasort);
 	if (maps < 0)
 		pr_err("cannot scan map files");
 
 	for (i = 0; i < maps; i++) {
-		snprintf(buf, sizeof(buf), "%s/%s",
-			 dirname, map_list[i]->d_name);
-		map_fd = open(buf, O_RDONLY);
-		if (map_fd < 0)
-			pr_err("map open failed");
-
-		if (sscanf(map_list[i]->d_name, "sid-%"PRIx64".map", &sid) < 0)
-			pr_err("map sid parse failed");
-
-		if (fstat(map_fd, &stbuf) < 0)
-			pr_err("map stat failed");
-
-		len = stbuf.st_size;
-		map = xmalloc(len);
-
-		if (read_all(map_fd, map, len) < 0)
-			pr_err("map read failed");
-
-		send_trace_map(sock, sid, map, len);
-
-		free(map);
+		send_trace_metadata(sock, dirname, map_list[i]->d_name);
 		free(map_list[i]);
-		close(map_fd);
 	}
 	free(map_list);
 }
@@ -1106,38 +1089,15 @@ static int filter_sym(const struct dirent *de)
 static void send_sym_files(int sock, const char *dirname)
 {
 	int i, syms;
-	int sym_fd;
 	struct dirent **sym_list;
-	struct stat stbuf;
-	void *sym;
-	int len;
-	char buf[PATH_MAX];
 
 	syms = scandir(dirname, &sym_list, filter_sym, alphasort);
 	if (syms < 0)
 		pr_err("cannot scan sym files");
 
 	for (i = 0; i < syms; i++) {
-		snprintf(buf, sizeof(buf), "%s/%s",
-			 dirname, sym_list[i]->d_name);
-		sym_fd = open(buf, O_RDONLY);
-		if (sym_fd < 0)
-			pr_err("open symfile failed");
-
-		if (fstat(sym_fd, &stbuf) < 0)
-			pr_err("stat symfile failed");
-
-		len = stbuf.st_size;
-		sym = xmalloc(len);
-
-		if (read_all(sym_fd, sym, len) < 0)
-			pr_err("read symfile failed");
-
-		send_trace_sym(sock, sym_list[i]->d_name, sym, len);
-
-		free(sym);
+		send_trace_metadata(sock, dirname, sym_list[i]->d_name);
 		free(sym_list[i]);
-		close(sym_fd);
 	}
 	free(sym_list);
 }
@@ -1146,7 +1106,7 @@ static void send_info_file(int sock, const char *dirname)
 {
 	int fd;
 	char *filename = NULL;
-	struct ftrace_file_header hdr;
+	struct uftrace_file_header hdr;
 	struct stat stbuf;
 	void *info;
 	int len;
@@ -1171,7 +1131,14 @@ static void send_info_file(int sock, const char *dirname)
 	send_trace_info(sock, &hdr, info, len);
 
 	close(fd);
+	free(info);
 	free(filename);
+}
+
+static void send_kernel_metadata(int sock, const char *dirname)
+{
+	send_trace_metadata(sock, dirname, "kernel_header");
+	send_trace_metadata(sock, dirname, "kallsyms");
 }
 
 static void save_module_symbols(struct opts *opts, struct symtabs *symtabs)
@@ -1257,8 +1224,8 @@ static void print_child_usage(struct rusage *ru)
 	       ru->ru_utime.tv_sec, ru->ru_utime.tv_usec);
 }
 
-#define FTRACE_MSG  "Cannot trace '%s': No such file\n"			\
-"\tNote that ftrace doesn't search $PATH for you.\n"			\
+#define UFTRACE_MSG  "Cannot trace '%s': No such file\n"			\
+"\tNote that uftrace doesn't search $PATH for you.\n"			\
 "\tIf you really want to trace executables in the $PATH,\n"		\
 "\tplease give it the absolute pathname (like /usr/bin/%s).\n"
 
@@ -1266,13 +1233,9 @@ static void print_child_usage(struct rusage *ru)
 "\tIt seems not to be compiled with -pg or -finstrument-functions flag\n" 	\
 "\twhich generates traceable code.  Please check your binary file.\n"
 
-#define FTRACE_ELF_MSG  "Cannot trace '%s': Invalid file\n"		\
+#define UFTRACE_ELF_MSG  "Cannot trace '%s': Invalid file\n"		\
 "\tThis file doesn't look like an executable ELF file.\n"		\
 "\tPlease check whether it's a kind of script or shell functions.\n"
-
-#define OBJTYPE_MSG  "Cannot trace '%s': Invalid ELF object type\n"	\
-"\tNote that ftrace only trace ELF executables by default,\n"		\
-"\tIf you want to trace shared libraries, please use --force option.\n"
 
 #define MACHINE_MSG  "Cannot trace '%s': Unsupported machine\n"		\
 "\tThis machine type (%u) is not supported currently.\n"		\
@@ -1280,6 +1243,10 @@ static void print_child_usage(struct rusage *ru)
 
 #define ARGUMENT_MSG  "uftrace: -A or -R might not work for binaries"	\
 " with -finstrument-functions\n"
+
+#ifndef  EM_AARCH64
+# define EM_AARCH64  183
+#endif
 
 static void check_binary(struct opts *opts)
 {
@@ -1289,14 +1256,14 @@ static void check_binary(struct opts *opts)
 	uint16_t e_type;
 	uint16_t e_machine;
 	uint16_t supported_machines[] = {
-		EM_X86_64, EM_ARM,
+		EM_X86_64, EM_ARM, EM_AARCH64,
 	};
 
 	pr_dbg3("checking binary %s\n", opts->exename);
 
 	if (access(opts->exename, X_OK) < 0) {
 		if (errno == ENOENT && opts->exename[0] != '/') {
-			pr_err_ns(FTRACE_MSG, opts->exename, opts->exename);
+			pr_err_ns(UFTRACE_MSG, opts->exename, opts->exename);
 		}
 		pr_err("Cannot trace '%s'", opts->exename);
 	}
@@ -1309,13 +1276,13 @@ static void check_binary(struct opts *opts)
 		pr_err("Cannot read '%s'", opts->exename);
 
 	if (memcmp(elf_ident, ELFMAG, SELFMAG))
-		pr_err_ns(FTRACE_ELF_MSG, opts->exename);
+		pr_err_ns(UFTRACE_ELF_MSG, opts->exename);
 
 	if (read(fd, &e_type, sizeof(e_type)) < 0)
 		pr_err("Cannot read '%s'", opts->exename);
 
-	if (e_type != ET_EXEC && e_type != ET_DYN && !opts->force)
-		pr_err_ns(OBJTYPE_MSG, opts->exename);
+	if (e_type != ET_EXEC && e_type != ET_DYN)
+		pr_err_ns(UFTRACE_ELF_MSG, opts->exename);
 
 	if (read(fd, &e_machine, sizeof(e_machine)) < 0)
 		pr_err("Cannot read '%s'", opts->exename);
@@ -1330,7 +1297,7 @@ static void check_binary(struct opts *opts)
 	if (!opts->force) {
 		int chk = check_trace_functions(opts->exename);
 
-		if (chk == 0) {
+		if (chk == 0 && !opts->patch) {
 			/* there's no function to trace */
 			pr_err_ns(MCOUNT_MSG, "mcount", opts->exename);
 		}
@@ -1361,7 +1328,8 @@ int command_record(int argc, char *argv[], struct opts *opts)
 	struct timespec ts1, ts2;
 	struct rusage usage;
 	pthread_t *writers;
-	struct ftrace_kernel kern;
+	struct uftrace_kernel kernel;
+	struct dlopen_list *dlib, *tmp;
 	int efd;
 	uint64_t go = 1;
 	int sock = -1;
@@ -1417,16 +1385,16 @@ int command_record(int argc, char *argv[], struct opts *opts)
 
 	if (opts->host) {
 		sock = setup_client_socket(opts);
-		send_trace_header(sock, opts->dirname);
+		send_trace_dir_name(sock, opts->dirname);
 	}
 
 	nr_cpu = sysconf(_SC_NPROCESSORS_ONLN);
 
 	if (opts->kernel) {
-		kern.pid = pid;
-		kern.output_dir = opts->dirname;
-		kern.depth = opts->kernel_depth ?: 1;
-		kern.bufsize = opts->kernel_bufsize;
+		kernel.pid = pid;
+		kernel.output_dir = opts->dirname;
+		kernel.depth = opts->kernel_depth ?: 1;
+		kernel.bufsize = opts->kernel_bufsize;
 
 		if (!opts->nr_thread) {
 			if (opts->kernel_depth >= 4)
@@ -1437,14 +1405,14 @@ int command_record(int argc, char *argv[], struct opts *opts)
 
 		if (!opts->kernel_bufsize) {
 			if (opts->kernel_depth >= 8)
-				kern.bufsize = 4096 * 1024;
+				kernel.bufsize = 4096 * 1024;
 			else if (opts->kernel_depth >= 4)
-				kern.bufsize = 3072 * 1024;
+				kernel.bufsize = 3072 * 1024;
 			else if (opts->kernel_depth >= 2)
-				kern.bufsize = 2048 * 1024;
+				kernel.bufsize = 2048 * 1024;
 		}
 
-		if (setup_kernel_tracing(&kern, opts->filter) < 0) {
+		if (setup_kernel_tracing(&kernel, opts) < 0) {
 			opts->kernel = false;
 			pr_log("kernel tracing disabled due to an error\n");
 		}
@@ -1458,11 +1426,10 @@ int command_record(int argc, char *argv[], struct opts *opts)
 	pr_dbg("creating %d thread(s) for recording\n", opts->nr_thread);
 	writers = xmalloc(opts->nr_thread * sizeof(*writers));
 
-//	thread_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if (pipe(thread_ctl) < 0)
 		pr_err("cannot create an eventfd for writer thread");
 
-	if (opts->kernel && start_kernel_tracing(&kern) < 0) {
+	if (opts->kernel && start_kernel_tracing(&kernel) < 0) {
 		opts->kernel = false;
 		pr_log("kernel tracing disabled due to an error\n");
 	}
@@ -1476,7 +1443,7 @@ int command_record(int argc, char *argv[], struct opts *opts)
 		warg->opts = opts;
 		warg->idx  = i;
 		warg->sock = sock;
-		warg->kern = &kern;
+		warg->kern = &kernel;
 		warg->nr_cpu = 0;
 		INIT_LIST_HEAD(&warg->list);
 		INIT_LIST_HEAD(&warg->bufs);
@@ -1570,7 +1537,7 @@ int command_record(int argc, char *argv[], struct opts *opts)
 
 	stop_all_writers();
 	if (opts->kernel)
-		stop_kernel_tracing(&kern);
+		stop_kernel_tracing(&kernel);
 
 	if (fill_file_header(opts, status, &usage) < 0)
 		pr_err("cannot generate data file");
@@ -1585,6 +1552,7 @@ int command_record(int argc, char *argv[], struct opts *opts)
 
 	for (i = 0; i < opts->nr_thread; i++)
 		pthread_join(writers[i], NULL);
+	free(writers);
 	close(thread_ctl[0]);
 
 	flush_shmem_list(opts->dirname, opts->bufsize);
@@ -1596,14 +1564,32 @@ int command_record(int argc, char *argv[], struct opts *opts)
 	save_symbol_file(&symtabs, opts->dirname, opts->exename);
 	save_module_symbols(opts, &symtabs);
 
+	list_for_each_entry_safe(dlib, tmp, &dlopen_libs, list) {
+		struct symtabs dlib_symtabs = {
+			.loaded = false,
+		};
+
+		load_symtabs(&dlib_symtabs, opts->dirname, dlib->libname);
+		save_symbol_file(&dlib_symtabs, opts->dirname, dlib->libname);
+
+		list_del(&dlib->list);
+
+		free(dlib->libname);
+		free(dlib);
+	}
+
 	if (opts->kernel)
-		finish_kernel_tracing(&kern);
+		finish_kernel_tracing(&kernel);
 
 	if (opts->host) {
-		send_task_file(sock, opts->dirname, &symtabs);
+		send_task_file(sock, opts->dirname);
 		send_map_files(sock, opts->dirname);
 		send_sym_files(sock, opts->dirname);
 		send_info_file(sock, opts->dirname);
+
+		if (opts->kernel)
+			send_kernel_metadata(sock, opts->dirname);
+
 		send_trace_end(sock);
 		close(sock);
 

@@ -25,9 +25,8 @@
 #define OPT_RSTACK_DEFAULT  1024
 #define OPT_DEPTH_MAX       OPT_RSTACK_MAX
 #define OPT_DEPTH_DEFAULT   OPT_RSTACK_DEFAULT
-#define OPT_FIELD_DEFAULT   (char *)"duration,tid"
 
-struct ftrace_file_header {
+struct uftrace_file_header {
 	char magic[UFTRACE_MAGIC_LEN];
 	uint32_t version;
 	uint16_t header_size;
@@ -40,7 +39,7 @@ struct ftrace_file_header {
 	uint32_t unused2;
 };
 
-enum ftrace_feat_bits {
+enum uftrace_feat_bits {
 	/* bit index */
 	PLTHOOK_BIT,
 	TASK_SESSION_BIT,
@@ -49,6 +48,8 @@ enum ftrace_feat_bits {
 	RETVAL_BIT,
 	SYM_REL_ADDR_BIT,
 	MAX_STACK_BIT,
+
+	FEAT_BIT_MAX,
 
 	/* bit mask */
 	PLTHOOK			= (1U << PLTHOOK_BIT),
@@ -60,7 +61,7 @@ enum ftrace_feat_bits {
 	MAX_STACK		= (1U << MAX_STACK_BIT),
 };
 
-enum ftrace_info_bits {
+enum uftrace_info_bits {
 	EXE_NAME,
 	EXE_BUILD_ID,
 	EXIT_STATUS,
@@ -74,7 +75,7 @@ enum ftrace_info_bits {
 	ARG_SPEC,
 };
 
-struct ftrace_info {
+struct uftrace_info {
 	char *exename;
 	unsigned char build_id[20];
 	int exit_status;
@@ -110,16 +111,53 @@ enum {
 	UFTRACE_EXIT_UNKNOWN,
 };
 
-struct ftrace_kernel;
+struct kbuffer;
+struct pevent;
+struct uftrace_record;
+struct uftrace_rstack_list;
+struct uftrace_session;
+
+struct uftrace_session_link {
+	struct rb_root		root;
+	struct rb_root		tasks;
+	struct uftrace_session *first;
+};
+
+struct uftrace_kernel {
+	int pid;
+	int nr_cpus;
+	int depth;
+	bool skip_out;
+	unsigned long bufsize;
+	int *traces;
+	int *fds;
+	int64_t *offsets;
+	int64_t *sizes;
+	void **mmaps;
+	struct kbuffer **kbufs;
+	struct pevent *pevent;
+	struct uftrace_record *rstacks;
+	struct uftrace_rstack_list *rstack_list;
+	bool *rstack_valid;
+	bool *rstack_done;
+	int *missed_events;
+	int *tids;
+	char *output_dir;
+	struct list_head filters;
+	struct list_head notrace;
+	struct list_head patches;
+	struct list_head nopatch;
+};
 
 struct ftrace_file_handle {
 	FILE *fp;
 	int sock;
 	const char *dirname;
-	struct ftrace_file_header hdr;
-	struct ftrace_info info;
-	struct ftrace_kernel *kern;
+	struct uftrace_file_header hdr;
+	struct uftrace_info info;
+	struct uftrace_kernel kernel;
 	struct ftrace_task_handle *tasks;
+	struct uftrace_session_link sessions;
 	int nr_tasks;
 	int depth;
 	bool needs_byte_swap;
@@ -154,6 +192,7 @@ struct opts {
 	char *retval;
 	char *diff;
 	char *fields;
+	char *patch;
 	int mode;
 	int idx;
 	int depth;
@@ -191,7 +230,7 @@ struct opts {
 	bool flame_graph;
 	bool libmcount_single;
 	bool kernel;
-	bool kernel_skip_out;
+	bool kernel_skip_out;  /* also affects VDSO filter */
 	bool kernel_only;
 	struct uftrace_time_range range;
 };
@@ -216,12 +255,14 @@ extern struct ftrace_proc_maps *proc_maps;
 
 int open_data_file(struct opts *opts, struct ftrace_file_handle *handle);
 void close_data_file(struct opts *opts, struct ftrace_file_handle *handle);
-int read_task_file(char *dirname, bool needs_session, bool sym_rel_addr);
-int read_task_txt_file(char *dirname, bool needs_session, bool sym_rel_addr);
+int read_task_file(struct uftrace_session_link *sess, char *dirname,
+		   bool needs_session, bool sym_rel_addr);
+int read_task_txt_file(struct uftrace_session_link *sess, char *dirname,
+		       bool needs_session, bool sym_rel_addr);
 
 #define SESSION_ID_LEN  16
 
-struct ftrace_session {
+struct uftrace_session {
 	struct rb_node		 node;
 	char			 sid[SESSION_ID_LEN];
 	uint64_t		 start_time;
@@ -234,9 +275,9 @@ struct ftrace_session {
 	char 			 exename[];
 };
 
-struct ftrace_sess_ref {
-	struct ftrace_sess_ref	*next;
-	struct ftrace_session	*sess;
+struct uftrace_sess_ref {
+	struct uftrace_sess_ref	*next;
+	struct uftrace_session	*sess;
 	uint64_t		 start, end;
 };
 
@@ -248,56 +289,58 @@ struct uftrace_dlopen_list {
 	char			name[];
 };
 
-struct ftrace_task {
+struct uftrace_task {
 	int			 pid, tid;
 	struct rb_node		 node;
-	struct ftrace_sess_ref	 sess;
-	struct ftrace_sess_ref	*sess_last;
+	struct uftrace_sess_ref	 sref;
+	struct uftrace_sess_ref	*sref_last;
 };
 
-#define FTRACE_MSG_MAGIC 0xface
+#define UFTRACE_MSG_MAGIC 0xface
 
-#define FTRACE_MSG_REC_START      1U
-#define FTRACE_MSG_REC_END        2U
-#define FTRACE_MSG_TID            3U
-#define FTRACE_MSG_FORK_START     4U
-#define FTRACE_MSG_FORK_END       5U
-#define FTRACE_MSG_SESSION        6U
-#define FTRACE_MSG_LOST           7U
-#define FTRACE_MSG_SEND_HDR       8U
-#define FTRACE_MSG_SEND_DATA      9U
-#define FTRACE_MSG_SEND_TASK     10U
-#define FTRACE_MSG_SEND_SESSION  11U
-#define FTRACE_MSG_SEND_MAP      12U
-#define FTRACE_MSG_SEND_SYM      13U
-#define FTRACE_MSG_SEND_INFO     14U
-#define FTRACE_MSG_SEND_END      15U
-#define FTRACE_MSG_DLOPEN        16U
+enum uftrace_msg_type {
+	UFTRACE_MSG_REC_START		= 1,
+	UFTRACE_MSG_REC_END,
+	UFTRACE_MSG_TASK,
+	UFTRACE_MSG_FORK_START,
+	UFTRACE_MSG_FORK_END,
+	UFTRACE_MSG_SESSION,
+	UFTRACE_MSG_LOST,
+	UFTRACE_MSG_DLOPEN,
+
+	UFTRACE_MSG_SEND_START		= 100,
+	UFTRACE_MSG_SEND_DIR_NAME,
+	UFTRACE_MSG_SEND_DATA,
+	UFTRACE_MSG_SEND_KERNEL_DATA,
+	UFTRACE_MSG_SEND_INFO,
+	UFTRACE_MSG_SEND_META_DATA,
+	UFTRACE_MSG_SEND_END,
+};
 
 /* msg format for communicating by pipe */
-struct ftrace_msg {
-	unsigned short magic; /* FTRACE_MSG_MAGIC */
-	unsigned short type;  /* FTRACE_MSG_REC_* */
+struct uftrace_msg {
+	unsigned short magic; /* UFTRACE_MSG_MAGIC */
+	unsigned short type;  /* UFTRACE_MSG_REC_* */
 	unsigned int len;
 	unsigned char data[];
 };
 
-struct ftrace_msg_task {
+struct uftrace_msg_task {
 	uint64_t time;
 	int32_t  pid;
 	int32_t  tid;
 };
 
-struct ftrace_msg_sess {
-	struct ftrace_msg_task task;
+struct uftrace_msg_sess {
+	struct uftrace_msg_task task;
 	char sid[16];
 	int  unused;
 	int  namelen;
 	char exename[];
 };
 
-struct ftrace_msg_dlopen {
-	struct ftrace_msg_task task;
+struct uftrace_msg_dlopen {
+	struct uftrace_msg_task task;
 	uint64_t base_addr;
 	char sid[16];
 	int  unused;
@@ -305,52 +348,61 @@ struct ftrace_msg_dlopen {
 	char exename[];
 };
 
-extern struct ftrace_session *first_session;
+extern struct uftrace_session *first_session;
 
-void create_session(struct ftrace_msg_sess *msg, char *dirname, char *exename,
-		    bool sym_rel_addr);
-struct ftrace_session *find_session(int pid, uint64_t timestamp);
-struct ftrace_session *find_task_session(int pid, uint64_t timestamp);
-void create_task(struct ftrace_msg_task *msg, bool fork, bool needs_session);
-struct ftrace_task *find_task(int tid);
+void create_session(struct uftrace_session_link *sess, struct uftrace_msg_sess *msg,
+		    char *dirname, char *exename, bool sym_rel_addr);
+struct uftrace_session *find_session(struct uftrace_session_link *sess,
+				     int pid, uint64_t timestamp);
+struct uftrace_session *find_task_session(struct uftrace_session_link *sess,
+					  int pid, uint64_t timestamp);
+void create_task(struct uftrace_session_link *sess, struct uftrace_msg_task *msg,
+		 bool fork, bool needs_session);
+struct uftrace_task *find_task(struct uftrace_session_link *sess, int tid);
 void read_session_map(char *dirname, struct symtabs *symtabs, char *sid);
-struct ftrace_session * get_session_from_sid(char sid[]);
-void session_add_dlopen(struct ftrace_session *sess, const char *dirname,
-			uint64_t timestamp, unsigned long base_addr,
-			const char *libname);
-struct sym * session_find_dlsym(struct ftrace_session *sess, uint64_t timestamp,
+struct uftrace_session * get_session_from_sid(struct uftrace_session_link *sess,
+					      char sid[]);
+void session_add_dlopen(struct uftrace_session *sess, uint64_t timestamp,
+			unsigned long base_addr, const char *libname);
+struct sym * session_find_dlsym(struct uftrace_session *sess, uint64_t timestamp,
 				unsigned long addr);
 
-typedef int (*walk_sessions_cb_t)(struct ftrace_session *session, void *arg);
-void walk_sessions(walk_sessions_cb_t callback, void *arg);
-typedef int (*walk_tasks_cb_t)(struct ftrace_task *task, void *arg);
-void walk_tasks(walk_tasks_cb_t callback, void *arg);
+struct uftrace_record;
+struct sym * task_find_sym(struct uftrace_session_link *sess,
+			   struct ftrace_task_handle *task,
+			   struct uftrace_record *rec);
+struct sym * task_find_sym_addr(struct uftrace_session_link *sess,
+				struct ftrace_task_handle *task,
+				uint64_t time, uint64_t addr);
+
+typedef int (*walk_sessions_cb_t)(struct uftrace_session *session, void *arg);
+void walk_sessions(struct uftrace_session_link *sess,
+		   walk_sessions_cb_t callback, void *arg);
+typedef int (*walk_tasks_cb_t)(struct uftrace_task *task, void *arg);
+void walk_tasks(struct uftrace_session_link *sess,
+		walk_tasks_cb_t callback, void *arg);
 
 int setup_client_socket(struct opts *opts);
-void send_trace_header(int sock, char *name);
+void send_trace_dir_name(int sock, char *name);
 void send_trace_data(int sock, int tid, void *data, size_t len);
-void send_trace_task(int sock, struct ftrace_msg *hmsg,
-		     struct ftrace_msg_task *tmsg);
-void send_trace_session(int sock, struct ftrace_msg *hmsg,
-			struct ftrace_msg_sess *smsg,
-			char *exename, int namelen);
-void send_trace_map(int sock, uint64_t sid, void *map, int len);
-void send_trace_sym(int sock, char *symfile, void *map, int len);
-void send_trace_info(int sock, struct ftrace_file_header *hdr,
+void send_trace_kernel_data(int sock, int cpu, void *data, size_t len);
+void send_trace_metadata(int sock, const char *dirname, char *filename);
+void send_trace_info(int sock, struct uftrace_file_header *hdr,
 		     void *info, int len);
 void send_trace_end(int sock);
 
-void write_task_info(const char *dirname, struct ftrace_msg_task *tmsg);
-void write_fork_info(const char *dirname, struct ftrace_msg_task *tmsg);
-void write_session_info(const char *dirname, struct ftrace_msg_sess *smsg,
+void write_task_info(const char *dirname, struct uftrace_msg_task *tmsg);
+void write_fork_info(const char *dirname, struct uftrace_msg_task *tmsg);
+void write_session_info(const char *dirname, struct uftrace_msg_sess *smsg,
 			const char *exename);
-void write_dlopen_info(const char *dirname, struct ftrace_msg_dlopen *dmsg,
+void write_dlopen_info(const char *dirname, struct uftrace_msg_dlopen *dmsg,
 		       const char *libname);
 
-enum ftrace_ret_stack_type {
-	FTRACE_ENTRY,
-	FTRACE_EXIT,
-	FTRACE_LOST,
+enum uftrace_record_type {
+	UFTRACE_ENTRY,
+	UFTRACE_EXIT,
+	UFTRACE_LOST,
+	UFTRACE_EVENT,
 };
 
 #define RECORD_MAGIC_V3  0xa
@@ -358,7 +410,7 @@ enum ftrace_ret_stack_type {
 #define RECORD_MAGIC     RECORD_MAGIC_V4
 
 /* reduced version of mcount_ret_stack */
-struct ftrace_ret_stack {
+struct uftrace_record {
 	uint64_t time;
 	uint64_t type:   2;
 	uint64_t more:   1;
@@ -367,10 +419,10 @@ struct ftrace_ret_stack {
 	uint64_t addr:   48;
 };
 
-static inline bool is_v3_compat(struct ftrace_ret_stack *stack)
+static inline bool is_v3_compat(struct uftrace_record *urec)
 {
 	/* (RECORD_MAGIC_V4 << 1 | more) == RECORD_MAGIC_V3 */
-	return stack->magic == RECORD_MAGIC && stack->more == 0;
+	return urec->magic == RECORD_MAGIC && urec->more == 0;
 }
 
 struct fstack_arguments {
@@ -387,15 +439,15 @@ struct uftrace_rstack_list {
 
 struct uftrace_rstack_list_node {
 	struct list_head list;
-	struct ftrace_ret_stack rstack;
+	struct uftrace_record rstack;
 	struct fstack_arguments args;
 };
 
 void setup_rstack_list(struct uftrace_rstack_list *list);
 void add_to_rstack_list(struct uftrace_rstack_list *list,
-			struct ftrace_ret_stack *rstack,
+			struct uftrace_record *rstack,
 			struct fstack_arguments *args);
-struct ftrace_ret_stack * get_first_rstack_list(struct uftrace_rstack_list *);
+struct uftrace_record * get_first_rstack_list(struct uftrace_rstack_list *);
 void consume_first_rstack_list(struct uftrace_rstack_list *list);
 void delete_last_rstack_list(struct uftrace_rstack_list *list);
 void reset_rstack_list(struct uftrace_rstack_list *list);
@@ -404,54 +456,35 @@ enum ftrace_ext_type {
 	FTRACE_ARGUMENT		= 1,
 };
 
-struct kbuffer;
-struct pevent;
-
-struct ftrace_kernel {
-	int pid;
-	int nr_cpus;
-	int depth;
-	bool skip_out;
-	unsigned long bufsize;
-	int *traces;
-	int *fds;
-	int64_t *offsets;
-	int64_t *sizes;
-	void **mmaps;
-	struct kbuffer **kbufs;
-	struct pevent *pevent;
-	struct ftrace_ret_stack *rstacks;
-	struct uftrace_rstack_list *rstack_list;
-	bool *rstack_valid;
-	bool *rstack_done;
-	int *missed_events;
-	int *tids;
-	char *output_dir;
-	struct list_head filters;
-	struct list_head notrace;
-};
-
 /* these functions will be used at record time */
-int setup_kernel_tracing(struct ftrace_kernel *kernel, char *filters);
-int start_kernel_tracing(struct ftrace_kernel *kernel);
-int record_kernel_tracing(struct ftrace_kernel *kernel);
-int record_kernel_trace_pipe(struct ftrace_kernel *kernel, int cpu);
-int stop_kernel_tracing(struct ftrace_kernel *kernel);
-int finish_kernel_tracing(struct ftrace_kernel *kernel);
+int setup_kernel_tracing(struct uftrace_kernel *kernel, struct opts *opts);
+int start_kernel_tracing(struct uftrace_kernel *kernel);
+int record_kernel_tracing(struct uftrace_kernel *kernel);
+int record_kernel_trace_pipe(struct uftrace_kernel *kernel, int cpu, int sock);
+int stop_kernel_tracing(struct uftrace_kernel *kernel);
+int finish_kernel_tracing(struct uftrace_kernel *kernel);
 
 /* these functions will be used at replay time */
-int setup_kernel_data(struct ftrace_kernel *kernel);
+int setup_kernel_data(struct uftrace_kernel *kernel);
 int read_kernel_stack(struct ftrace_file_handle *handle,
 		      struct ftrace_task_handle **taskp);
-int read_kernel_cpu_data(struct ftrace_kernel *kernel, int cpu);
-int finish_kernel_data(struct ftrace_kernel *kernel);
+int read_kernel_cpu_data(struct uftrace_kernel *kernel, int cpu);
+void * read_kernel_event(struct uftrace_kernel *kernel, int cpu, int *psize);
+int finish_kernel_data(struct uftrace_kernel *kernel);
+
+static inline bool has_kernel_data(struct uftrace_kernel *kernel)
+{
+	return kernel->pevent != NULL;
+}
+
+bool check_kernel_pid_filter(void);
 
 struct rusage;
 
 void fill_ftrace_info(uint64_t *info_mask, int fd, struct opts *opts, int status,
 		      struct rusage *rusage);
 int read_ftrace_info(uint64_t info_mask, struct ftrace_file_handle *handle);
-void clear_ftrace_info(struct ftrace_info *info);
+void clear_ftrace_info(struct uftrace_info *info);
 
 int arch_fill_cpuinfo_model(int fd);
 int arch_register_index(char *reg_name);

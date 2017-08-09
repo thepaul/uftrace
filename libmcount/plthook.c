@@ -5,7 +5,6 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #include <assert.h>
-#include <string.h>
 
 /* This should be defined before #include "utils.h" */
 #define PR_FMT     "mcount"
@@ -25,25 +24,109 @@ static unsigned long *plthook_dynsym_addr;
 static bool *plthook_dynsym_resolved;
 
 static unsigned long got_addr;
-static bool segv_handled;
+static volatile bool segv_handled;
 
-void segv_handler(int sig, siginfo_t *si, void *ctx)
+#define PAGE_SIZE  4096
+#define PAGE_ADDR(addr)  ((void *)((addr) & ~(PAGE_SIZE - 1)))
+
+static void segv_handler(int sig, siginfo_t *si, void *ctx)
 {
+	if (segv_handled)
+		pr_err_ns("stuck in a loop at segfault handler\n");
+
 	if (si->si_code == SEGV_ACCERR) {
-		mprotect((void *)(got_addr & ~0xFFF), sizeof(long)*3,
-			 PROT_WRITE);
+		if (mprotect(PAGE_ADDR(got_addr), PAGE_SIZE, PROT_WRITE) < 0)
+			pr_err("mprotect failed");
 		segv_handled = true;
 	} else {
-		pr_err_ns("mcount: invalid memory access.. exiting.\n");
+		pr_err_ns("invalid memory access.. exiting.\n");
+	}
+}
+
+static void overwrite_pltgot(int idx, void *data)
+{
+	/* save got_addr for segv_handler */
+	got_addr = (unsigned long)(&plthook_got_ptr[idx]);
+
+	segv_handled = false;
+
+	compiler_barrier();
+
+	/* overwrite it - might be read-protected */
+	plthook_got_ptr[idx] = (unsigned long)data;
+
+	if (segv_handled)
+		mprotect(PAGE_ADDR(got_addr), PAGE_SIZE, PROT_READ);
+}
+
+/* use weak reference for non-defined (arch-dependent) symbols */
+#define ALIAS_DECL(_sym)  extern __weak void (*uftrace_##_sym)(void);
+
+ALIAS_DECL(mcount);
+ALIAS_DECL(_mcount);
+ALIAS_DECL(__fentry__);
+ALIAS_DECL(__gnu_mcount_nc);
+
+/*
+ * The `mcount` (and its friends) are part of uftrace itself,
+ * so no need to use PLT hook for them.
+ */
+static void skip_plt_functions(void)
+{
+	unsigned i, k;
+
+#define SKIP_FUNC(func)  { #func, &uftrace_ ## func }
+
+	struct {
+		const char *name;
+		void *addr;
+	} skip_list[] = {
+		SKIP_FUNC(mcount),
+		SKIP_FUNC(_mcount),
+		SKIP_FUNC(__fentry__),
+		SKIP_FUNC(__gnu_mcount_nc),
+	};
+
+#undef SKIP_FUNC
+
+	struct symtab *dsymtab = &symtabs.dsymtab;
+
+	for (i = 0; i < dsymtab->nr_sym; i++) {
+		for (k = 0; k < ARRAY_SIZE(skip_list); k++) {
+			struct sym *sym = dsymtab->sym_names[i];
+
+			if (strcmp(sym->name, skip_list[k].name))
+				continue;
+
+			overwrite_pltgot(3 + i, skip_list[k].addr);
+			pr_dbg2("overwrite [%u] %s: %p\n",
+				i, skip_list[k].name, skip_list[k].addr);
+		}
 	}
 }
 
 extern void __weak plt_hooker(void);
+extern unsigned long plthook_return(void);
 
 static int find_got(Elf_Data *dyn_data, size_t nr_dyn, unsigned long offset)
 {
 	size_t i;
+	bool found = false;
 	struct sigaction sa, old_sa;
+
+	/*
+	 * The GOT region is write-protected on some systems.
+	 * In that case, we need to use mprotect() to overwrite
+	 * the address of resolver function.  So install signal
+	 * handler to catch such cases.
+	 */
+	sa.sa_sigaction = segv_handler;
+	sa.sa_flags = SA_SIGINFO;
+	sigfillset(&sa.sa_mask);
+	if (sigaction(SIGSEGV, &sa, &old_sa) < 0) {
+		pr_dbg("error during install sig handler\n");
+		return -1;
+	}
 
 	for (i = 0; i < nr_dyn; i++) {
 		GElf_Dyn dyn;
@@ -58,38 +141,24 @@ static int find_got(Elf_Data *dyn_data, size_t nr_dyn, unsigned long offset)
 		plthook_got_ptr = (void *)got_addr;
 		plthook_resolver_addr = plthook_got_ptr[2];
 
-		/*
-		 * The GOT region is write-protected on some systems.
-		 * In that case, we need to use mprotect() to overwrite
-		 * the address of resolver function.  So install signal
-		 * handler to catch such cases.
-		 */
-		sa.sa_sigaction = segv_handler;
-		sa.sa_flags = SA_SIGINFO;
-		sigfillset(&sa.sa_mask);
-		if (sigaction(SIGSEGV, &sa, &old_sa) < 0) {
-			pr_dbg("error during install sig handler\n");
-			return -1;
-		}
-
-		plthook_got_ptr[2] = (unsigned long)plt_hooker;
-
-		if (sigaction(SIGSEGV, &old_sa, NULL) < 0) {
-			pr_dbg("error during recover sig handler\n");
-			return -1;
-		}
-
-		if (segv_handled) {
-			mprotect((void *)(got_addr & ~0xFFF), sizeof(long)*3,
-				 PROT_READ);
-			segv_handled = false;
-		}
+		overwrite_pltgot(2, plt_hooker);
 
 		pr_dbg2("found GOT at %p (PLT resolver: %#lx)\n",
 			plthook_got_ptr, plthook_resolver_addr);
 
+		found = true;
 		break;
 	}
+
+	if (found)
+		skip_plt_functions();
+
+	/* restore the original signal handler */
+	if (sigaction(SIGSEGV, &old_sa, NULL) < 0) {
+		pr_dbg("error during recover sig handler\n");
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -164,9 +233,6 @@ elf_error:
 
 /* functions should skip PLT hooking */
 static const char *skip_syms[] = {
-	"mcount",
-	"__fentry__",
-	"__gnu_mcount_nc",
 	"__cyg_profile_func_enter",
 	"__cyg_profile_func_exit",
 	"_mcleanup",
@@ -174,6 +240,7 @@ static const char *skip_syms[] = {
 	"__cxa_throw",
 	"__cxa_begin_catch",
 	"__cxa_end_catch",
+	"__cxa_finalize",
 	"_Unwind_Resume",
 };
 
@@ -300,55 +367,71 @@ void destroy_dynsym_indexes(void)
 }
 
 struct mcount_jmpbuf_rstack {
+	struct list_head list;
+	unsigned long addr;
 	int count;
 	int record_idx;
-	unsigned long parent[MCOUNT_RSTACK_MAX];
-	unsigned long child[MCOUNT_RSTACK_MAX];
+	struct mcount_ret_stack rstack[MCOUNT_RSTACK_MAX];
 };
 
-static struct mcount_jmpbuf_rstack setjmp_rstack;
+static LIST_HEAD(jmpbuf_list);
 
-static void setup_jmpbuf_rstack(struct mcount_thread_data *mtdp, int idx)
+static void setup_jmpbuf_rstack(struct mcount_thread_data *mtdp,
+				unsigned long addr)
 {
 	int i;
-	struct mcount_jmpbuf_rstack *jbstack = &setjmp_rstack;
+	struct mcount_jmpbuf_rstack *jbstack;
 
-	pr_dbg2("setup jmpbuf rstack: %d\n", idx);
+	list_for_each_entry(jbstack, &jmpbuf_list, list) {
+		if (jbstack->addr == addr)
+			break;
+	}
+	if (list_no_entry(jbstack, &jmpbuf_list, list)) {
+		jbstack = xmalloc(sizeof(*jbstack));
+		jbstack->addr = addr;
+
+		list_add(&jbstack->list, &jmpbuf_list);
+	}
+
+	pr_dbg2("setup jmpbuf rstack at %lx (%d entries)\n", addr, mtdp->idx);
 
 	/* currently, only saves a single jmpbuf */
-	jbstack->count = idx;
+	jbstack->count      = mtdp->idx;
 	jbstack->record_idx = mtdp->record_idx;
 
-	for (i = 0; i <= idx; i++) {
-		jbstack->parent[i] = mtdp->rstack[i].parent_ip;
-		jbstack->child[i]  = mtdp->rstack[i].child_ip;
-	}
-
-	mtdp->rstack[idx].flags |= MCOUNT_FL_SETJMP;
+	for (i = 0; i < jbstack->count; i++)
+		jbstack->rstack[i] = mtdp->rstack[i];
 }
 
-static void restore_jmpbuf_rstack(struct mcount_thread_data *mtdp, int idx)
+static void restore_jmpbuf_rstack(struct mcount_thread_data *mtdp,
+				  unsigned long addr)
 {
-	int i, dyn_idx;
-	struct mcount_jmpbuf_rstack *jbstack = &setjmp_rstack;
+	int i;
+	struct mcount_jmpbuf_rstack *jbstack;
 
-	dyn_idx = mtdp->rstack[idx].dyn_idx;
+	list_for_each_entry(jbstack, &jmpbuf_list, list) {
+		if (jbstack->addr == addr)
+			break;
+	}
+	assert(!list_no_entry(jbstack, &jmpbuf_list, list));
 
-	pr_dbg2("restore jmpbuf: %d\n", jbstack->count);
+	pr_dbg2("restore jmpbuf rstack at %lx (%d entries)\n", addr, jbstack->count);
 
-	mtd.idx = jbstack->count + 1;
-	mtd.record_idx = jbstack->record_idx;
+	/* restoring current rstack caused an error - skip it */
+	mtdp->idx--;
+	mcount_rstack_restore();
 
-	mtdp->idx = jbstack->count + 1;
+	mtdp->idx        = jbstack->count;
 	mtdp->record_idx = jbstack->record_idx;
 
-	for (i = 0; i < jbstack->count + 1; i++) {
-		mtdp->rstack[i].parent_ip = jbstack->parent[i];
-		mtdp->rstack[i].child_ip  = jbstack->child[i];
+	for (i = 0; i < jbstack->count; i++) {
+		mtdp->rstack[i] = jbstack->rstack[i];
+
+		/* setjmp() already wrote rstacks */
+		mtdp->rstack[i].flags |= MCOUNT_FL_WRITTEN;
 	}
 
-	/* to avoid check in plthook_exit() */
-	mtdp->rstack[jbstack->count].dyn_idx = dyn_idx;
+	mcount_rstack_reset();
 }
 
 /* it's crazy to call vfork() concurrently */
@@ -374,7 +457,7 @@ static void prepare_vfork(struct mcount_thread_data *mtdp,
 /* this function will be called in child */
 static void setup_vfork(struct mcount_thread_data *mtdp)
 {
-	struct ftrace_msg_task tmsg = {
+	struct uftrace_msg_task tmsg = {
 		.pid = getppid(),
 		.tid = getpid(),
 		.time = mcount_gettime(),
@@ -389,7 +472,7 @@ static void setup_vfork(struct mcount_thread_data *mtdp)
 	memset(&mtdp->shmem, 0, sizeof(mtdp->shmem));
 	prepare_shmem_buffer(mtdp);
 
-	ftrace_send_message(FTRACE_MSG_TID, &tmsg, sizeof(tmsg));
+	ftrace_send_message(UFTRACE_MSG_TASK, &tmsg, sizeof(tmsg));
 }
 
 /* this function detects whether child finished */
@@ -418,7 +501,29 @@ static struct mcount_ret_stack * restore_vfork(struct mcount_thread_data *mtdp,
 	return rstack;
 }
 
-extern unsigned long plthook_return(void);
+static void update_pltgot(struct mcount_thread_data *mtdp, int dyn_idx)
+{
+	unsigned long new_addr;
+
+	if (!plthook_dynsym_resolved[dyn_idx]) {
+#ifndef SINGLE_THREAD
+		static pthread_mutex_t resolver_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+		pthread_mutex_lock(&resolver_mutex);
+#endif
+		if (!plthook_dynsym_resolved[dyn_idx]) {
+			new_addr = plthook_got_ptr[3 + dyn_idx];
+			/* restore GOT so plt_hooker keep called */
+			plthook_got_ptr[3 + dyn_idx] = mtdp->plthook_addr;
+
+			plthook_dynsym_addr[dyn_idx] = new_addr;
+			plthook_dynsym_resolved[dyn_idx] = true;
+		}
+#ifndef SINGLE_THREAD
+		pthread_mutex_unlock(&resolver_mutex);
+#endif
+	}
+}
 
 unsigned long plthook_entry(unsigned long *ret_addr, unsigned long child_idx,
 			    unsigned long module_id, struct mcount_regs *regs)
@@ -500,20 +605,22 @@ unsigned long plthook_entry(unsigned long *ret_addr, unsigned long child_idx,
 	*ret_addr = (unsigned long)plthook_return;
 
 	if (unlikely(special_flag)) {
+		/* force flush rstack on some special functions */
+		if (special_flag & PLT_FL_FLUSH) {
+			record_trace_data(mtdp, rstack, NULL);
+		}
+
 		if (special_flag & PLT_FL_SETJMP) {
-			setup_jmpbuf_rstack(mtdp, mtdp->idx - 1);
+			setup_jmpbuf_rstack(mtdp, ARG1(regs));
 		}
 		else if (special_flag & PLT_FL_LONGJMP) {
 			rstack->flags |= MCOUNT_FL_LONGJMP;
+			/* abuse end-time for the jmpbuf addr */
+			rstack->end_time = ARG1(regs);
 		}
 		else if (special_flag & PLT_FL_VFORK) {
 			rstack->flags |= MCOUNT_FL_VFORK;
 			prepare_vfork(mtdp, rstack);
-		}
-
-		/* force flush rstack on some special functions */
-		if (special_flag & PLT_FL_FLUSH) {
-			record_trace_data(mtdp, rstack, NULL);
 		}
 	}
 
@@ -540,7 +647,6 @@ out:
 unsigned long plthook_exit(long *retval)
 {
 	int dyn_idx;
-	unsigned long new_addr;
 	struct mcount_thread_data *mtdp;
 	struct mcount_ret_stack *rstack;
 
@@ -554,8 +660,9 @@ again:
 
 	if (unlikely(rstack->flags & (MCOUNT_FL_LONGJMP | MCOUNT_FL_VFORK))) {
 		if (rstack->flags & MCOUNT_FL_LONGJMP) {
-			restore_jmpbuf_rstack(mtdp, mtdp->idx + 1);
+			update_pltgot(mtdp, rstack->dyn_idx);
 			rstack->flags &= ~MCOUNT_FL_LONGJMP;
+			restore_jmpbuf_rstack(mtdp, rstack->end_time);
 			goto again;
 		}
 
@@ -578,25 +685,7 @@ again:
 		rstack->end_time = mcount_gettime();
 
 	mcount_exit_filter_record(mtdp, rstack, retval);
-
-	if (!plthook_dynsym_resolved[dyn_idx]) {
-#ifndef SINGLE_THREAD
-		static pthread_mutex_t resolver_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-		pthread_mutex_lock(&resolver_mutex);
-#endif
-		if (!plthook_dynsym_resolved[dyn_idx]) {
-			new_addr = plthook_got_ptr[3 + dyn_idx];
-			/* restore GOT so plt_hooker keep called */
-			plthook_got_ptr[3 + dyn_idx] = mtdp->plthook_addr;
-
-			plthook_dynsym_addr[dyn_idx] = new_addr;
-			plthook_dynsym_resolved[dyn_idx] = true;
-		}
-#ifndef SINGLE_THREAD
-		pthread_mutex_unlock(&resolver_mutex);
-#endif
-	}
+	update_pltgot(mtdp, dyn_idx);
 
 	compiler_barrier();
 
