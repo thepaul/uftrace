@@ -25,6 +25,10 @@
 #include "utils/symbol.h"
 #include "utils/filter.h"
 
+#ifndef  EM_AARCH64
+# define EM_AARCH64  183
+#endif
+
 static struct symtabs ksymtabs;
 
 static int addrsort(const void *a, const void *b)
@@ -138,6 +142,55 @@ elf_error:
 	goto out;
 }
 
+int check_static_binary(const char *filename)
+{
+	int fd;
+	Elf *elf;
+	GElf_Ehdr ehdr;
+	int ret = -1;
+	size_t i;
+
+	fd = open(filename, O_RDONLY);
+	if (fd < 0) {
+		pr_dbg("error during file open: %s: %m\n", filename);
+		return -1;
+	}
+
+	elf_version(EV_CURRENT);
+
+	elf = elf_begin(fd, ELF_C_READ_MMAP, NULL);
+	if (elf == NULL)
+		goto elf_error;
+
+	if (gelf_getehdr(elf, &ehdr) == NULL)
+		goto elf_error;
+
+	for (i = 0; i < ehdr.e_phnum; i++) {
+		GElf_Phdr phdr;
+
+		if (gelf_getphdr(elf, i, &phdr) == NULL)
+			goto elf_error;
+
+		if (phdr.p_type == PT_DYNAMIC) {
+			ret = 0;
+			break;
+		}
+	}
+
+	if (ret == -1)
+		ret = 1;  /* static binary */
+
+out:
+	elf_end(elf);
+	close(fd);
+	return ret;
+
+elf_error:
+	pr_dbg("ELF error when reading program headers: %s\n",
+	       elf_errmsg(elf_errno()));
+	goto out;
+}
+
 static void __unload_symtab(struct symtab *symtab)
 {
 	size_t i;
@@ -176,6 +229,7 @@ static int load_symtab(struct symtab *symtab, const char *filename,
 	Elf_Data *sym_data;
 	size_t shstr_idx, symstr_idx = 0, dynsymstr_idx = 0;
 	unsigned long prev_sym_value = -1;
+	int dup_syms = 0;
 
 	fd = open(filename, O_RDONLY);
 	if (fd < 0) {
@@ -190,13 +244,13 @@ static int load_symtab(struct symtab *symtab, const char *filename,
 		goto elf_error;
 
 	if (flags & SYMTAB_FL_ADJ_OFFSET) {
+		GElf_Ehdr ehdr;
 		GElf_Phdr phdr;
-		size_t nr_phdr;
 
-		if (elf_getphdrnum(elf, &nr_phdr) < 0)
+		if (gelf_getehdr(elf, &ehdr) == NULL)
 			goto elf_error;
 
-		for (i = 0; i < nr_phdr; i++) {
+		for (i = 0; i < ehdr.e_phnum; i++) {
 			if (!gelf_getphdr(elf, i, &phdr))
 				goto elf_error;
 
@@ -242,7 +296,7 @@ static int load_symtab(struct symtab *symtab, const char *filename,
 		sym_sec = dynsym_sec;
 		nr_sym = nr_dynsym;
 		symstr_idx = dynsymstr_idx;
-		pr_dbg2("using dynsym instead\n");
+		pr_dbg2("no symtab, using dynsyms instead\n");
 	}
 
 	if (sym_sec == NULL) {
@@ -254,7 +308,7 @@ static int load_symtab(struct symtab *symtab, const char *filename,
 	if (sym_data == NULL)
 		goto elf_error;
 
-	pr_dbg2("loading symbols from %s\n", filename);
+	pr_dbg2("loading symbols from %s (offset: %#lx)\n", filename, offset);
 	for (i = 0; i < nr_sym; i++) {
 		GElf_Sym elf_sym;
 		struct sym *sym;
@@ -312,9 +366,10 @@ static int load_symtab(struct symtab *symtab, const char *filename,
 		else
 			sym->name = xstrdup(name);
 
-		pr_dbg3("[%zd] %c %lx + %-5u %s\n", symtab->nr_sym,
+		pr_dbg3("[%zd] %c %"PRIx64" + %-5u %s\n", symtab->nr_sym,
 			sym->type, sym->addr, sym->size, sym->name);
 	}
+	pr_dbg2("loaded %zd symbols\n", symtab->nr_sym);
 
 	if (symtab->nr_sym == 0)
 		goto out;
@@ -334,12 +389,24 @@ static int load_symtab(struct symtab *symtab, const char *filename,
 		}
 
 		if (count) {
+			struct sym *tmp = curr;
+
+			while (tmp < next - 1) {
+				free(tmp->name);
+				tmp++;
+			}
+
 			memmove(curr, next - 1,
 				(symtab->nr_sym - i - count) * sizeof(*next));
 
 			symtab->nr_sym -= count;
+			dup_syms += count;
 		}
 	}
+
+	if (dup_syms)
+		pr_dbg2("removed %d duplicates\n", dup_syms);
+
 	symtab->nr_alloc = symtab->nr_sym;
 	symtab->sym = xrealloc(symtab->sym, symtab->nr_sym * sizeof(*symtab->sym));
 
@@ -391,15 +458,59 @@ static void sort_dynsymtab(struct symtab *dsymtab)
 	dsymtab->name_sorted = false;
 }
 
-static int load_dynsymtab(struct symtab *dsymtab, const char *filename,
-			  unsigned long offset, unsigned long flags)
+__weak int arch_load_dynsymtab_bindnow(Elf *elf, struct symtab *dsymtab,
+				       unsigned long offset, unsigned long flags)
 {
-	int fd;
+	return 0;
+}
+
+static int try_load_dynsymtab_bindnow(Elf *elf, struct Elf_Scn *dynsec,
+				      int nr_dyns, struct symtab *dsymtab,
+				      unsigned long offset, unsigned long flags)
+{
+	int idx;
+	bool bind_now = false;
+	Elf_Data *dynamic_data;
+
+	dynamic_data = elf_getdata(dynsec, NULL);
+	if (dynamic_data == NULL)
+		return 0;
+
+	for (idx = 0; idx < nr_dyns; idx++) {
+		GElf_Dyn dyn;
+
+		if (gelf_getdyn(dynamic_data, idx, &dyn) == NULL)
+			return 0;
+
+		if (dyn.d_tag != DT_BIND_NOW)
+			bind_now = true;
+		else if (dyn.d_tag == DT_FLAGS_1 && (dyn.d_un.d_val & DF_1_NOW))
+			bind_now = true;
+	}
+
+	if (!bind_now)
+		return 0;
+
+	if (arch_load_dynsymtab_bindnow(elf, dsymtab, offset, flags) < 0) {
+		pr_dbg("cannot load dynamic symbols for bind-now\n");
+		__unload_symtab(dsymtab);
+		return -1;
+	}
+
+	if (!dsymtab->nr_sym)
+		return 0;
+
+	sort_dynsymtab(dsymtab);
+	return 1;
+}
+
+int load_elf_dynsymtab(struct symtab *dsymtab, Elf *elf,
+		       unsigned long offset, unsigned long flags)
+{
 	int ret = -1;
-	int idx, nr_rels = 0;
+	int idx, nr_rels = 0, nr_dyns = 0;
 	unsigned grow = SYMTAB_GROW;
-	Elf *elf;
-	Elf_Scn *dynsym_sec, *relplt_sec, *sec;
+	Elf_Scn *dynsym_sec, *relplt_sec, *dynamic_sec, *sec;
 	Elf_Data *dynsym_data, *relplt_data;
 	size_t shstr_idx, dynstr_idx = 0;
 	GElf_Ehdr ehdr;
@@ -408,27 +519,14 @@ static int load_dynsymtab(struct symtab *dsymtab, const char *filename,
 	size_t plt_entsize = 1;
 	int rel_type = SHT_NULL;
 
-	fd = open(filename, O_RDONLY);
-	if (fd < 0) {
-		pr_dbg("error during open symbol file: %s: %m\n", filename);
-		return -1;
-	}
-
-	elf_version(EV_CURRENT);
-
-	elf = elf_begin(fd, ELF_C_READ_MMAP, NULL);
-	if (elf == NULL)
+	if (gelf_getehdr(elf, &ehdr) == NULL)
 		goto elf_error;
 
 	if (flags & SYMTAB_FL_ADJ_OFFSET) {
 		GElf_Phdr phdr;
-		size_t nr_phdr;
 		unsigned i;
 
-		if (elf_getphdrnum(elf, &nr_phdr) < 0)
-			goto elf_error;
-
-		for (i = 0; i < nr_phdr; i++) {
+		for (i = 0; i < ehdr.e_phnum; i++) {
 			if (!gelf_getphdr(elf, i, &phdr))
 				goto elf_error;
 
@@ -442,7 +540,7 @@ static int load_dynsymtab(struct symtab *dsymtab, const char *filename,
 	if (elf_getshdrstrndx(elf, &shstr_idx) < 0)
 		goto elf_error;
 
-	sec = dynsym_sec = relplt_sec = NULL;
+	sec = dynsym_sec = relplt_sec = dynamic_sec = NULL;
 	while ((sec = elf_nextscn(elf, sec)) != NULL) {
 		char *shstr;
 		GElf_Shdr shdr;
@@ -455,33 +553,40 @@ static int load_dynsymtab(struct symtab *dsymtab, const char *filename,
 		if (strcmp(shstr, ".dynsym") == 0) {
 			dynsym_sec = sec;
 			dynstr_idx = shdr.sh_link;
-		} else if (strcmp(shstr, ".rela.plt") == 0) {
+		}
+		else if (strcmp(shstr, ".rela.plt") == 0) {
 			relplt_sec = sec;
 			nr_rels = shdr.sh_size / shdr.sh_entsize;
 			rel_type = SHT_RELA;
-		} else if (strcmp(shstr, ".rel.plt") == 0) {
+		}
+		else if (strcmp(shstr, ".rel.plt") == 0) {
 			relplt_sec = sec;
 			nr_rels = shdr.sh_size / shdr.sh_entsize;
 			rel_type = SHT_REL;
-		} else if (strcmp(shstr, ".plt") == 0) {
-			plt_addr = shdr.sh_addr;
+		}
+		else if (strcmp(shstr, ".plt") == 0) {
+			plt_addr = shdr.sh_addr + offset;
 			plt_entsize = shdr.sh_entsize;
+		}
+		else if (strcmp(shstr, ".dynamic") == 0) {
+			dynamic_sec = sec;
+			nr_dyns = shdr.sh_size / shdr.sh_entsize;
 		}
 	}
 
-	if (dynsym_sec == NULL || plt_addr == 0) {
-		pr_dbg("cannot find dynamic symbols.. skipping\n");
+	if (dynsym_sec == NULL || dynamic_sec == NULL || plt_addr == 0) {
+		pr_dbg2("cannot find dynamic symbols.. skipping\n");
 		ret = 0;
 		goto out;
 	}
 
 	if (rel_type != SHT_RELA && rel_type != SHT_REL) {
-		pr_dbg("cannot find relocation info for PLT\n");
+		ret = try_load_dynsymtab_bindnow(elf, dynamic_sec, nr_dyns,
+						 dsymtab, offset, flags);
+		if (ret <= 0)
+			pr_dbg("cannot find relocation info for PLT\n");
 		goto out;
 	}
-
-	if (gelf_getehdr(elf, &ehdr) == NULL)
-		goto elf_error;
 
 	relplt_data = elf_getdata(relplt_sec, NULL);
 	if (relplt_data == NULL)
@@ -491,12 +596,16 @@ static int load_dynsymtab(struct symtab *dsymtab, const char *filename,
 	if (dynsym_data == NULL)
 		goto elf_error;
 
-	if (ehdr.e_machine == EM_ARM)
+	if (ehdr.e_machine == EM_ARM) {
+		plt_addr += 8;     /* ARM PLT0 size is 20 */
 		plt_entsize = 12;  /* size of R_ARM_JUMP_SLOT */
+	}
+	else if (ehdr.e_machine == EM_AARCH64) {
+		plt_addr += 16;    /* AARCH64 PLT0 size is 32 */
+	}
 
 	prev_addr = plt_addr;
 
-	pr_dbg2("loading dynamic symbols from %s\n", filename);
 	for (idx = 0; idx < nr_rels; idx++) {
 		GElf_Sym esym;
 		struct sym *sym;
@@ -532,23 +641,24 @@ static int load_dynsymtab(struct symtab *dsymtab, const char *filename,
 
 		sym = &dsymtab->sym[dsymtab->nr_sym++];
 
-		sym->addr = esym.st_value ?: prev_addr + plt_entsize;
+		if (ehdr.e_machine == EM_ARM && esym.st_value)
+			sym->addr = esym.st_value + offset;
+		else
+			sym->addr = prev_addr + plt_entsize;
 		sym->size = plt_entsize;
 		sym->type = ST_PLT;
 
 		prev_addr = sym->addr;
-
-		if (flags & SYMTAB_FL_ADJ_OFFSET)
-			sym->addr += offset;
 
 		if (flags & SYMTAB_FL_DEMANGLE)
 			sym->name = demangle(name);
 		else
 			sym->name = xstrdup(name);
 
-		pr_dbg3("[%zd] %c %lx + %-5u %s\n", dsymtab->nr_sym,
+		pr_dbg3("[%zd] %c %"PRIx64" + %-5u %s\n", dsymtab->nr_sym,
 			sym->type, sym->addr, sym->size, sym->name);
 	}
+	pr_dbg2("loaded %zd symbols\n", dsymtab->nr_sym);
 
 	if (dsymtab->nr_sym == 0)
 		goto out;
@@ -557,8 +667,6 @@ static int load_dynsymtab(struct symtab *dsymtab, const char *filename,
 	ret = 0;
 
 out:
-	elf_end(elf);
-	close(fd);
 	return ret;
 
 elf_error:
@@ -566,6 +674,90 @@ elf_error:
 	       elf_errmsg(elf_errno()));
 	__unload_symtab(dsymtab);
 	goto out;
+}
+
+static int load_dynsymtab(struct symtab *dsymtab, const char *filename,
+			  unsigned long offset, unsigned long flags)
+{
+	int fd, ret;
+	Elf *elf;
+
+	fd = open(filename, O_RDONLY);
+	if (fd < 0) {
+		pr_dbg("error during open symbol file: %s: %m\n", filename);
+		return -1;
+	}
+
+	elf_version(EV_CURRENT);
+
+	elf = elf_begin(fd, ELF_C_READ_MMAP, NULL);
+	if (elf == NULL) {
+		int err = elf_errno();
+
+		pr_dbg("ELF error during load dynsymtab: %s\n", elf_errmsg(err));
+		close(fd);
+		return -1;
+	}
+
+	pr_dbg2("loading dynamic symbols from %s (offset: %#lx)\n", filename, offset);
+	ret = load_elf_dynsymtab(dsymtab, elf, offset, flags);
+
+	elf_end(elf);
+	close(fd);
+	return ret;
+}
+
+static void merge_symtabs(struct symtab *left, struct symtab *right)
+{
+	size_t nr_sym = left->nr_sym + right->nr_sym;
+	struct sym *syms;
+	size_t i;
+
+	if (right->nr_sym == 0)
+		return;
+
+	if (left->nr_sym == 0) {
+		*left = *right;
+		right->nr_sym = 0;
+		right->sym = NULL;
+		return;
+	}
+
+	pr_dbg2("merge two symbol tables (left = %u, right = %u)\n",
+		left->nr_sym, right->nr_sym);
+
+	syms = xmalloc(nr_sym * sizeof(*syms));
+
+	if (left->sym[0].addr < right->sym[0].addr) {
+		memcpy(&syms[0], left->sym, left->nr_sym * sizeof(*syms));
+		memcpy(&syms[left->nr_sym], right->sym, right->nr_sym * sizeof(*syms));
+	}
+	else {
+		memcpy(&syms[0], right->sym, right->nr_sym * sizeof(*syms));
+		memcpy(&syms[right->nr_sym], left->sym, left->nr_sym * sizeof(*syms));
+	}
+
+	free(left->sym);
+	free(right->sym);
+	left->sym = NULL;
+	right->sym = NULL;
+
+	free(left->sym_names);
+	free(right->sym_names);
+	left->sym_names = NULL;
+	right->sym_names = NULL;
+
+	left->nr_sym = left->nr_alloc = nr_sym;
+	left->sym = syms;
+	left->sym_names = xmalloc(nr_sym * sizeof(*left->sym_names));
+
+	qsort(left->sym, left->nr_sym, sizeof(*left->sym), addrsort);
+
+	for (i = 0; i < left->nr_sym; i++)
+		left->sym_names[i] = &left->sym[i];
+	qsort(left->sym_names, left->nr_sym, sizeof(*left->sym_names), namesort);
+
+	left->name_sorted = true;
 }
 
 int check_trace_functions(const char *filename)
@@ -658,7 +850,7 @@ elf_error:
 static uint64_t find_map_offset(struct symtabs *symtabs,
 				     const char *filename)
 {
-	struct ftrace_proc_maps *maps = symtabs->maps;
+	struct uftrace_mmap *maps = symtabs->maps;
 
 	while (maps) {
 		if (!strcmp(maps->libname, filename))
@@ -669,10 +861,10 @@ static uint64_t find_map_offset(struct symtabs *symtabs,
 	return 0;
 }
 
-struct ftrace_proc_maps *find_map_by_name(struct symtabs *symtabs,
-					  const char *prefix)
+struct uftrace_mmap *find_map_by_name(struct symtabs *symtabs,
+				      const char *prefix)
 {
-	struct ftrace_proc_maps *maps = symtabs->maps;
+	struct uftrace_mmap *maps = symtabs->maps;
 	char *mod_name;
 
 	while (maps) {
@@ -761,44 +953,62 @@ void load_dlopen_symtabs(struct symtabs *symtabs, unsigned long offset,
 static int load_module_symbol(struct symtab *symtab, const char *symfile,
 			      unsigned long offset);
 
-void load_module_symtabs(struct symtabs *symtabs, struct list_head *head)
+void load_module_symtabs(struct symtabs *symtabs)
 {
-	struct filter_module *fm;
-	struct ftrace_proc_maps *maps;
+	struct uftrace_mmap *maps;
+	static const char * const skip_libs[] = {
+		/* uftrace internal libraries */
+		"libmcount.so",
+		"libmcount-fast.so",
+		"libmcount-single.so",
+		"libmcount-fast-single.so",
+	};
+	size_t k;
+	unsigned long flags = symtabs->flags;
 
 	assert(symtabs->maps);
 
-	list_for_each_entry(fm, head, list) {
-		if (!strcasecmp(fm->name, "main") ||
-		    !strcasecmp(fm->name, "PLT") ||
-		    !strcasecmp(fm->name, "kernel"))
-			continue;
+	maps = symtabs->maps;
+	while (maps) {
+		struct symtab dsymtab = {};
 
-		maps = find_map_by_name(symtabs, fm->name);
-		if (maps == NULL || maps->symtab.nr_sym)
-			continue;
+		if (!strcmp(maps->libname, symtabs->filename))
+			goto next;
+		if (maps->libname[0] == '[')
+			goto next;
 
-		if (symtabs->flags & SYMTAB_FL_USE_SYMFILE) {
-			char *symfile = NULL;
-			bool ok = false;
-			unsigned long offset = 0;
-
-			if (symtabs->flags & SYMTAB_FL_ADJ_OFFSET)
-				offset = maps->start;
-
-			xasprintf(&symfile, "%s/%s.sym", symtabs->dirname,
-				  basename(maps->libname));
-			if (!load_module_symbol(&maps->symtab, symfile, offset))
-				ok = true;
-			free(symfile);
-
-			if (ok)
-				continue;
+		for (k = 0; k < ARRAY_SIZE(skip_libs); k++) {
+			if (!strcmp(basename(maps->libname), skip_libs[k]))
+				goto next;
 		}
 
-		pr_dbg("load module symbol: %s\n", maps->libname);
-		load_symtab(&maps->symtab, maps->libname,
-			    maps->start, symtabs->flags);
+		pr_dbg2("load module symbol table: %s\n", maps->libname);
+
+		if (flags & SYMTAB_FL_USE_SYMFILE) {
+			char *symfile = NULL;
+
+			xasprintf(&symfile, "%s/%s.sym",
+				  symtabs->dirname, basename(maps->libname));
+			if (access(symfile, F_OK) == 0)
+				load_module_symbol(&maps->symtab, symfile, maps->start);
+
+			free(symfile);
+
+			if (maps->symtab.nr_sym)
+				goto next;
+		}
+
+		/*
+		 * Currently it uses a single symtab for both normal symbols
+		 * and dynamic symbols.  Maybe it can be changed later to
+		 * support more sophisticated symbol handling.
+		 */
+		load_symtab(&maps->symtab, maps->libname, maps->start, flags);
+		load_dynsymtab(&dsymtab, maps->libname, maps->start, flags);
+		merge_symtabs(&maps->symtab, &dsymtab);
+
+next:
+		maps = maps->next;
 	}
 }
 
@@ -899,13 +1109,15 @@ int load_symbol_file(struct symtabs *symtabs, const char *symfile,
 		sym->name = demangle(name);
 		sym->size = 0;
 
-		pr_dbg3("[%zd] %c %lx + %-5u %s\n", stab->nr_sym,
+		pr_dbg3("[%zd] %c %"PRIx64" + %-5u %s\n", stab->nr_sym,
 			sym->type, sym->addr, sym->size, sym->name);
 
 		if (stab->nr_sym > 1)
 			sym[-1].size = sym->addr - sym[-1].addr;
 	}
 	free(line);
+	pr_dbg2("loaded %zd normal + %zd dynamic symbols\n",
+		symtabs->symtab.nr_sym, symtabs->dsymtab.nr_sym);
 
 	stab = &symtabs->symtab;
 	qsort(stab->sym, stab->nr_sym, sizeof(*stab->sym), addrsort);
@@ -943,8 +1155,8 @@ void save_symbol_file(struct symtabs *symtabs, const char *dirname,
 	unsigned long offset = 0;
 	int fd;
 	Elf *elf = NULL;
+	GElf_Ehdr ehdr;
 	GElf_Phdr phdr;
-	size_t nr = 0;
 
 	xasprintf(&symfile, "%s/%s.sym", dirname, basename(exename));
 
@@ -969,10 +1181,10 @@ void save_symbol_file(struct symtabs *symtabs, const char *dirname,
 	if (elf == NULL)
 		goto do_it;
 
-	if (elf_getphdrnum(elf, &nr) < 0)
+	if (gelf_getehdr(elf, &ehdr) == NULL)
 		goto do_it;
 
-	for (i = 0; i < nr; i++) {
+	for (i = 0; i < ehdr.e_phnum; i++) {
 		if (!gelf_getphdr(elf, i, &phdr))
 			break;
 		if (phdr.p_type == PT_LOAD) {
@@ -1131,6 +1343,9 @@ static void save_module_symbol(struct symtab *stab, const char *symfile,
 	FILE *fp;
 	unsigned i;
 
+	if (stab->nr_sym == 0)
+		return;
+
 	fp = fopen(symfile, "wx");
 	if (fp == NULL) {
 		if (errno == EEXIST)
@@ -1153,19 +1368,13 @@ static void save_module_symbol(struct symtab *stab, const char *symfile,
 	fclose(fp);
 }
 
-void save_module_symtabs(struct symtabs *symtabs, struct list_head *modules)
+void save_module_symtabs(struct symtabs *symtabs)
 {
 	char *symfile = NULL;
-	struct filter_module *fm;
-	struct ftrace_proc_maps *map;
+	struct uftrace_mmap *map;
 
-	list_for_each_entry(fm, modules, list) {
-		map = find_map_by_name(symtabs, fm->name);
-		if (map == NULL) {
-			pr_dbg("cannot find module: %s\n", fm->name);
-			continue;
-		}
-
+	map = symtabs->maps;
+	while (map) {
 		xasprintf(&symfile, "%s/%s.sym", symtabs->dirname,
 			  basename(map->libname));
 
@@ -1173,6 +1382,8 @@ void save_module_symtabs(struct symtabs *symtabs, struct list_head *modules)
 
 		free(symfile);
 		symfile = NULL;
+
+		map = map->next;
 	}
 }
 
@@ -1233,13 +1444,12 @@ struct symtab * get_kernel_symtab(void)
 	return NULL;
 }
 
-void build_dynsym_idxlist(struct symtabs *symtabs, struct dynsym_idxlist *idxlist,
+void build_dynsym_idxlist(struct symtab *dsymtab, struct dynsym_idxlist *idxlist,
 			  const char *symlist[], unsigned symcount)
 {
 	unsigned i, k;
 	unsigned *idx = NULL;
 	unsigned count = 0;
-	struct symtab *dsymtab = &symtabs->dsymtab;
 
 	for (i = 0; i < dsymtab->nr_sym; i++) {
 		for (k = 0; k < symcount; k++) {
@@ -1296,7 +1506,7 @@ struct sym * find_symtabs(struct symtabs *symtabs, uint64_t addr)
 {
 	struct symtab *stab = &symtabs->symtab;
 	struct symtab *dtab = &symtabs->dsymtab;
-	struct ftrace_proc_maps *maps;
+	struct uftrace_mmap *maps;
 	struct sym *sym;
 
 	if (is_kernel_address(symtabs, addr)) {
@@ -1429,12 +1639,12 @@ void print_symtabs(struct symtabs *symtabs)
 
 	pr_out("\n\n");
 	pr_out("Dynamic symbols\n");
-	printf("===============\n");
+	pr_out("===============\n");
 	for (i = 0; i < dtab->nr_sym; i++) {
 		struct sym *sym = &dtab->sym[i];
 
 		name = symbol_getname(sym, sym->addr);
-		printf("[%2zd] %#"PRIx64": %s (size: %u)\n",
+		pr_out("[%2zd] %#"PRIx64": %s (size: %u)\n",
 		       i, sym->addr, name, sym->size);
 		symbol_putname(sym, name);
 	}

@@ -1,13 +1,13 @@
 #include <stdlib.h>
 #include <assert.h>
+#include <gelf.h>
 
-#include "mcount-arch.h"
-#include "libmcount/mcount.h"
+#include "libmcount/internal.h"
 #include "utils/utils.h"
 #include "utils/filter.h"
 
 int mcount_get_register_arg(struct mcount_arg_context *ctx,
-			    struct ftrace_arg_spec *spec)
+			    struct uftrace_arg_spec *spec)
 {
 	struct mcount_regs *regs = ctx->regs;
 	int reg_idx;
@@ -111,7 +111,7 @@ int mcount_get_register_arg(struct mcount_arg_context *ctx,
 }
 
 void mcount_get_stack_arg(struct mcount_arg_context *ctx,
-			  struct ftrace_arg_spec *spec)
+			  struct uftrace_arg_spec *spec)
 {
 	int offset = 1;
 
@@ -139,7 +139,7 @@ void mcount_get_stack_arg(struct mcount_arg_context *ctx,
 }
 
 void mcount_arch_get_arg(struct mcount_arg_context *ctx,
-			 struct ftrace_arg_spec *spec)
+			 struct uftrace_arg_spec *spec)
 {
 	/* don't support long double, treat it as double */
 	if (unlikely(spec->size == 10))
@@ -150,7 +150,7 @@ void mcount_arch_get_arg(struct mcount_arg_context *ctx,
 }
 
 void mcount_arch_get_retval(struct mcount_arg_context *ctx,
-			    struct ftrace_arg_spec *spec)
+			    struct uftrace_arg_spec *spec)
 {
 	/* don't support long double, treat it as double */
 	if (unlikely(spec->size == 10))
@@ -165,4 +165,12 @@ void mcount_arch_get_retval(struct mcount_arg_context *ctx,
 	}
 	else
 		memcpy(ctx->val.v, ctx->retval, spec->size);
+}
+
+unsigned long mcount_arch_plthook_addr(struct plthook_data *pd, int idx)
+{
+	struct sym *sym;
+
+	sym = &pd->dsymtab.sym[0];
+	return sym->addr - ARCH_PLT0_SIZE;
 }

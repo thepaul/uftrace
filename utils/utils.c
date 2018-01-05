@@ -6,8 +6,13 @@
 #include <errno.h>
 #include <sys/uio.h>
 #include <sys/stat.h>
+#include <limits.h>
+#include <libgen.h>
 
+#include "uftrace.h"
 #include "utils/utils.h"
+#include "utils/kernel.h"
+#include "libtraceevent/event-parse.h"
 
 
 volatile bool uftrace_done;
@@ -133,6 +138,7 @@ int remove_directory(char *dirname)
 {
 	DIR *dp;
 	struct dirent *ent;
+	struct stat statbuf;
 	char buf[PATH_MAX];
 	int saved_errno = 0;
 	int ret = 0;
@@ -144,13 +150,23 @@ int remove_directory(char *dirname)
 	pr_dbg("removing %s directory\n", dirname);
 
 	while ((ent = readdir(dp)) != NULL) {
-		if (ent->d_name[0] == '.')
+		if (!strcmp(ent->d_name, ".") ||
+		    !strcmp(ent->d_name, ".."))
 			continue;
 
 		snprintf(buf, sizeof(buf), "%s/%s", dirname, ent->d_name);
-		if (unlink(buf) < 0) {
+		ret = stat(buf, &statbuf);
+		if (ret < 0)
+			goto failed;
+
+		if (S_ISDIR(statbuf.st_mode))
+			ret = remove_directory(buf);
+		else
+			ret = unlink(buf);
+
+		if (ret < 0) {
+failed:
 			saved_errno = errno;
-			ret = -1;
 			break;
 		}
 	}
@@ -170,21 +186,21 @@ int create_directory(char *dirname)
 
 	xasprintf(&oldname, "%s.old", dirname);
 
-	if (!access(oldname, F_OK)) {
-		if (remove_directory(oldname) < 0) {
-			pr_log("removing old directory failed: %m\n");
+	if (!access(dirname, F_OK)) {
+		if (!access(oldname, F_OK) && remove_directory(oldname) < 0) {
+			pr_warn("removing old directory failed: %m\n");
+			goto out;
+		}
+
+		if (rename(dirname, oldname) < 0) {
+			pr_warn("rename %s -> %s failed: %m\n", dirname, oldname);
 			goto out;
 		}
 	}
 
-	if (!access(dirname, F_OK) && rename(dirname, oldname) < 0) {
-		pr_log("rename %s -> %s failed: %m\n", dirname, oldname);
-		goto out;
-	}
-
 	ret = mkdir(dirname, 0755);
 	if (ret < 0)
-		pr_log("creating directory failed: %m\n");
+		pr_warn("creating directory failed: %m\n");
 
 out:
 	free(oldname);
@@ -392,3 +408,210 @@ char * strjoin(char *left, char *right, char *delim)
 	strcpy(new + len - rlen - 1, right);
 	return new;
 }
+
+#define QUOTE '\''
+#define DQUOTE '"'
+#define QUOTES "\'\""
+
+/* escape quotes with backslash - caller should free the returned string */
+char * strquote(char *str, int *len)
+{
+	char *p = str;
+	int quote = 0;
+	int i, k;
+	int orig_len = *len;
+
+	/* find number of necessary escape */
+	while ((p = strpbrk(p, QUOTES)) != NULL) {
+		quote++;
+		p++;
+	}
+
+	p = xmalloc(orig_len + quote + 1);
+
+	/* escape single- and double-quotes */
+	for (i = k = 0; i < orig_len; i++, k++) {
+		if (str[i] == QUOTE) {
+			p[k++] = '\\';
+			p[k] = QUOTE;
+		}
+		else if (str[i] == DQUOTE) {
+			p[k++] = '\\';
+			p[k] = DQUOTE;
+		}
+		else
+			p[k] = str[i];
+	}
+	p[k] = '\0';
+	*len = k;
+
+	return p;
+}
+
+static int setargs(char *args, char **argv)
+{
+	int count = 0;
+
+	while (*args) {
+		/* ignore spaces */
+		if (isspace(*args)) {
+			++args;
+			continue;
+		}
+
+		/* consider quotes and update argv */
+		if (*args == QUOTE) {
+			if (argv)
+				argv[count] = ++args;
+			while (*args != QUOTE)
+				++args;
+			if (argv)
+				*args = ' ';
+		}
+		else if (*args == DQUOTE) {
+			if (argv)
+				argv[count] = ++args;
+			while (*args != DQUOTE)
+				++args;
+			if (argv)
+				*args = ' ';
+		}
+		else if (*args == '#') {
+			/* ignore comment line */
+			while (*args != '\n' || *args == '\0')
+				++args;
+			continue;
+		}
+		else if (argv) {
+			argv[count] = args;
+		}
+		/* read characters until '\0' or space */
+		while (*args && !isspace(*args))
+			++args;
+		/* set '\0' rather than space */
+		if (argv && *args)
+			*args++ = '\0';
+		/* count up argument */
+		count++;
+	}
+
+	return count;
+}
+
+#undef QUOTE
+#undef DQUOTE
+
+/**
+ * parse_cmdline - parse given string to be executed via execvp(3)
+ * @cmd:  full command line
+ * @argc: pointer to number of arguments
+ *
+ * This function parses @cmd and split it into an array of string
+ * to be executed by exec(3) like argv[] in main().  The @argc
+ * will be set to number of argument parsed if it's non-NULL.
+ * The resulting array contains a copy of input string (@cmd) in
+ * the first element which other elements point to.  It returns a
+ * pointer to the second element so that it can be used directly
+ * in other functions like exec(3).
+ *
+ * The returned array should be freed by free_parsed_cmdline().
+ */
+char **parse_cmdline(char *cmd, int *argc)
+{
+	char **argv = NULL;
+	char *cmd_dup = NULL;
+	int argn = 0;
+
+	if (!cmd || !*cmd)
+		return NULL;
+
+	/* duplicate cmdline to map to argv with modification */
+	cmd_dup = xstrdup(cmd);
+	/* get count of arguments */
+	argn = setargs(cmd_dup, NULL);
+	/* create argv array. +1 for cmd_dup, +1 for the last NULL */
+	argv = xcalloc(argn + 2, sizeof(char *));
+
+	/* remember cmd_dup to free later */
+	argv[0] = cmd_dup;
+	/* actual assigning of arguments to argv + 1 */
+	argn = setargs(cmd_dup, &argv[1]);
+	/* set last one as null for execv */
+	argv[argn + 1] = NULL;
+
+	/* pass count of arguments */
+	if (argc)
+		*argc = argn;
+
+	/* returns +1 addr to hide cmd_dup address */
+	return &argv[1];
+}
+
+
+/**
+ * free_parsed_cmdline - free memory that was allocated by parse_cmdline
+ * @argv: result of parse_cmdline
+ *
+ * The parse_cmdline uses internal allocation logic so,
+ * the pointer should be freed by this function rather than free.
+ */
+void free_parsed_cmdline(char **argv)
+{
+	if (argv) {
+		/* parse_cmdline() passes &argv[1] */
+		argv--;
+
+		/* free cmd_dup */
+		free(argv[0]);
+		/* free original argv */
+		free(argv);
+	}
+}
+
+/**
+ * absolute_dirname - return the canonicalized absolute dirname
+ *
+ * @path: pathname string that can be either absolute or relative path
+ * @resolved_path: input buffer that will store absolute dirname
+ *
+ * This function parses the @path and sets absolute dirname to @resolved_path.
+ *
+ * Given @path sets @resolved_path as follows:
+ *
+ *    @path                   | @resolved_path
+ *   -------------------------+----------------
+ *    mcount.py               | $PWD
+ *    tests/mcount.py         | $PWD/tests
+ *    ./tests/mcount.py       | $PWD/./tests
+ *    /root/uftrace/mcount.py | /root/uftrace
+ */
+char *absolute_dirname(const char *path, char *resolved_path)
+{
+	if (realpath(path, resolved_path) == NULL)
+		return NULL;
+	dirname(resolved_path);
+
+	return resolved_path;
+}
+
+#ifdef UNIT_TEST
+TEST_CASE(parse_cmdline)
+{
+	char **cmdv;
+	int argc = -1;
+
+	cmdv = parse_cmdline(NULL, NULL);
+	TEST_EQ(cmdv, NULL);
+
+	cmdv = parse_cmdline("uftrace recv --run-cmd 'uftrace replay'", &argc);
+	TEST_NE(cmdv, NULL);
+	TEST_EQ(argc, 4);
+	TEST_STREQ(cmdv[0], "uftrace");
+	TEST_STREQ(cmdv[1], "recv");
+	TEST_STREQ(cmdv[2], "--run-cmd");
+	TEST_STREQ(cmdv[3], "uftrace replay");
+	free_parsed_cmdline(cmdv);
+
+	return TEST_OK;
+}
+#endif /* UNIT_TEST */

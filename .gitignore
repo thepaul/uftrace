@@ -24,9 +24,14 @@ check-deps/*
 FLAGS
 version.h
 .config
+.build/
 GPATH
 GRTAGS
 GTAGS
 TAGS
 tags
 cscope.*
+*.pyc
+*.sw[opn]
+*.patch
+*.orig

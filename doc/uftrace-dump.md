@@ -27,10 +27,13 @@ OPTIONS
 :   Show FlameGraph style output (svg) viewable by modern web browsers.
 
 -k, \--kernel
-:   Dump kernel functions as well as user functions.
+:   Dump kernel functions as well as user functions.  Note that this option is set by default and always shows kernel functions if exist.
 
 \--kernel-only
-:   Dump kernel functions only without user functions.  Implies `--kernel`.
+:   Dump kernel functions only (without user functions).
+
+\--kernel-full
+:   Show all kernel functions called outside of user functions.  This option is the inverse of `--kernel-skip-out`.  This option is only meaningful when used with \--chrome or \--flame-graph options.
 
 -F *FUNC*, \--filter=*FUNC*
 :   Set filter to trace selected functions only.  This option can be used more than once.  See `uftrace-replay`(1) for an explanation of filters.
@@ -56,6 +59,12 @@ OPTIONS
 -r *RANGE*, \--time-range=*RANGE*
 :   Only show functions executed within the time RANGE.  The RANGE can be \<start\>~\<stop\> (separated by "~") and one of \<start\> and \<stop\> can be omitted.  The \<start\> and \<stop\> are timestamp or elapsed time if they have \<time_unit\> postfix, for example '100us'.  The timestamp or elapsed time can be shown with `-f time` or `-f elapsed` option respectively in `uftrace replay`(1).
 
+\--event-full
+:   Show all (user) events outside of user functions.  This option is only meaningful when used with \--chrome or \--flame-graph options.
+
+\--demangle=*TYPE*
+:   Use demangled C++ symbol names for filters, triggers, arguments and/or return values.  Possible values are "full", "simple" and "no".  Default is "simple" which ignores function arguments and template parameters.
+
 
 EXAMPLE
 =======
@@ -69,7 +78,7 @@ This command dumps data like below:
     uftrace file header: header size   = 40
     uftrace file header: endian        = 1 (little)
     uftrace file header: class         = 2 (64 bit)
-    uftrace file header: features      = 0x3
+    uftrace file header: features      = 0x63 (PLTHOOK | TASK_SESSION | SYM_REL_ADDR | MAX_STACK)
     uftrace file header: info          = 0x3ff
 
     reading 23043.dat

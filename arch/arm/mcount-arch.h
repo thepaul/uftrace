@@ -1,5 +1,5 @@
-#ifndef __MCOUNT_ARCH_H__
-#define __MCOUNT_ARCH_H__
+#ifndef MCOUNT_ARCH_H
+#define MCOUNT_ARCH_H
 
 #define mcount_regs  mcount_regs
 
@@ -57,6 +57,9 @@ enum arm_reg_index {
 	ARM_REG_D7,
 };
 
+struct mcount_arch_context {
+};
+
 struct symtabs;
 
 #define FIX_PARENT_LOC
@@ -64,4 +67,7 @@ unsigned long * mcount_arch_parent_location(struct symtabs *symtabs,
 					    unsigned long *parent_loc,
 					    unsigned long child_ip);
 
-#endif /* __MCOUNT_ARCH_H__ */
+#define ARCH_PLT0_SIZE  20
+#define ARCH_PLTHOOK_ADDR_OFFSET  0
+
+#endif /* MCOUNT_ARCH_H */

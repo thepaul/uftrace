@@ -1,5 +1,5 @@
-#ifndef __UFTRACE_H__
-#define __UFTRACE_H__
+#ifndef UFTRACE_H
+#define UFTRACE_H
 
 #include <stdio.h>
 #include <stdint.h>
@@ -10,6 +10,7 @@
 #include "utils/rbtree.h"
 #include "utils/list.h"
 #include "utils/symbol.h"
+#include "utils/perf.h"
 
 
 #define UFTRACE_MAGIC_LEN  8
@@ -25,6 +26,9 @@
 #define OPT_RSTACK_DEFAULT  1024
 #define OPT_DEPTH_MAX       OPT_RSTACK_MAX
 #define OPT_DEPTH_DEFAULT   OPT_RSTACK_DEFAULT
+
+#define KB 1024
+#define MB (KB * 1024)
 
 struct uftrace_file_header {
 	char magic[UFTRACE_MAGIC_LEN];
@@ -48,6 +52,9 @@ enum uftrace_feat_bits {
 	RETVAL_BIT,
 	SYM_REL_ADDR_BIT,
 	MAX_STACK_BIT,
+	EVENT_BIT,
+	PERF_EVENT_BIT,
+	AUTO_ARGS_BIT,
 
 	FEAT_BIT_MAX,
 
@@ -59,6 +66,9 @@ enum uftrace_feat_bits {
 	RETVAL			= (1U << RETVAL_BIT),
 	SYM_REL_ADDR		= (1U << SYM_REL_ADDR_BIT),
 	MAX_STACK		= (1U << MAX_STACK_BIT),
+	EVENT			= (1U << EVENT_BIT),
+	PERF_EVENT		= (1U << PERF_EVENT_BIT),
+	AUTO_ARGS		= (1U << AUTO_ARGS_BIT),
 };
 
 enum uftrace_info_bits {
@@ -73,6 +83,7 @@ enum uftrace_info_bits {
 	USAGEINFO,
 	LOADINFO,
 	ARG_SPEC,
+	RECORD_DATE,
 };
 
 struct uftrace_info {
@@ -88,10 +99,17 @@ struct uftrace_info {
 	char *hostname;
 	char *distro;
 	char *argspec;
+	char *retspec;
+	char *autoarg;
+	char *autoret;
+	char *autoenum;
+	bool auto_args_enabled;
 	int nr_tid;
 	int *tids;
 	double stime;
 	double utime;
+	char *record_date;
+	char *elapsed_time;
 	long vctxsw;
 	long ictxsw;
 	long maxrss;
@@ -116,37 +134,13 @@ struct pevent;
 struct uftrace_record;
 struct uftrace_rstack_list;
 struct uftrace_session;
+struct uftrace_kernel_reader;
+struct uftrace_perf_reader;
 
 struct uftrace_session_link {
 	struct rb_root		root;
 	struct rb_root		tasks;
 	struct uftrace_session *first;
-};
-
-struct uftrace_kernel {
-	int pid;
-	int nr_cpus;
-	int depth;
-	bool skip_out;
-	unsigned long bufsize;
-	int *traces;
-	int *fds;
-	int64_t *offsets;
-	int64_t *sizes;
-	void **mmaps;
-	struct kbuffer **kbufs;
-	struct pevent *pevent;
-	struct uftrace_record *rstacks;
-	struct uftrace_rstack_list *rstack_list;
-	bool *rstack_valid;
-	bool *rstack_done;
-	int *missed_events;
-	int *tids;
-	char *output_dir;
-	struct list_head filters;
-	struct list_head notrace;
-	struct list_head patches;
-	struct list_head nopatch;
 };
 
 struct ftrace_file_handle {
@@ -155,15 +149,19 @@ struct ftrace_file_handle {
 	const char *dirname;
 	struct uftrace_file_header hdr;
 	struct uftrace_info info;
-	struct uftrace_kernel kernel;
+	struct uftrace_kernel_reader *kernel;
+	struct uftrace_perf_reader *perf;
 	struct ftrace_task_handle *tasks;
 	struct uftrace_session_link sessions;
 	int nr_tasks;
+	int nr_perf;
+	int last_perf_idx;
 	int depth;
 	bool needs_byte_swap;
 	bool needs_bit_swap;
 	uint64_t time_filter;
 	struct uftrace_time_range time_range;
+	struct list_head events;
 };
 
 #define UFTRACE_MODE_INVALID 0
@@ -175,6 +173,7 @@ struct ftrace_file_handle {
 #define UFTRACE_MODE_RECV    6
 #define UFTRACE_MODE_DUMP    7
 #define UFTRACE_MODE_GRAPH   8
+#define UFTRACE_MODE_SCRIPT  9
 
 #define UFTRACE_MODE_DEFAULT  UFTRACE_MODE_LIVE
 
@@ -193,6 +192,11 @@ struct opts {
 	char *diff;
 	char *fields;
 	char *patch;
+	char *event;
+	char **run_cmd;
+	char *opt_file;
+	char *script_file;
+	char *diff_policy;
 	int mode;
 	int idx;
 	int depth;
@@ -232,6 +236,12 @@ struct opts {
 	bool kernel;
 	bool kernel_skip_out;  /* also affects VDSO filter */
 	bool kernel_only;
+	bool list_event;
+	bool keep_pid;
+	bool event_skip_out;
+	bool nest_libcall;
+	bool record;
+	bool auto_args;
 	struct uftrace_time_range range;
 };
 
@@ -241,6 +251,8 @@ static inline bool opts_has_filter(struct opts *opts)
 		opts->depth != OPT_DEPTH_DEFAULT;
 }
 
+void parse_script_opt(struct opts *opts);
+
 int command_record(int argc, char *argv[], struct opts *opts);
 int command_replay(int argc, char *argv[], struct opts *opts);
 int command_live(int argc, char *argv[], struct opts *opts);
@@ -249,9 +261,9 @@ int command_info(int argc, char *argv[], struct opts *opts);
 int command_recv(int argc, char *argv[], struct opts *opts);
 int command_dump(int argc, char *argv[], struct opts *opts);
 int command_graph(int argc, char *argv[], struct opts *opts);
+int command_script(int argc, char *argv[], struct opts *opts);
 
 extern volatile bool uftrace_done;
-extern struct ftrace_proc_maps *proc_maps;
 
 int open_data_file(struct opts *opts, struct ftrace_file_handle *handle);
 void close_data_file(struct opts *opts, struct ftrace_file_handle *handle);
@@ -290,7 +302,7 @@ struct uftrace_dlopen_list {
 };
 
 struct uftrace_task {
-	int			 pid, tid;
+	int			 pid, tid, ppid;
 	struct rb_node		 node;
 	struct uftrace_sess_ref	 sref;
 	struct uftrace_sess_ref	*sref_last;
@@ -301,17 +313,20 @@ struct uftrace_task {
 enum uftrace_msg_type {
 	UFTRACE_MSG_REC_START		= 1,
 	UFTRACE_MSG_REC_END,
-	UFTRACE_MSG_TASK,
+	UFTRACE_MSG_TASK_START,
+	UFTRACE_MSG_TASK_END,
 	UFTRACE_MSG_FORK_START,
 	UFTRACE_MSG_FORK_END,
 	UFTRACE_MSG_SESSION,
 	UFTRACE_MSG_LOST,
 	UFTRACE_MSG_DLOPEN,
+	UFTRACE_MSG_FINISH,
 
 	UFTRACE_MSG_SEND_START		= 100,
 	UFTRACE_MSG_SEND_DIR_NAME,
 	UFTRACE_MSG_SEND_DATA,
 	UFTRACE_MSG_SEND_KERNEL_DATA,
+	UFTRACE_MSG_SEND_PERF_DATA,
 	UFTRACE_MSG_SEND_INFO,
 	UFTRACE_MSG_SEND_META_DATA,
 	UFTRACE_MSG_SEND_END,
@@ -366,6 +381,7 @@ void session_add_dlopen(struct uftrace_session *sess, uint64_t timestamp,
 			unsigned long base_addr, const char *libname);
 struct sym * session_find_dlsym(struct uftrace_session *sess, uint64_t timestamp,
 				unsigned long addr);
+void delete_sessions(struct uftrace_session_link *sess);
 
 struct uftrace_record;
 struct sym * task_find_sym(struct uftrace_session_link *sess,
@@ -386,6 +402,7 @@ int setup_client_socket(struct opts *opts);
 void send_trace_dir_name(int sock, char *name);
 void send_trace_data(int sock, int tid, void *data, size_t len);
 void send_trace_kernel_data(int sock, int cpu, void *data, size_t len);
+void send_trace_perf_data(int sock, int cpu, void *data, size_t len);
 void send_trace_metadata(int sock, const char *dirname, char *filename);
 void send_trace_info(int sock, struct uftrace_file_header *hdr,
 		     void *info, int len);
@@ -416,7 +433,7 @@ struct uftrace_record {
 	uint64_t more:   1;
 	uint64_t magic:  3;
 	uint64_t depth:  10;
-	uint64_t addr:   48;
+	uint64_t addr:   48; /* child ip or uftrace_event_id */
 };
 
 static inline bool is_v3_compat(struct uftrace_record *urec)
@@ -456,37 +473,43 @@ enum ftrace_ext_type {
 	FTRACE_ARGUMENT		= 1,
 };
 
-/* these functions will be used at record time */
-int setup_kernel_tracing(struct uftrace_kernel *kernel, struct opts *opts);
-int start_kernel_tracing(struct uftrace_kernel *kernel);
-int record_kernel_tracing(struct uftrace_kernel *kernel);
-int record_kernel_trace_pipe(struct uftrace_kernel *kernel, int cpu, int sock);
-int stop_kernel_tracing(struct uftrace_kernel *kernel);
-int finish_kernel_tracing(struct uftrace_kernel *kernel);
-
-/* these functions will be used at replay time */
-int setup_kernel_data(struct uftrace_kernel *kernel);
-int read_kernel_stack(struct ftrace_file_handle *handle,
-		      struct ftrace_task_handle **taskp);
-int read_kernel_cpu_data(struct uftrace_kernel *kernel, int cpu);
-void * read_kernel_event(struct uftrace_kernel *kernel, int cpu, int *psize);
-int finish_kernel_data(struct uftrace_kernel *kernel);
-
-static inline bool has_kernel_data(struct uftrace_kernel *kernel)
+static inline bool has_perf_data(struct ftrace_file_handle *handle)
 {
-	return kernel->pevent != NULL;
+	return handle->perf != NULL;
 }
-
-bool check_kernel_pid_filter(void);
 
 struct rusage;
 
-void fill_ftrace_info(uint64_t *info_mask, int fd, struct opts *opts, int status,
-		      struct rusage *rusage);
-int read_ftrace_info(uint64_t info_mask, struct ftrace_file_handle *handle);
-void clear_ftrace_info(struct uftrace_info *info);
+void fill_uftrace_info(uint64_t *info_mask, int fd, struct opts *opts, int status,
+		      struct rusage *rusage, char *elapsed_time);
+int read_uftrace_info(uint64_t info_mask, struct ftrace_file_handle *handle);
+void clear_uftrace_info(struct uftrace_info *info);
 
 int arch_fill_cpuinfo_model(int fd);
 int arch_register_index(char *reg_name);
 
-#endif /* __UFTRACE_H__ */
+enum uftrace_event_id {
+	EVENT_ID_KERNEL	= 0U,
+	/* kernel IDs are read from tracefs */
+
+	EVENT_ID_BUILTIN = 100000U,
+	EVENT_ID_PROC_STATM,
+	EVENT_ID_PAGE_FAULT,
+
+	/* supported perf events */
+	EVENT_ID_PERF		= 200000U,
+	EVENT_ID_PERF_SCHED_IN,
+	EVENT_ID_PERF_SCHED_OUT,
+	EVENT_ID_PERF_SCHED_BOTH,
+
+	EVENT_ID_USER	= 1000000U,
+};
+
+struct uftrace_event {
+	struct list_head	list;
+	enum uftrace_event_id	id;
+	char			*provider;
+	char			*event;
+};
+
+#endif /* UFTRACE_H */

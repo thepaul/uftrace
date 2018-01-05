@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <assert.h>
+#include <unistd.h>
 
 #define PR_FMT     "session"
 #define PR_DOMAIN  DBG_SESSION
@@ -12,12 +13,24 @@
 #include "utils/fstack.h"
 #include "libmcount/mcount.h"
 
+static void delete_tasks(struct uftrace_session_link *sessions);
+
+/**
+ * read_session_map - read memory mappings in a session map file
+ * @dirname: directory name of the session
+ * @symtabs: symbol table to keep the memory mapping
+ * @sid: session id
+ *
+ * This function reads mapping data from a session map file and
+ * construct the address space for a session to resolve symbols
+ * in libraries.
+ */
 void read_session_map(char *dirname, struct symtabs *symtabs, char *sid)
 {
 	FILE *fp;
 	char buf[PATH_MAX];
 	char *last_libname = NULL;
-	struct ftrace_proc_maps **maps = &symtabs->maps;
+	struct uftrace_mmap **maps = &symtabs->maps;
 
 	snprintf(buf, sizeof(buf), "%s/sid-%.16s.map", dirname, sid);
 	fp = fopen(buf, "rb");
@@ -29,7 +42,7 @@ void read_session_map(char *dirname, struct symtabs *symtabs, char *sid)
 		char prot[5];
 		char path[PATH_MAX];
 		size_t namelen;
-		struct ftrace_proc_maps *map;
+		struct uftrace_mmap *map;
 
 		/* skip anon mappings */
 		if (sscanf(buf, "%lx-%lx %s %*x %*x:%*x %*d %s\n",
@@ -51,6 +64,7 @@ void read_session_map(char *dirname, struct symtabs *symtabs, char *sid)
 		map->start = start;
 		map->end = end;
 		map->len = namelen;
+		map->next = NULL;
 		memcpy(map->prot, prot, 4);
 		map->symtab.sym = NULL;
 		map->symtab.sym_names = NULL;
@@ -60,10 +74,22 @@ void read_session_map(char *dirname, struct symtabs *symtabs, char *sid)
 		map->libname[strlen(path)] = '\0';
 		last_libname = map->libname;
 
-		map->next = *maps;
 		*maps = map;
+		maps = &map->next;
 	}
 	fclose(fp);
+}
+
+static void delete_session_map(struct symtabs *symtabs)
+{
+	struct uftrace_mmap *map, *tmp;
+
+	map = symtabs->maps;
+	while (map) {
+		tmp = map->next;
+		free(map);
+		map = tmp;
+	}
 }
 
 /**
@@ -120,6 +146,8 @@ void create_session(struct uftrace_session_link *sessions,
 	read_session_map(dirname, &s->symtabs, s->sid);
 	load_symtabs(&s->symtabs, dirname, s->exename);
 	set_kernel_base(&s->symtabs, s->sid);
+
+	load_module_symtabs(&s->symtabs);
 
 	if (sessions->first == NULL)
 		sessions->first = s;
@@ -278,6 +306,44 @@ struct sym * session_find_dlsym(struct uftrace_session *sess, uint64_t timestamp
 	return sym;
 }
 
+void delete_session(struct uftrace_session *sess)
+{
+	struct uftrace_dlopen_list *udl, *tmp;
+
+	list_for_each_entry_safe(udl, tmp, &sess->dlopen_libs, list) {
+		list_del(&udl->list);
+		unload_symtabs(&udl->symtabs);
+		free(udl);
+	}
+
+	unload_symtabs(&sess->symtabs);
+	delete_session_map(&sess->symtabs);
+	free(sess);
+}
+
+/**
+ * delete_sessions - free all resouces in the @sessions
+ * @sessions: session link to manage sessions and tasks
+ *
+ * This function removes all session-related data structure in
+ * @sessions.
+ */
+void delete_sessions(struct uftrace_session_link *sessions)
+{
+	struct uftrace_session *sess;
+	struct rb_node *n;
+
+	delete_tasks(sessions);
+
+	while (!RB_EMPTY_ROOT(&sessions->root)) {
+		n = rb_first(&sessions->root);
+		rb_erase(n, &sessions->root);
+
+		sess = rb_entry(n, struct uftrace_session, node);
+		delete_session(sess);
+	}
+}
+
 static void add_session_ref(struct uftrace_task *task, struct uftrace_session *sess,
 			    uint64_t timestamp)
 {
@@ -381,6 +447,7 @@ void create_task(struct uftrace_session_link *sessions,
 	/* msg->pid is a parent pid if forked */
 	t->pid = fork ? msg->tid : msg->pid;
 	t->tid = msg->tid;
+	t->ppid = fork ? msg->pid : 0;
 	t->sref_last = NULL;
 
 	if (needs_session) {
@@ -395,6 +462,33 @@ void create_task(struct uftrace_session_link *sessions,
 
 	rb_link_node(&t->node, parent, p);
 	rb_insert_color(&t->node, &sessions->tasks);
+}
+
+static void delete_task(struct uftrace_task *t)
+{
+	struct uftrace_sess_ref *sref, *tmp;
+
+	sref = t->sref.next;
+	while (sref) {
+		tmp = sref->next;
+		free(sref);
+		sref = tmp;
+	}
+	free(t);
+}
+
+static void delete_tasks(struct uftrace_session_link *sessions)
+{
+	struct uftrace_task *t;
+	struct rb_node *n;
+
+	while (!RB_EMPTY_ROOT(&sessions->tasks)) {
+		n = rb_first(&sessions->tasks);
+		rb_erase(n, &sessions->tasks);
+
+		t = rb_entry(n, struct uftrace_task, node);
+		delete_task(t);
+	}
 }
 
 /**
@@ -525,14 +619,16 @@ struct sym * task_find_sym_addr(struct uftrace_session_link *sessions,
 #ifdef UNIT_TEST
 
 static struct uftrace_session_link test_sessions;
+static const char session_map[] = "00400000-00401000 r-xp 00000000 08:03 4096 unittest\n";
 
 TEST_CASE(session_search)
 {
 	int i;
+	const int NUM_TEST = 100;
 
 	TEST_EQ(test_sessions.first, NULL);
 
-	for (i = 0; i < 1000; i++) {
+	for (i = 0; i < NUM_TEST; i++) {
 		struct uftrace_msg_sess msg = {
 			.task = {
 				.pid = 1,
@@ -542,8 +638,11 @@ TEST_CASE(session_search)
 			.sid = "test",
 			.namelen = 8,  /* = strlen("unittest") */
 		};
+		int fd;
 
-		creat("sid-test.map", 0400);
+		fd = creat("sid-test.map", 0400);
+		write(fd, session_map, sizeof(session_map)-1);
+		close(fd);
 		create_session(&test_sessions, &msg, ".", "unittest", false);
 		remove("sid-test.map");
 	}
@@ -552,11 +651,11 @@ TEST_CASE(session_search)
 	TEST_EQ(test_sessions.first->pid, 1);
 	TEST_EQ(test_sessions.first->start_time, 0);
 
-	for (i = 0; i < 1000; i++) {
+	for (i = 0; i < NUM_TEST; i++) {
 		int t;
 		struct uftrace_session *s;
 
-		t = random() % (1000 * 100);
+		t = random() % (NUM_TEST * 100);
 		s = find_session(&test_sessions, 1, t);
 
 		TEST_NE(s, NULL);
@@ -565,6 +664,9 @@ TEST_CASE(session_search)
 		TEST_LT(t, s->start_time + 100);
 	}
 
+	delete_sessions(&test_sessions);
+	TEST_EQ(RB_EMPTY_ROOT(&test_sessions.root), true);
+
 	return TEST_OK;
 }
 
@@ -572,6 +674,7 @@ TEST_CASE(task_search)
 {
 	struct uftrace_task *task;
 	struct uftrace_session *sess;
+	int fd;
 
 	/* 1. create initial task */
 	{
@@ -590,7 +693,9 @@ TEST_CASE(task_search)
 			.time = 100,
 		};
 
-		creat("sid-initial.map", 0400);
+		fd = creat("sid-initial.map", 0400);
+		write(fd, session_map, sizeof(session_map)-1);
+		close(fd);
 		create_session(&test_sessions, &smsg, ".", "unittest", false);
 		create_task(&test_sessions, &tmsg, false, true);
 		remove("sid-initial.map");
@@ -692,7 +797,9 @@ TEST_CASE(task_search)
 			.time = 500,
 		};
 
-		creat("sid-after_exec.map", 0400);
+		fd = creat("sid-after_exec.map", 0400);
+		write(fd, session_map, sizeof(session_map)-1);
+		close(fd);
 		create_session(&test_sessions, &smsg, ".", "unittest", false);
 		create_task(&test_sessions, &tmsg, false, true);
 		remove("sid-after_exec.map");
@@ -779,6 +886,10 @@ TEST_CASE(task_search)
 	sess = find_task_session(&test_sessions, 6, 100);
 	TEST_EQ(sess, NULL);
 
+	delete_sessions(&test_sessions);
+	TEST_EQ(RB_EMPTY_ROOT(&test_sessions.root), true);
+	TEST_EQ(RB_EMPTY_ROOT(&test_sessions.tasks), true);
+
 	return TEST_OK;
 }
 
@@ -800,10 +911,12 @@ TEST_CASE(task_symbol)
 	FILE *fp;
 
 	fp = fopen("sid-test.map", "w");
+	TEST_NE(fp, NULL);
 	fprintf(fp, "00400000-00401000 r-xp 00000000 08:03 4096 unittest\n");
 	fclose(fp);
 
 	fp = fopen("unittest.sym", "w");
+	TEST_NE(fp, NULL);
 	fprintf(fp, "00400100 P printf\n");
 	fprintf(fp, "00400200 P __dynsym_end\n");
 	fprintf(fp, "00400300 T _start\n");
@@ -822,6 +935,9 @@ TEST_CASE(task_symbol)
 
 	TEST_NE(sym, NULL);
 	TEST_STREQ(sym->name, "main");
+
+	delete_sessions(&test_sessions);
+	TEST_EQ(RB_EMPTY_ROOT(&test_sessions.root), true);
 
 	return TEST_OK;
 }
@@ -844,9 +960,13 @@ TEST_CASE(task_symbol_dlopen)
 	FILE *fp;
 	struct uftrace_dlopen_list *udl;
 
-	creat("sid-test.map", 0400);
+	fp = fopen("sid-test.map", "w");
+	TEST_NE(fp, NULL);
+	fprintf(fp, "00400000-00401000 r-xp 00000000 08:03 4096 unittest\n");
+	fclose(fp);
 
 	fp = fopen("libuftrace-test.so.0.sym", "w");
+	TEST_NE(fp, NULL);
 	fprintf(fp, "0100 P __tls_get_addr\n");
 	fprintf(fp, "0200 P __dynsym_end\n");
 	fprintf(fp, "0300 T _start\n");
@@ -869,6 +989,9 @@ TEST_CASE(task_symbol_dlopen)
 
 	TEST_NE(sym, NULL);
 	TEST_STREQ(sym->name, "foo");
+
+	delete_sessions(&test_sessions);
+	TEST_EQ(RB_EMPTY_ROOT(&test_sessions.root), true);
 
 	return TEST_OK;
 }

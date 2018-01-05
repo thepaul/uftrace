@@ -214,13 +214,13 @@ class TestBase:
         result = []
         mode = 0
         for ln in output.split('\n'):
-            if ln.strip() == '' or ln.startswith('#') or ln.startswith('='):
+            if ln.strip() == '' or ln.startswith('#'):
                 continue
             # A graph result consists of backtrace and calling functions
-            if ln.startswith('backtrace'):
+            if ln.startswith('=============== BACKTRACE ==============='):
                 mode = 1
                 continue
-            if ln.startswith('calling'):
+            if ln.startswith('========== FUNCTION CALL GRAPH =========='):
                 mode = 2
                 continue
             if mode == 1:
@@ -310,7 +310,10 @@ class TestBase:
         timed_out = False
         def timeout(sig, frame):
             timed_out = True
-            p.kill()
+            try:
+                p.kill()
+            except:
+                pass
 
         import signal
         signal.signal(signal.SIGALRM, timeout)
@@ -332,9 +335,9 @@ class TestBase:
                 return TestBase.TEST_ABNORMAL_EXIT
             return TestBase.TEST_NONZERO_RETURN
 
-        self.pr_debug("=========== %s =============\n%s" % ("expected", result_expect))
-        self.pr_debug("=========== %s =============\n%s" % ("original", result_origin))
-        self.pr_debug("=========== %s =============\n%s" % ("result", result_tested))
+        self.pr_debug("=========== %s ===========\n%s" % ("original", result_origin))
+        self.pr_debug("=========== %s ===========\n%s" % (" result ", result_tested))
+        self.pr_debug("=========== %s ===========\n%s" % ("expected", result_expect))
 
         if result_expect.strip() == '':
             return TestBase.TEST_DIFF_RESULT
@@ -406,7 +409,7 @@ def run_single_case(case, flags, opts, diff, dbg):
     result = []
 
     # for python3
-    _locals = locals()
+    _locals = {}
     exec("import %s; tc = %s.TestCase()" % (case, case), globals(), _locals)
     tc = _locals['tc']
     tc.set_debug(dbg)
@@ -460,6 +463,9 @@ def parse_argument():
     return parser.parse_args()
 
 if __name__ == "__main__":
+    # prevent to create .pyc files (it makes some tests failed)
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
     arg = parse_argument()
 
     if arg.case == 'all':

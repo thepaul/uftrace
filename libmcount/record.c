@@ -3,18 +3,23 @@
 #include <assert.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 /* This should be defined before #include "utils.h" */
 #define PR_FMT     "mcount"
 #define PR_DOMAIN  DBG_MCOUNT
 
 #include "libmcount/mcount.h"
+#include "libmcount/internal.h"
 #include "mcount-arch.h"
 #include "utils/utils.h"
 #include "utils/filter.h"
 
 #define SHMEM_SESSION_FMT  "/uftrace-%s-%d-%03d" /* session-id, tid, seq */
+
+#define ARG_STR_MAX	98
 
 static struct mcount_shmem_buffer *allocate_shmem_buffer(char *buf, size_t size,
 							 int tid, int idx)
@@ -22,7 +27,7 @@ static struct mcount_shmem_buffer *allocate_shmem_buffer(char *buf, size_t size,
 	int fd;
 	struct mcount_shmem_buffer *buffer = NULL;
 
-	snprintf(buf, size, SHMEM_SESSION_FMT, session_name(), tid, idx);
+	snprintf(buf, size, SHMEM_SESSION_FMT, mcount_session_name(), tid, idx);
 
 	fd = shm_open(buf, O_RDWR | O_CREAT | O_TRUNC, 0600);
 	if (fd < 0) {
@@ -53,7 +58,7 @@ void prepare_shmem_buffer(struct mcount_thread_data *mtdp)
 {
 	char buf[128];
 	int idx;
-	int tid = gettid(mtdp);
+	int tid = mcount_gettid(mtdp);
 	struct mcount_shmem *shmem = &mtdp->shmem;
 
 	pr_dbg2("preparing shmem buffers\n");
@@ -70,8 +75,9 @@ void prepare_shmem_buffer(struct mcount_thread_data *mtdp)
 	}
 
 	/* set idx 0 as current buffer */
-	snprintf(buf, sizeof(buf), SHMEM_SESSION_FMT, session_name(), tid, 0);
-	ftrace_send_message(UFTRACE_MSG_REC_START, buf, strlen(buf));
+	snprintf(buf, sizeof(buf), SHMEM_SESSION_FMT,
+		 mcount_session_name(), tid, 0);
+	uftrace_send_message(UFTRACE_MSG_REC_START, buf, strlen(buf));
 
 	shmem->done = false;
 	shmem->curr = 0;
@@ -102,7 +108,7 @@ void get_new_shmem_buffer(struct mcount_thread_data *mtdp)
 		shmem->buffer = new_buffer;
 
 		curr_buf = allocate_shmem_buffer(buf, sizeof(buf),
-						 gettid(mtdp), idx);
+						 mcount_gettid(mtdp), idx);
 	}
 
 	if (new_buffer == NULL || curr_buf == NULL) {
@@ -147,10 +153,10 @@ reuse:
 	}
 
 	snprintf(buf, sizeof(buf), SHMEM_SESSION_FMT,
-		 session_name(), gettid(mtdp), idx);
+		 mcount_session_name(), mcount_gettid(mtdp), idx);
 
 	pr_dbg2("new buffer: [%d] %s\n", idx, buf);
-	ftrace_send_message(UFTRACE_MSG_REC_START, buf, strlen(buf));
+	uftrace_send_message(UFTRACE_MSG_REC_START, buf, strlen(buf));
 
 	if (shmem->losts) {
 		struct uftrace_record *frstack = (void *)curr_buf->data;
@@ -161,7 +167,7 @@ reuse:
 		frstack->more   = 0;
 		frstack->addr   = shmem->losts;
 
-		ftrace_send_message(UFTRACE_MSG_LOST, &shmem->losts,
+		uftrace_send_message(UFTRACE_MSG_LOST, &shmem->losts,
 				    sizeof(shmem->losts));
 
 		curr_buf->size = sizeof(*frstack);
@@ -174,9 +180,9 @@ void finish_shmem_buffer(struct mcount_thread_data *mtdp, int idx)
 	char buf[64];
 
 	snprintf(buf, sizeof(buf), SHMEM_SESSION_FMT,
-		 session_name(), gettid(mtdp), idx);
+		 mcount_session_name(), mcount_gettid(mtdp), idx);
 
-	ftrace_send_message(UFTRACE_MSG_REC_END, buf, strlen(buf));
+	uftrace_send_message(UFTRACE_MSG_REC_END, buf, strlen(buf));
 }
 
 void clear_shmem_buffer(struct mcount_thread_data *mtdp)
@@ -184,7 +190,7 @@ void clear_shmem_buffer(struct mcount_thread_data *mtdp)
 	struct mcount_shmem *shmem = &mtdp->shmem;
 	int i;
 
-	pr_dbg2("releasing all shmem buffers for task %d\n", gettid(mtdp));
+	pr_dbg2("releasing all shmem buffers for task %d\n", mcount_gettid(mtdp));
 
 	for (i = 0; i < shmem->nr_buf; i++)
 		munmap(shmem->buffer[i], shmem_bufsize);
@@ -211,7 +217,7 @@ void shmem_finish(struct mcount_thread_data *mtdp)
 	shmem->curr = -1;
 
 	pr_dbg("%s: tid: %d seqnum = %u curr = %d, nr_buf = %d max_buf = %d\n",
-	       __func__, gettid(mtdp), shmem->seqnum, curr,
+	       __func__, mcount_gettid(mtdp), shmem->seqnum, curr,
 	       shmem->nr_buf, shmem->max_buf);
 
 	clear_shmem_buffer(mtdp);
@@ -229,7 +235,7 @@ void *get_argbuf(struct mcount_thread_data *mtdp,
 static unsigned save_to_argbuf(void *argbuf, struct list_head *args_spec,
 			       struct mcount_arg_context *ctx)
 {
-	struct ftrace_arg_spec *spec;
+	struct uftrace_arg_spec *spec;
 	unsigned size, total_size = 0;
 	unsigned max_size = ARGBUF_SIZE - sizeof(size);
 	bool is_retval = !!ctx->retval;
@@ -245,9 +251,22 @@ static unsigned save_to_argbuf(void *argbuf, struct list_head *args_spec,
 		else
 			mcount_arch_get_arg(ctx, spec);
 
-		if (spec->fmt == ARG_FMT_STR) {
+		if (spec->fmt == ARG_FMT_STR ||
+		    spec->fmt == ARG_FMT_STD_STRING) {
 			unsigned short len;
 			char *str = ctx->val.p;
+
+			if (spec->fmt == ARG_FMT_STD_STRING) {
+				/*
+				 * This is libstdc++ implementation dependent.
+				 * So doesn't work on others such as libc++.
+				 */
+				long *base = ctx->val.p;
+				long *_M_string_length = base + 1;
+				char *_M_dataplus = (char*)(*base);
+				len = *_M_string_length;
+				str = _M_dataplus;
+			}
 
 			if (str) {
 				unsigned i;
@@ -261,7 +280,15 @@ static unsigned save_to_argbuf(void *argbuf, struct list_head *args_spec,
 				len = 0;
 				for (i = 0; i < max_size - total_size; i++) {
 					dst[i] = str[i];
-					if (!str[i])
+
+					/* truncate long string */
+					if (i > ARG_STR_MAX) {
+						dst[i-3] = '.';
+						dst[i-2] = '.';
+						dst[i-1] = '.';
+						dst[i] = '\0';
+					}
+					if (!dst[i])
 						break;
 					len++;
 				}
@@ -269,16 +296,17 @@ static unsigned save_to_argbuf(void *argbuf, struct list_head *args_spec,
 				*(unsigned short *)ptr = len;
 			}
 			else {
-				/* mark NULL pointer with -1 */
-				len = 4;
-				memcpy(ptr, &len, sizeof(len));
-				memset(ptr + 2, 0xff, 4);
+				const char null_str[4] = { 'N', 'U', 'L', 'L' };
+
+				len = sizeof(null_str);
+				mcount_memcpy1(ptr, &len, sizeof(len));
+				mcount_memcpy1(ptr + 2, null_str, len);
 			}
 			size = ALIGN(len + 2, 4);
 		}
 		else {
-			memcpy(ptr, ctx->val.v, spec->size);
 			size = ALIGN(spec->size, 4);
+			mcount_memcpy4(ptr, ctx->val.v, size);
 		}
 		ptr += size;
 		total_size += size;
@@ -304,7 +332,7 @@ void save_argument(struct mcount_thread_data *mtdp,
 
 	size = save_to_argbuf(argbuf, args_spec, &ctx);
 	if (size == -1U) {
-		pr_log("argument data is too big\n");
+		pr_warn("argument data is too big\n");
 		return;
 	}
 
@@ -324,13 +352,80 @@ void save_retval(struct mcount_thread_data *mtdp,
 
 	size = save_to_argbuf(argbuf, args_spec, &ctx);
 	if (size == -1U) {
-		pr_log("retval data is too big\n");
+		pr_warn("retval data is too big\n");
 		rstack->flags &= ~MCOUNT_FL_RETVAL;
 		return;
 	}
 
 	*(unsigned *)argbuf = size;
 }
+
+static void save_proc_statm(void *buf)
+{
+	FILE *fp;
+	struct uftrace_proc_statm *statm = buf;
+
+	fp = fopen("/proc/self/statm", "r");
+	if (fp == NULL)
+		pr_err("failed to open /proc/self/statm");
+
+	if (fscanf(fp, "%"SCNu64" %"SCNu64" %"SCNu64,
+		   &statm->vmsize, &statm->vmrss, &statm->shared) != 3)
+		pr_err("failed to scan /proc/self/statm");
+
+	/* Since /proc/[pid]/statm prints the number of pages for each field,
+	 * it'd be better to keep the memory size in KB. */
+	statm->vmsize *= page_size_in_kb;
+	statm->vmrss  *= page_size_in_kb;
+	statm->shared *= page_size_in_kb;
+
+	fclose(fp);
+}
+
+static void save_page_fault(void *buf)
+{
+	struct rusage ru;
+	struct uftrace_page_fault *page_fault = buf;
+
+	/* getrusage provides faults info in a single syscall */
+	getrusage(RUSAGE_SELF, &ru);
+
+	page_fault->major = ru.ru_majflt;
+	page_fault->minor = ru.ru_minflt;
+}
+
+void save_trigger_read(struct mcount_thread_data *mtdp,
+		       struct mcount_ret_stack *rstack,
+		       enum trigger_read_type type)
+{
+	if (type & TRIGGER_READ_PROC_STATM) {
+		struct mcount_event *event;
+
+		if (mtdp->nr_events < MAX_EVENT) {
+			event = &mtdp->event[mtdp->nr_events++];
+
+			event->id    = EVENT_ID_PROC_STATM;
+			event->time  = rstack->start_time;
+			event->dsize = sizeof(struct uftrace_proc_statm);
+			event->idx   = mtdp->idx;
+			save_proc_statm(event->data);
+		}
+	}
+	if (type & TRIGGER_READ_PAGE_FAULT) {
+		struct mcount_event *event;
+
+		if (mtdp->nr_events < MAX_EVENT) {
+			event = &mtdp->event[mtdp->nr_events++];
+
+			event->id    = EVENT_ID_PAGE_FAULT;
+			event->time  = rstack->start_time;
+			event->dsize = sizeof(struct uftrace_page_fault);
+			event->idx   = mtdp->idx;
+			save_page_fault(event->data);
+		}
+	}
+}
+
 #else
 void *get_argbuf(struct mcount_thread_data *mtdp,
 		 struct mcount_ret_stack *rstack)
@@ -342,28 +437,29 @@ void save_retval(struct mcount_thread_data *mtdp,
 		 struct mcount_ret_stack *rstack, long *retval)
 {
 }
+
+void save_trigger_read(struct mcount_thread_data *mtdp,
+		       struct mcount_ret_stack *rstack,
+		       enum trigger_read_type type)
+{
+}
 #endif
 
-static int record_ret_stack(struct mcount_thread_data *mtdp,
-			    enum uftrace_record_type type,
-			    struct mcount_ret_stack *mrstack)
+static int record_event(struct mcount_thread_data *mtdp)
 {
-	struct uftrace_record *frstack;
-	uint64_t timestamp = mrstack->start_time;
 	struct mcount_shmem *shmem = &mtdp->shmem;
-	const size_t maxsize = (size_t)shmem_bufsize - sizeof(**shmem->buffer);
+	struct mcount_event *event = &mtdp->event[0];
 	struct mcount_shmem_buffer *curr_buf = shmem->buffer[shmem->curr];
-	size_t size = sizeof(*frstack);
-	void *argbuf = NULL;
-	uint64_t *buf;
-	uint64_t rec;
+	size_t maxsize = (size_t)shmem_bufsize - sizeof(**shmem->buffer);
+	struct {
+		uint64_t time;
+		uint64_t data;
+	} *rec;
+	size_t size = sizeof(*rec);
+	uint16_t data_size = event->dsize;
 
-	if ((type == UFTRACE_ENTRY && mrstack->flags & MCOUNT_FL_ARGUMENT) ||
-	    (type == UFTRACE_EXIT  && mrstack->flags & MCOUNT_FL_RETVAL)) {
-		argbuf = get_argbuf(mtdp, mrstack);
-		if (argbuf)
-			size += *(unsigned *)argbuf;
-	}
+	if (data_size)
+		size += ALIGN(data_size + 2, 8);
 
 	if (unlikely(shmem->curr == -1 || curr_buf->size + size > maxsize)) {
 		if (shmem->done)
@@ -380,8 +476,83 @@ static int record_ret_stack(struct mcount_thread_data *mtdp,
 		curr_buf = shmem->buffer[shmem->curr];
 	}
 
+	rec = (void *)(curr_buf->data + curr_buf->size);
+
+	/*
+	 * instead of set bitfields, do the bit operations manually.
+	 * this would be good both for performance and portability.
+	 */
+	rec->data  = UFTRACE_EVENT | RECORD_MAGIC << 3;
+	rec->data += (uint64_t)event->id << 16;
+	rec->time  = event->time;
+
+	if (data_size) {
+		void *ptr = rec + 1;
+
+		rec->data += 4;  /* set 'more' bit in uftrace_record */
+
+		*(uint16_t *)ptr = data_size;
+		memcpy(ptr + 2, event->data, data_size);
+	}
+
+	curr_buf->size += size;
+
+	/* clear event info */
+	mtdp->nr_events--;
+
+	return 0;
+}
+
+static int record_ret_stack(struct mcount_thread_data *mtdp,
+			    enum uftrace_record_type type,
+			    struct mcount_ret_stack *mrstack)
+{
+	struct uftrace_record *frstack;
+	uint64_t timestamp = mrstack->start_time;
+	struct mcount_shmem *shmem = &mtdp->shmem;
+	struct mcount_shmem_buffer *curr_buf;
+	size_t maxsize;
+	size_t size = sizeof(*frstack);
+	void *argbuf = NULL;
+	uint64_t *buf;
+	uint64_t rec;
+
 	if (type == UFTRACE_EXIT)
 		timestamp = mrstack->end_time;
+
+	if (unlikely(mtdp->nr_events)) {
+		while (mtdp->nr_events && mtdp->event[0].time < timestamp) {
+			record_event(mtdp);
+
+			mcount_memcpy4(&mtdp->event[0], &mtdp->event[1],
+				       sizeof(*mtdp->event) * mtdp->nr_events);
+		}
+	}
+
+	if ((type == UFTRACE_ENTRY && mrstack->flags & MCOUNT_FL_ARGUMENT) ||
+	    (type == UFTRACE_EXIT  && mrstack->flags & MCOUNT_FL_RETVAL)) {
+		argbuf = get_argbuf(mtdp, mrstack);
+		if (argbuf)
+			size += *(unsigned *)argbuf;
+	}
+
+	maxsize = (size_t)shmem_bufsize - sizeof(**shmem->buffer);
+	curr_buf = shmem->buffer[shmem->curr];
+
+	if (unlikely(shmem->curr == -1 || curr_buf->size + size > maxsize)) {
+		if (shmem->done)
+			return 0;
+		if (shmem->curr > -1)
+			finish_shmem_buffer(mtdp, shmem->curr);
+		get_new_shmem_buffer(mtdp);
+
+		if (shmem->curr == -1) {
+			shmem->losts++;
+			return -1;
+		}
+
+		curr_buf = shmem->buffer[shmem->curr];
+	}
 
 #if 0
 	frstack = (void *)(curr_buf->data + curr_buf->size);
@@ -412,17 +583,10 @@ static int record_ret_stack(struct mcount_thread_data *mtdp,
 
 	if (argbuf) {
 		unsigned int *ptr = (void *)curr_buf->data + curr_buf->size;
-		unsigned i;
 
 		size -= sizeof(*frstack);
 
-		/*
-		 * Calling memcpy() here (esp. with a large size) can
-		 * clobber floating-point registers (SSE registers on x86).
-		 * As the argbuf was aligned to 4-bytes, copy the words.
-		 */
-		for (i = 0; i < size; i += 4, ptr++)
-			*ptr = *(unsigned int *)(argbuf + sizeof(unsigned) + i);
+		mcount_memcpy4(ptr, argbuf + 4, size);
 
 		curr_buf->size += ALIGN(size, 8);
 	}
@@ -480,7 +644,7 @@ int record_trace_data(struct mcount_thread_data *mtdp,
 	size += count * sizeof(*frstack);
 
 	pr_dbg3("task %d recorded %zd bytes (record count = %d)\n",
-		gettid(mtdp), size, count);
+		mcount_gettid(mtdp), size, count);
 
 	while (non_written_mrstack && non_written_mrstack < mrstack) {
 		if (!(non_written_mrstack->flags & SKIP_FLAGS)) {
@@ -521,7 +685,8 @@ void record_proc_maps(char *dirname, const char *sess_id,
 {
 	FILE *ifp, *ofp;
 	char buf[4096];
-	struct ftrace_proc_maps *prev_map = NULL;
+	struct uftrace_mmap *prev_map = NULL;
+	char *last_libname = NULL;
 
 	ifp = fopen("/proc/self/maps", "r");
 	if (ifp == NULL)
@@ -538,7 +703,7 @@ void record_proc_maps(char *dirname, const char *sess_id,
 		char prot[5];
 		char path[PATH_MAX];
 		size_t namelen;
-		struct ftrace_proc_maps *map;
+		struct uftrace_mmap *map;
 
 		/* skip anon mappings */
 		if (sscanf(buf, "%lx-%lx %s %*x %*x:%*x %*d %s\n",
@@ -549,6 +714,10 @@ void record_proc_maps(char *dirname, const char *sess_id,
 		if (prot[2] != 'x')
 			goto next;
 
+		/* use first mapping only */
+		if (last_libname && !strcmp(last_libname, path))
+			continue;
+
 		/* save map for the executable */
 		namelen = ALIGN(strlen(path) + 1, 4);
 
@@ -557,13 +726,14 @@ void record_proc_maps(char *dirname, const char *sess_id,
 		map->start = start;
 		map->end = end;
 		map->len = namelen;
-		memcpy(map->prot, prot, 4);
+		mcount_memcpy1(map->prot, prot, 4);
 		map->symtab.sym = NULL;
 		map->symtab.sym_names = NULL;
 		map->symtab.nr_sym = 0;
 		map->symtab.nr_alloc = 0;
-		memcpy(map->libname, path, namelen);
+		mcount_memcpy1(map->libname, path, namelen);
 		map->libname[strlen(path)] = '\0';
+		last_libname = map->libname;
 
 		if (prev_map)
 			prev_map->next = map;

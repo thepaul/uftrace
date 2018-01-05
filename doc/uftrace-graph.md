@@ -9,7 +9,7 @@ uftrace-graph - Show function call graph
 
 SYNOPSIS
 ========
-uftrace graph [*options*] [<function>]
+uftrace graph [*options*] [*FUNCTION*]
 
 
 DESCRIPTION
@@ -44,16 +44,22 @@ OPTIONS
 :   Allocate internal graph structure up to *DEPTH*.
 
 -k, \--kernel
-:   Trace kernel functions as well as user functions.
+:   Trace kernel functions as well as user functions.  Note that this option is set by default and always shows kernel functions if exist.
 
 \--kernel-full
-:   Show all kernel functions called outside of user functions.  This option is the inverse of `--kernel-skip-out`.  Implies `--kernel`.
+:   Show all kernel functions called outside of user functions.  This option is the inverse of `--kernel-skip-out`.
 
 \--kernel-skip-out
 :   Do not show kernel functions called outside of user functions.  This option is deprecated and set to true by default.
 
 \--kernel-only
-:   Show kernel functions only without user functions.  Implies `--kernel`.
+:   Show kernel functions only without user functions.
+
+\--event-full
+:   Show all (user) events outside of user functions.
+
+\--demangle=*TYPE*
+:   Use demangled C++ symbol names for filters, triggers, arguments and/or return values.  Possible values are "full", "simple" and "no".  Default is "simple" which ignores function arguments and template parameters.
 
 
 EXAMPLES
@@ -83,17 +89,12 @@ This command show data like below:
 Running the `graph` command on the `main` function shows called functions like below:
 
     $ uftrace graph main
-    #
-    # function graph for 'main'
-    #
-    
-    backtrace
-    ================================
+    # Function Call Graph for 'main' (session: 073f1e84aa8b09d3)
+    =============== BACKTRACE ===============
      backtrace #0: hit 1, time  10.293 ms
        [0] main (0x4004f0)
     
-    calling functions
-    ================================
+    ========== FUNCTION CALL GRAPH ==========
       10.293 ms : (1) main
       46.626 us :  +-(2) foo
       44.360 us :  | (6) loop
@@ -108,19 +109,14 @@ It can also be seen that `main` called `bar` once and that `bar` then called `us
 Running graph command on a leaf function looks like below.
 
     $ uftrace graph loop
-    #
-    # function graph for 'loop'
-    #
-    
-    backtrace
-    ================================
+    # Function Call Graph for 'loop' (session: 073f1e84aa8b09d3)
+    =============== BACKTRACE ===============
      backtrace #0: hit 6, time  44.360 us
        [0] main (0x4004b0)
        [1] foo (0x400622)
        [2] loop (0x400f5f6)
     
-    calling functions
-    ================================
+    ========== FUNCTION CALL GRAPH ==========
       44.360 us : (6) loop
 
 The backtrace shows that loop is called from `foo` and that `foo` is called from `main`.  Since `loop` is a leaf function, it didn't call any other function.  In this case, `loop` was called only from a single path so backtrace #0 is hit 6 times.

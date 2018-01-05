@@ -6,8 +6,8 @@
  * Released under the GPL v2.
  */
 
-#ifndef FTRACE_SYMBOL_H
-#define FTRACE_SYMBOL_H
+#ifndef UFTRACE_SYMBOL_H
+#define UFTRACE_SYMBOL_H
 
 #include <stdint.h>
 #include <limits.h>
@@ -41,8 +41,8 @@ struct symtab {
 	bool name_sorted;
 };
 
-struct ftrace_proc_maps {
-	struct ftrace_proc_maps *next;
+struct uftrace_mmap {
+	struct uftrace_mmap *next;
 	uint64_t start;
 	uint64_t end;
 	char prot[4];
@@ -67,7 +67,7 @@ struct symtabs {
 	struct symtab symtab;
 	struct symtab dsymtab;
 	uint64_t kernel_base;
-	struct ftrace_proc_maps *maps;
+	struct uftrace_mmap *maps;
 };
 
 /* only meaningful for 64-bit systems */
@@ -94,19 +94,26 @@ void load_symtabs(struct symtabs *symtabs, const char *dirname,
 void unload_symtabs(struct symtabs *symtabs);
 void print_symtabs(struct symtabs *symtabs);
 
-void load_module_symtabs(struct symtabs *symtabs, struct list_head *head);
-void save_module_symtabs(struct symtabs *symtabs, struct list_head *head);
+typedef struct Elf Elf;
+int arch_load_dynsymtab_bindnow(Elf *elf, struct symtab *dsymtab,
+				unsigned long offset, unsigned long flags);
+int load_elf_dynsymtab(struct symtab *dsymtab, Elf *elf,
+		       unsigned long offset, unsigned long flags);
+
+void load_module_symtabs(struct symtabs *symtabs);
+void save_module_symtabs(struct symtabs *symtabs);
 void load_dlopen_symtabs(struct symtabs *symtabs, unsigned long offset,
 			 const char *filename);
 
 bool check_libpthread(const char *filename);
 int check_trace_functions(const char *filename);
+int check_static_binary(const char *filename);
 
 struct sym * find_dynsym(struct symtabs *symtabs, size_t idx);
 size_t count_dynsym(struct symtabs *symtabs);
 
-struct ftrace_proc_maps *find_map_by_name(struct symtabs *symtabs,
-					  const char *prefix);
+struct uftrace_mmap *find_map_by_name(struct symtabs *symtabs,
+				      const char *prefix);
 
 int save_kernel_symbol(char *dirname);
 int load_kernel_symbol(char *dirname);
@@ -125,7 +132,7 @@ struct dynsym_idxlist {
 	unsigned count;
 };
 
-void build_dynsym_idxlist(struct symtabs *symtabs, struct dynsym_idxlist *idxlist,
+void build_dynsym_idxlist(struct symtab *dsymtab, struct dynsym_idxlist *idxlist,
 			  const char *symlist[], unsigned symcount);
 void destroy_dynsym_idxlist(struct dynsym_idxlist *idxlist);
 bool check_dynsym_idxlist(struct dynsym_idxlist *idxlist, unsigned idx);
@@ -163,9 +170,9 @@ static inline bool support_full_demangle(void)
 
 static inline char *demangle_full(char *str)
 {
-	pr_log("full demangle is not supported\n");
+	pr_warn("full demangle is not supported\n");
 	return str;
 }
 #endif /* HAVE_CXA_DEMANGLE */
 
-#endif /* FTRACE_SYMBOL_H */
+#endif /* UFTRACE_SYMBOL_H */

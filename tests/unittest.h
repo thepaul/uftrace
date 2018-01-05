@@ -1,5 +1,5 @@
-#ifndef __UFTRACE_UNIT_TEST_H__
-#define __UFTRACE_UNIT_TEST_H__
+#ifndef UFTRACE_UNIT_TEST_H
+#define UFTRACE_UNIT_TEST_H
 
 #include <stdio.h>
 #include <string.h>
@@ -18,17 +18,19 @@ enum {
 
 extern int debug;
 
+#define __TEST_NG(file, line, test)	({			\
+	if (debug)						\
+		printf("test failed at %s:%d: %s\n",		\
+			file, line, test);			\
+	return TEST_NG;						\
+})
+
 #define __TEST_OP(a, op, b, file, line)  ({			\
 	__typeof__(a) __a = (a);				\
 	__typeof__(b) __b = (b);				\
 								\
-	if (!(__a op __b)) {					\
-		if (debug)					\
-			printf("test failed at %s:%d: %s\n",	\
-			       file, line, stringify(a op b));	\
-		/* return only if result is different */	\
-		return TEST_NG;					\
-	}							\
+	if (!(__a op __b))					\
+		__TEST_NG(file, line, stringify(a op b));	\
 	TEST_OK;						\
 })
 
@@ -40,23 +42,15 @@ extern int debug;
 #define TEST_LE(a, b)  __TEST_OP(a, <=, b, __FILE__, __LINE__)
 
 #define __TEST_STREQ(a, b, file, line)      ({			\
-	if (strcmp((a), (b))) {					\
-		if (debug)					\
-			printf("test failed: %s\n",		\
-			       stringify(a == b));		\
-		return TEST_NG;					\
-	}							\
+	if (strcmp((a), (b)))					\
+		__TEST_NG(file, line, stringify(a == b));	\
 	TEST_OK;						\
 })
-#define TEST_STREQ(a, b)  __TEST_STREQ((a), (b), __FILE, __LINE__)
+#define TEST_STREQ(a, b)  __TEST_STREQ((a), (b), __FILE__, __LINE__)
 
 #define __TEST_MEMEQ(a, b, sz, file, line)      ({		\
-	if (memcmp((a), (b), (sz))) {				\
-		if (debug)					\
-			printf("test failed: %s\n",		\
-			       stringify(a == b));		\
-		return TEST_NG;					\
-	}							\
+	if (memcmp((a), (b), (sz)))				\
+		__TEST_NG(file, line, stringify(a == b));	\
 	TEST_OK;						\
 })
 #define TEST_MEMEQ(a, b, sz)  __TEST_MEMEQ((a), (b), (sz), __FILE__, __LINE__)
@@ -84,8 +78,8 @@ int func_ ## t(void)
 #define TERM_COLOR_NORMAL	""
 #define TERM_COLOR_RESET	"\033[0m"
 #define TERM_COLOR_BOLD		"\033[1m"
-#define TERM_COLOR_RED		"\033[31m"
+#define TERM_COLOR_RED		"\033[1;31m"
 #define TERM_COLOR_GREEN	"\033[32m"
 #define TERM_COLOR_YELLOW	"\033[33m"
 
-#endif /* __UFTRACE_UNIT_TEST_H__ */
+#endif /* UFTRACE_UNIT_TEST_H */

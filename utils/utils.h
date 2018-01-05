@@ -6,8 +6,8 @@
  * Released under the GPL v2.
  */
 
-#ifndef __FTRACE_UTILS_H__
-#define __FTRACE_UTILS_H__
+#ifndef UFTRACE_UTILS_H
+#define UFTRACE_UTILS_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +17,7 @@
 #include <string.h>
 #include <ctype.h>
 
+#include "compiler.h"
 
 #ifndef container_of
 # define container_of(ptr, type, member) ({			\
@@ -45,6 +46,7 @@ extern int debug;
 extern FILE *logfp;
 extern FILE *outfp;
 
+/* must change DBG_DOMAIN_STR (in mcount.h) as well */
 enum debug_domain {
 	DBG_UFTRACE	= 0,
 	DBG_SYMBOL,
@@ -55,6 +57,8 @@ enum debug_domain {
 	DBG_KERNEL,
 	DBG_MCOUNT,
 	DBG_DYNAMIC,
+	DBG_EVENT,
+	DBG_SCRIPT,
 	DBG_DOMAIN_MAX,
 };
 extern int dbg_domain[DBG_DOMAIN_MAX];
@@ -75,8 +79,9 @@ enum color_setting {
 #define COLOR_CODE_GRAY     'g'
 #define COLOR_CODE_BOLD     'b'
 
+#define DEFAULT_EVENT_COLOR  COLOR_CODE_GRAY
+
 extern void __pr_dbg(const char *fmt, ...);
-extern void __pr_log(const char *fmt, ...);
 extern void __pr_out(const char *fmt, ...);
 extern void __pr_err(const char *fmt, ...) __attribute__((noreturn));
 extern void __pr_err_s(const char *fmt, ...) __attribute__((noreturn));
@@ -114,10 +119,6 @@ extern void setup_signal(void);
 		__pr_dbg(PR_FMT ": " fmt, ## __VA_ARGS__);	\
 })
 
-#define pr_log(fmt, ...)					\
-	__pr_log(PR_FMT ": %s:%d:%s\n" fmt,			\
-		 __FILE__, __LINE__, __func__, ## __VA_ARGS__)
-
 #define pr_err(fmt, ...)					\
 	__pr_err_s(PR_FMT ": %s:%d:%s\n ERROR: " fmt,		\
 		 __FILE__, __LINE__, __func__, ## __VA_ARGS__)
@@ -128,9 +129,9 @@ extern void setup_signal(void);
 
 #define pr_warn(fmt, ...)	__pr_warn("WARN: " fmt, ## __VA_ARGS__)
 
-#define pr_cont(fmt, ...)	__pr_log(fmt, ## __VA_ARGS__)
 #define pr_out(fmt, ...)	__pr_out(fmt, ## __VA_ARGS__)
-#define pr_use(fmt, ...)	__pr_out(fmt, ## __VA_ARGS__)
+#define pr_cont(fmt, ...)	__pr_out(fmt, ## __VA_ARGS__)
+#define pr_use(fmt, ...)	__pr_out("Usage: " fmt, ## __VA_ARGS__)
 
 #define pr_red(fmt, ...)	__pr_color(COLOR_CODE_RED,     fmt, ## __VA_ARGS__)
 #define pr_green(fmt, ...)	__pr_color(COLOR_CODE_GREEN,   fmt, ## __VA_ARGS__)
@@ -239,6 +240,8 @@ char *read_exename(void);
 
 void print_time_unit(uint64_t delta_nsec);
 void print_diff_percent(uint64_t base_nsec, uint64_t delta_nsec);
+void print_diff_time_unit(uint64_t base_nsec, uint64_t pair_nsec);
+void print_diff_count(unsigned long base, unsigned long pair);
 
 void start_pager(void);
 void wait_for_pager(void);
@@ -247,5 +250,15 @@ bool check_time_range(struct uftrace_time_range *range, uint64_t timestamp);
 uint64_t parse_time(char *arg, int limited_digits);
 
 char * strjoin(char *left, char *right, char *delim);
+char * strquote(char *str, int *len);
 
-#endif /* __FTRACE_UTILS_H__ */
+char **parse_cmdline(char *cmd, int *argc);
+void free_parsed_cmdline(char **argv);
+
+struct ftrace_file_handle;
+
+char *get_event_name(struct ftrace_file_handle *handle, unsigned evt_id);
+
+char *absolute_dirname(const char *path, char *resolved_path);
+
+#endif /* UFTRACE_UTILS_H */

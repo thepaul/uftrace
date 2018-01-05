@@ -20,6 +20,7 @@
 #include "uftrace.h"
 #include "libmcount/mcount.h"
 #include "utils/utils.h"
+#include "utils/filter.h"
 
 #define BUILD_ID_SIZE 20
 #define BUILD_ID_STR_SIZE (BUILD_ID_SIZE * 2 + 1)
@@ -29,6 +30,7 @@ struct fill_handler_arg {
 	int exit_status;
 	struct opts *opts;
 	struct rusage *rusage;
+	char *elapsed_time;
 };
 
 static char *copy_info_str(char *src)
@@ -222,23 +224,34 @@ static int fill_cmdline(void *arg)
 	struct fill_handler_arg *fha = arg;
 	char buf[4096];
 	FILE *fp;
-	int ret;
+	int ret, i;
 	char *p;
 
 	fp = fopen("/proc/self/cmdline", "r");
 	if (fp == NULL)
 		return -1;
 
-	strcpy(buf, "cmdline:");
-	ret = fread(&buf[8], 1, sizeof(buf)-8, fp);
-	buf[8+ret] = '\n';
+	ret = fread(buf, 1, sizeof(buf), fp);
 	fclose(fp);
 
-	for (p = buf; *p != '\n'; p++) {
+	if (ret < 0)
+		return ret;
+
+	/* cmdline separated by NUL character - convert to space */
+	for (i = 0, p = buf; i < ret; i++, p++) {
 		if (*p == '\0')
 			*p = ' ';
 	}
-	return write(fha->fd, buf, 8+ret+1);
+
+	p = strquote(buf, &ret);
+	p[ret - 1] = '\n';
+
+	if ((write(fha->fd, "cmdline:", 8) < 8) ||
+	    (write(fha->fd, p, ret) < ret))
+		return -1;
+
+	free(p);
+	return ret;
 }
 
 static int read_cmdline(void *arg)
@@ -505,24 +518,26 @@ static int read_taskinfo(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
 	struct uftrace_info *info = &handle->info;
-	char buf[4096];
 	int i, lines;
+	int ret = -1;
+	char *buf = NULL;
+	size_t len = 0;
 
-	if (fgets(buf, sizeof(buf), handle->fp) == NULL)
-		return -1;
+	if (getline(&buf, &len, handle->fp) < 0)
+		goto out;
 
 	if (strncmp(buf, "taskinfo:", 9))
-		return -1;
+		goto out;
 
 	if (sscanf(&buf[9], "lines=%d\n", &lines) == EOF)
-		return -1;
+		goto out;
 
 	for (i = 0; i < lines; i++) {
-		if (fgets(buf, sizeof(buf), handle->fp) == NULL)
-			return -1;
+		if (getline(&buf, &len, handle->fp) < 0)
+			goto out;
 
 		if (strncmp(buf, "taskinfo:", 9))
-			return -1;
+			goto out;
 
 		if (!strncmp(&buf[9], "nr_tid=", 7)) {
 			info->nr_tid = strtol(&buf[16], NULL, 10);
@@ -538,7 +553,7 @@ static int read_taskinfo(void *arg)
 
 				if (*endp != ',' && *endp != '\n') {
 					free(tids);
-					return -1;
+					goto out;
 				}
 
 				tids_str = endp + 1;
@@ -548,7 +563,10 @@ static int read_taskinfo(void *arg)
 			assert(nr_tid == info->nr_tid);
 		}
 	}
-	return 0;
+	ret = 0;
+out:
+	free(buf);
+	return ret;
 }
 
 static int fill_usageinfo(void *arg)
@@ -651,15 +669,30 @@ static int read_loadinfo(void *arg)
 static int fill_arg_spec(void *arg)
 {
 	struct fill_handler_arg *fha = arg;
+	char *argspec = fha->opts->args;
+	char *retspec = fha->opts->retval;
+	int n;
 
-	if (!(fha->opts->args || fha->opts->retval))
+	n = extract_trigger_args(&argspec, &retspec, fha->opts->trigger);
+	if (n == 0 && !fha->opts->auto_args)
 		return -1;
 
-	dprintf(fha->fd, "argspec:");
-	if (fha->opts->args)
-		dprintf(fha->fd, "%s;", fha->opts->args);
-	if (fha->opts->retval)
-		dprintf(fha->fd, "%s;", fha->opts->retval);
+	dprintf(fha->fd, "argspec:lines=%d\n", n + 3 + !!fha->opts->auto_args);
+	if (argspec) {
+		dprintf(fha->fd, "argspec:%s\n", argspec);
+		free(argspec);
+	}
+	if (retspec) {
+		dprintf(fha->fd, "retspec:%s\n", retspec);
+		free(retspec);
+	}
+
+	dprintf(fha->fd, "argauto:%s\n", get_auto_argspec_str());
+	dprintf(fha->fd, "retauto:%s\n", get_auto_retspec_str());
+	dprintf(fha->fd, "enumauto:%s\n", get_auto_enum_str());
+
+	if (fha->opts->auto_args)
+		dprintf(fha->fd, "auto-args:1\n");
 
 	return 0;
 }
@@ -668,25 +701,96 @@ static int read_arg_spec(void *arg)
 {
 	struct ftrace_file_handle *handle = arg;
 	struct uftrace_info *info = &handle->info;
+	int i, lines;
+	int ret = -1;
+	char *buf = NULL;
+	size_t len = 0;
+
+	if (getline(&buf, &len, handle->fp) < 0)
+		goto out;
+
+	if (strncmp(buf, "argspec:", 8))
+		goto out;
+
+	/* old format only has argspec */
+	if (strncmp(&buf[8], "lines", 5)) {
+		info->argspec = copy_info_str(&buf[8]);
+		ret = 0;
+		goto out;
+	}
+
+	if (sscanf(&buf[8], "lines=%d\n", &lines) == EOF)
+		goto out;
+
+	for (i = 0; i < lines; i++) {
+		if (getline(&buf, &len, handle->fp) < 0)
+			goto out;
+
+		if (!strncmp(buf, "argspec:", 8))
+			info->argspec = copy_info_str(&buf[8]);
+		else if (!strncmp(buf, "retspec:", 8))
+			info->retspec = copy_info_str(&buf[8]);
+		else if (!strncmp(buf, "argauto:", 8))
+			info->autoarg = copy_info_str(&buf[8]);
+		else if (!strncmp(buf, "retauto:", 8))
+			info->autoret = copy_info_str(&buf[8]);
+		else if (!strncmp(buf, "enumauto:", 9))
+			info->autoenum = copy_info_str(&buf[9]);
+		else if (!strncmp(buf, "auto-args:1", 11))
+			info->auto_args_enabled = 1;
+		else
+			goto out;
+	}
+	ret = 0;
+out:
+	free(buf);
+	return ret;
+}
+
+static int fill_record_date(void *arg)
+{
+	struct fill_handler_arg *fha = arg;
+	time_t current_time;
+
+	time(&current_time);
+
+	dprintf(fha->fd, "record_date:%s", ctime(&current_time));
+	dprintf(fha->fd, "elapsed_time:%s\n", fha->elapsed_time);
+	return 0;
+}
+
+static int read_record_date(void *arg)
+{
+	struct ftrace_file_handle *handle = arg;
+	struct uftrace_info *info = &handle->info;
 	char buf[4096];
 
 	if (fgets(buf, sizeof(buf), handle->fp) == NULL)
 		return -1;
 
-	if (strncmp(buf, "argspec:", 8))
+	if (strncmp(buf, "record_date:", 12))
 		return -1;
 
-	info->argspec = copy_info_str(&buf[8]);
+	info->record_date = copy_info_str(&buf[12]);
+
+	if (fgets(buf, sizeof(buf), handle->fp) == NULL)
+		return -1;
+
+	if (strncmp(buf, "elapsed_time:", 13))
+		return -1;
+
+	info->elapsed_time = copy_info_str(&buf[13]);
+
 	return 0;
 }
 
-struct ftrace_info_handler {
+struct uftrace_info_handler {
 	enum uftrace_info_bits bit;
 	int (*handler)(void *arg);
 };
 
-void fill_ftrace_info(uint64_t *info_mask, int fd, struct opts *opts, int status,
-		      struct rusage *rusage)
+void fill_uftrace_info(uint64_t *info_mask, int fd, struct opts *opts, int status,
+		      struct rusage *rusage, char *elapsed_time)
 {
 	size_t i;
 	off_t offset;
@@ -695,8 +799,9 @@ void fill_ftrace_info(uint64_t *info_mask, int fd, struct opts *opts, int status
 		.opts = opts,
 		.exit_status = status,
 		.rusage = rusage,
+		.elapsed_time = elapsed_time,
 	};
-	struct ftrace_info_handler fill_handlers[] = {
+	struct uftrace_info_handler fill_handlers[] = {
 		{ EXE_NAME,	fill_exe_name },
 		{ EXE_BUILD_ID,	fill_exe_build_id },
 		{ EXIT_STATUS,	fill_exit_status },
@@ -708,24 +813,33 @@ void fill_ftrace_info(uint64_t *info_mask, int fd, struct opts *opts, int status
 		{ USAGEINFO,	fill_usageinfo },
 		{ LOADINFO,	fill_loadinfo },
 		{ ARG_SPEC,	fill_arg_spec },
+		{ RECORD_DATE,	fill_record_date },
 	};
 
 	for (i = 0; i < ARRAY_SIZE(fill_handlers); i++) {
+		errno = 0;
 		offset = lseek(fd, 0, SEEK_CUR);
+		if (offset == -1 && errno) {
+			pr_dbg("skip info due to failed lseek: %m\n");
+			continue;
+		}
 
 		if (fill_handlers[i].handler(&arg) < 0) {
 			/* ignore failed info */
-			lseek(fd, offset, SEEK_SET);
+			errno = 0;
+			if (lseek(fd, offset, SEEK_SET) == -1 && errno)
+				pr_warn("fail to reset uftrace info: %m\n");
+
 			continue;
 		}
 		*info_mask |= (1UL << fill_handlers[i].bit);
 	}
 }
 
-int read_ftrace_info(uint64_t info_mask, struct ftrace_file_handle *handle)
+int read_uftrace_info(uint64_t info_mask, struct ftrace_file_handle *handle)
 {
 	size_t i;
-	struct ftrace_info_handler read_handlers[] = {
+	struct uftrace_info_handler read_handlers[] = {
 		{ EXE_NAME,	read_exe_name },
 		{ EXE_BUILD_ID,	read_exe_build_id },
 		{ EXIT_STATUS,	read_exit_status },
@@ -737,6 +851,7 @@ int read_ftrace_info(uint64_t info_mask, struct ftrace_file_handle *handle)
 		{ USAGEINFO,	read_usageinfo },
 		{ LOADINFO,	read_loadinfo },
 		{ ARG_SPEC,	read_arg_spec },
+		{ RECORD_DATE,	read_record_date },
 	};
 
 	memset(&handle->info, 0, sizeof(handle->info));
@@ -746,7 +861,7 @@ int read_ftrace_info(uint64_t info_mask, struct ftrace_file_handle *handle)
 			continue;
 
 		if (read_handlers[i].handler(handle) < 0) {
-			pr_dbg("error during read ftrace info (%x)\n",
+			pr_dbg("error during read uftrace info (%x)\n",
 			       (1U << read_handlers[i].bit));
 			return -1;
 		}
@@ -754,7 +869,7 @@ int read_ftrace_info(uint64_t info_mask, struct ftrace_file_handle *handle)
 	return 0;
 }
 
-void clear_ftrace_info(struct uftrace_info *info)
+void clear_uftrace_info(struct uftrace_info *info)
 {
 	free(info->exename);
 	free(info->cmdline);
@@ -765,27 +880,30 @@ void clear_ftrace_info(struct uftrace_info *info)
 	free(info->distro);
 	free(info->tids);
 	free(info->argspec);
+	free(info->record_date);
+	free(info->elapsed_time);
 }
 
 int command_info(int argc, char *argv[], struct opts *opts)
 {
+	int ret;
 	char buf[PATH_MAX];
 	struct stat statbuf;
 	struct ftrace_file_handle handle;
 	const char *fmt = "# %-20s: %s\n";
 
-	open_data_file(opts, &handle);
-
-	snprintf(buf, sizeof(buf), "%s/info", opts->dirname);
-
-	if (stat(buf, &statbuf) < 0)
-		return -1;
+	ret = open_data_file(opts, &handle);
 
 	if (opts->print_symtab) {
 		struct symtabs symtabs = {
 			.loaded = false,
-			.flags = SYMTAB_FL_DEMANGLE,
+			.flags = SYMTAB_FL_USE_SYMFILE | SYMTAB_FL_DEMANGLE,
 		};
+
+		if (!opts->exename) {
+			pr_use("Usage: uftrace info --symbols [COMMAND]\n");
+			return -1;
+		}
 
 		load_symtabs(&symtabs, opts->dirname, opts->exename);
 		print_symtabs(&symtabs);
@@ -793,10 +911,24 @@ int command_info(int argc, char *argv[], struct opts *opts)
 		goto out;
 	}
 
+	if (ret < 0) {
+		pr_warn("cannot open record data: %s: %m\n", opts->dirname);
+		return -1;
+	}
+
+	snprintf(buf, sizeof(buf), "%s/info", opts->dirname);
+
+	if (stat(buf, &statbuf) < 0)
+		return -1;
+
 	pr_out("# system information\n");
 	pr_out("# ==================\n");
 	pr_out(fmt, "program version", argp_program_version);
-	pr_out("# %-20s: %s", "recorded on", ctime(&statbuf.st_mtime));
+
+	if (handle.hdr.info_mask & (1UL << RECORD_DATE))
+		pr_out(fmt, "recorded on", handle.info.record_date);
+	else
+		pr_out("# %-20s: %s", "recorded on", ctime(&statbuf.st_mtime));
 
 	if (handle.hdr.info_mask & (1UL << CMDLINE))
 		pr_out(fmt, "cmdline", handle.info.cmdline);
@@ -850,8 +982,10 @@ int command_info(int argc, char *argv[], struct opts *opts)
 		pr_out("\n");
 	}
 
-	if (handle.hdr.info_mask & (1UL << ARG_SPEC))
-		pr_out(fmt, "arguments/retval", handle.info.argspec);
+	if (handle.hdr.info_mask & (1UL << ARG_SPEC)) {
+		pr_out(fmt, "arguments", handle.info.argspec);
+		pr_out(fmt, "return values", handle.info.retspec);
+	}
 
 	if (handle.hdr.info_mask & (1UL << EXIT_STATUS)) {
 		int status = handle.info.exit_status;
@@ -868,6 +1002,9 @@ int command_info(int argc, char *argv[], struct opts *opts)
 		}
 		pr_out(fmt, "exit status", buf);
 	}
+
+	if (handle.hdr.info_mask & (1UL << RECORD_DATE))
+		pr_out(fmt, "elapsed time", handle.info.elapsed_time);
 
 	if (handle.hdr.info_mask & (1UL << USAGEINFO)) {
 		pr_out("# %-20s: %.3lf / %.3lf sec (sys / user)\n", "cpu time",

@@ -49,6 +49,9 @@ OPTIONS
 \--disable
 :   Start uftrace with tracing disabled.  This is only meaningful when used with a `trace_on` trigger.
 
+\--demangle=*TYPE*
+:   Use demangled C++ symbol names for filters, triggers, arguments and/or return values.  Possible values are "full", "simple" and "no".  Default is "simple" which ignores function arguments and template parameters.
+
 --column-view
 :   Show each task in separate column.  This makes easy to distinguish functions in different tasks.
 
@@ -62,16 +65,19 @@ OPTIONS
 :   Do not show comments of returned functions.
 
 -k, \--kernel
-:   Trace kernel functions as well as user functions.
+:   Trace kernel functions (and events) as well as user functions (and events).  This options has no meaning and so is deprecated now.  It will always show kernel functions and events if exists.  If you want to hide kernel functions, please use `-N .@kernel` to filter out all kernel functions.
 
 \--kernel-full
-:   Show all kernel functions called outside of user functions.  This option is the inverse of `--kernel-skip-out`.  Implies `--kernel`.
+:   Show all kernel functions and events occurred outside of user functions.  This option is the inverse of `--kernel-skip-out`.
 
 \--kernel-skip-out
 :   Do not show kernel functions called outside of user functions.  This option is deprecated and set to true by default.
 
 \--kernel-only
-:   Show kernel functions only without user functions.  Implies `--kernel`.
+:   Show kernel functions only without user functions.
+
+\--event-full
+:   Show all (user) events outside of user functions.
 
 
 FILTERS
@@ -171,6 +177,31 @@ You can also see replay output with different time threshold for the same record
        6.448 us [ 1234] |   a();
        8.631 us [ 1234] | } /* main */
 
+In addition, The `-r` option can show functions executed within the given time range.
+When using this option, you can see TIMESTAMP or ELAPSED fields as well as DURATION and TID.
+
+    $ uftrace replay -r 502716.387320101~502716.387322389
+    #     TIMESTAMP      DURATION    TID     FUNCTION
+    502716.387320101   0.289 us [ 6126] |   fgets();
+    502716.387320584            [ 6126] |   get_values_from() {
+    502716.387320709   0.245 us [ 6126] |     strdup();
+    502716.387321172   0.144 us [ 6126] |     strsep();
+    502716.387321542   0.223 us [ 6126] |     atoi();
+    502716.387321983   0.239 us [ 6126] |     atoi();
+    502716.387322389   1.805 us [ 6126] |   } /* get_values_from */
+
+    $ uftrace replay -r 40us~ | head -10
+    #  ELAPSED   DURATION    TID     FUNCTION
+      40.141 us            [ 6126] |   get_values_from() {
+      40.269 us   0.249 us [ 6126] |     strdup();
+      40.756 us   0.149 us [ 6126] |     strsep();
+      41.119 us   0.235 us [ 6126] |     atoi();
+      41.578 us   0.211 us [ 6126] |     atoi();
+      41.957 us   1.816 us [ 6126] |   } /* get_values_from */
+      42.124 us   0.220 us [ 6126] |   fgets();
+      42.529 us            [ 6126] |   get_values_from() {
+      42.645 us   0.236 us [ 6126] |     strdup();
+
 You can also set triggers on filtered functions.  See *TRIGGERS* section below for details.
 
 
@@ -180,9 +211,10 @@ The uftrace tool supports triggering actions on selected function calls with or 
 
     <trigger>    :=  <symbol> "@" <actions>
     <actions>    :=  <action>  | <action> "," <actions>
-    <action>     :=  "depth="<num> | "backtrace" | "trace_on" | "trace_off" | "color="<color> | "time="<time_spec>
+    <action>     :=  "depth="<num> | "backtrace" | "trace_on" | "trace_off" |
+                     "color="<color> | "time="<time_spec> | "filter" | "notrace"
     <time_spec>  :=  <num> [ <time_unit> ]
-    <time_unit>  :=  "ns" | "us" | "ms" | "s"
+    <time_unit>  :=  "ns" | "nsec" | "us" | "usec" | "ms" | "msec" | "s" | "sec" | "m" | "min"
 
 The `depth` trigger is to change filter depth during execution of the function.  It can be used to apply different filter depths for different functions.  And the `backtrace` trigger is used to print a stack backtrace at replay time.
 
@@ -191,7 +223,7 @@ The color trigger is to change the color of the function in replay output.  The 
 The following example shows how triggers work.  We set a filter on function `b()` with the `backtrace` action and change the maximum filter depth under `b()` to 2.
 
     $ uftrace record ./abc
-    $ uftrace replay -F 'b@backtrace,depth=2'
+    $ uftrace replay -T 'b@filter,backtrace,depth=2'
     # DURATION    TID     FUNCTION
       backtrace [ 1234] | /* [ 0] main */
       backtrace [ 1234] | /* [ 1] a */
@@ -202,6 +234,8 @@ The following example shows how triggers work.  We set a filter on function `b()
 The `traceon` and `traceoff` actions (the `_` can be omitted from `trace_on` and `trace_off`) control whether uftrace shows functions or not.  The trigger runs at replay time, not run time, so it can handle kernel functions as well. Contrast this with triggers used under `uftrace record`.
 
 The 'time' trigger is to change time filter setting during execution of the function.  It can be used to apply different time filter for different functions.
+
+The 'filter' and 'notrace' triggers have same effect as -F/--filter and -N/--notrace options respectively.
 
 
 FIELDS

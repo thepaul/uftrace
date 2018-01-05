@@ -11,7 +11,10 @@
 #include "uftrace.h"
 #include "utils/utils.h"
 #include "utils/fstack.h"
+#include "utils/filter.h"
 #include "utils/symbol.h"
+#include "utils/kernel.h"
+#include "utils/perf.h"
 #include "libmcount/mcount.h"
 
 
@@ -64,7 +67,7 @@ int read_task_file(struct uftrace_session_link *sess, char *dirname,
 				create_session(sess, &smsg, dirname, buf, sym_rel_addr);
 			break;
 
-		case UFTRACE_MSG_TASK:
+		case UFTRACE_MSG_TASK_START:
 			if (read_all(fd, &tmsg, sizeof(tmsg)) < 0)
 				goto out;
 
@@ -79,7 +82,7 @@ int read_task_file(struct uftrace_session_link *sess, char *dirname,
 			break;
 
 		default:
-			pr_log("invalid contents in task file\n");
+			pr_dbg("invalid contents in task file\n");
 			goto out;
 		}
 	}
@@ -195,6 +198,59 @@ int read_task_txt_file(struct uftrace_session_link *sess, char *dirname,
 	return 0;
 }
 
+/**
+ * read_events_file - read 'events.txt' file from data directory
+ * @dirname: name of the data directory
+ *
+ * This function read the events file in the @dirname and build event
+ * information (for userspace).
+ *
+ * It returns 0 for success, -1 for error.
+ */
+int read_events_file(struct ftrace_file_handle *handle)
+{
+	FILE *fp;
+	char *fname = NULL;
+	char *line = NULL;
+	size_t sz = 0;
+
+	xasprintf(&fname, "%s/%s", handle->dirname, "events.txt");
+
+	fp = fopen(fname, "r");
+	if (fp == NULL) {
+		/* it might hit no events, so no file is ok */
+		if (errno == ENOENT)
+			errno = 0;
+
+		free(fname);
+		return -errno;
+	}
+
+	pr_dbg("reading %s file\n", fname);
+	while (getline(&line, &sz, fp) >= 0) {
+		char provider[512];
+		char event[512];
+		unsigned evt_id;
+		struct uftrace_event *ev;
+
+		if (!strncmp(line, "EVENT", 5)) {
+			sscanf(line + 7, "%u %[^:]:%s",
+			       &evt_id, provider, event);
+
+			ev = xmalloc(sizeof(*ev));
+			ev->id = evt_id;
+			ev->provider = xstrdup(provider);
+			ev->event = xstrdup(event);
+
+			list_add_tail(&ev->list, &handle->events);
+		}
+	}
+
+	fclose(fp);
+	free(fname);
+	return 0;
+}
+
 static void snprint_timestamp(char *buf, size_t sz, uint64_t timestamp)
 {
 	snprintf(buf, sz, "%"PRIu64".%09"PRIu64,  // sec.nsec
@@ -302,51 +358,44 @@ static void check_data_order(struct ftrace_file_handle *handle)
 		pr_dbg("bitfield order is different!\n");
 }
 
-#define RECORD_MSG  "Was '%s' compiled with -pg or\n"		\
-"\t-finstrument-functions flag and ran with ftrace record?\n"
-
 int open_data_file(struct opts *opts, struct ftrace_file_handle *handle)
 {
 	int ret = -1;
 	FILE *fp;
 	char buf[PATH_MAX];
-	bool again = false;
 
 	snprintf(buf, sizeof(buf), "%s/info", opts->dirname);
 
-retry:
 	fp = fopen(buf, "rb");
-	if (fp == NULL) {
-		if (again) {
-			/* restore original file name for error reporting */
-			snprintf(buf, sizeof(buf), "%s/info", opts->dirname);
+	if (fp != NULL)
+		goto ok;
+
+	/* if default dirname is failed */
+	if (!strcmp(opts->dirname, UFTRACE_DIR_NAME)) {
+		/* try again inside the current directory */
+		fp = fopen("./info", "rb");
+		if (fp != NULL) {
+			opts->dirname = "./";
+			goto ok;
 		}
 
-		if (errno == ENOENT) {
-			if (!again && !strcmp(opts->dirname, UFTRACE_DIR_NAME)) {
-				/* retry with old default dirname */
-				snprintf(buf, sizeof(buf), "%s/info",
-					UFTRACE_DIR_OLD_NAME);
-
-				again = true;
-				goto retry;
-			}
-
-			pr_log("cannot find %s file!\n", buf);
-
-			if (opts->exename)
-				pr_err(RECORD_MSG, opts->exename);
-		} else {
-			pr_err("cannot open %s file", buf);
+		/* retry with old default dirname */
+		snprintf(buf, sizeof(buf), "%s/info", UFTRACE_DIR_OLD_NAME);
+		fp = fopen(buf, "rb");
+		if (fp != NULL) {
+			opts->dirname = UFTRACE_DIR_OLD_NAME;
+			goto ok;
 		}
-		goto out;
+
+		/* restore original file name for error reporting */
+		snprintf(buf, sizeof(buf), "%s/info", opts->dirname);
 	}
 
-	if (again) {
-		/* found data in old dirname, rename it */
-		opts->dirname = UFTRACE_DIR_OLD_NAME;
-	}
+	/* data file loading is failed */
+	pr_dbg("cannot open %s file\n", buf);
+	goto out;
 
+ok:
 	handle->fp = fp;
 	handle->dirname = opts->dirname;
 	handle->depth = opts->depth;
@@ -357,13 +406,16 @@ retry:
 	handle->sessions.root  = RB_ROOT;
 	handle->sessions.tasks = RB_ROOT;
 	handle->sessions.first = NULL;
-	handle->kernel.pevent = NULL;
+	handle->kernel = NULL;
+	handle->nr_perf = 0;
+	handle->perf = NULL;
+	INIT_LIST_HEAD(&handle->events);
 
 	if (fread(&handle->hdr, sizeof(handle->hdr), 1, fp) != 1)
 		pr_err("cannot read header data");
 
 	if (memcmp(handle->hdr.magic, UFTRACE_MAGIC_STR, UFTRACE_MAGIC_LEN))
-		pr_err("invalid magic string found!");
+		pr_err_ns("invalid magic string found!");
 
 	check_data_order(handle);
 
@@ -376,10 +428,10 @@ retry:
 
 	if (handle->hdr.version < UFTRACE_FILE_VERSION_MIN ||
 	    handle->hdr.version > UFTRACE_FILE_VERSION)
-		pr_err("unsupported file version: %u", handle->hdr.version);
+		pr_err_ns("unsupported file version: %u", handle->hdr.version);
 
-	if (read_ftrace_info(handle->hdr.info_mask, handle) < 0)
-		pr_err("cannot read ftrace header info!");
+	if (read_uftrace_info(handle->hdr.info_mask, handle) < 0)
+		pr_err_ns("cannot read uftrace header info!");
 
 	fclose(fp);
 
@@ -393,25 +445,59 @@ retry:
 		if (handle->hdr.feat_mask & SYM_REL_ADDR)
 			sym_rel = true;
 
-		/* read task.txt first and then try old task file */
-		if (read_task_txt_file(sessions, opts->dirname, true, sym_rel) < 0 &&
-		    read_task_file(sessions, opts->dirname, true, sym_rel) < 0)
-			pr_warn("invalid task file\n");
+		/* read old task file first and then try task.txt file */
+		if (read_task_file(sessions, opts->dirname, true, sym_rel) < 0 &&
+		    read_task_txt_file(sessions, opts->dirname, true, sym_rel) < 0) {
+			if (errno == ENOENT)
+				pr_warn("no trace data found\n");
+			else
+				pr_warn("invalid trace data\n");
+		}
 	}
 
-	if (handle->hdr.feat_mask & (ARGUMENT | RETVAL))
-		setup_fstack_args(handle->info.argspec, handle);
+	if (handle->hdr.info_mask & ARG_SPEC) {
+		if (handle->hdr.feat_mask & AUTO_ARGS) {
+			setup_auto_args_str(handle->info.autoarg,
+					    handle->info.autoret,
+					    handle->info.autoenum);
+		}
+
+		setup_fstack_args(handle->info.argspec, handle->info.retspec,
+				  handle, false);
+		if (handle->info.auto_args_enabled) {
+			setup_fstack_args(handle->info.autoarg,
+					  handle->info.autoret,
+					  handle, true);
+		}
+	}
 
 	if (!(handle->hdr.feat_mask & MAX_STACK))
 		handle->hdr.max_stack = MCOUNT_RSTACK_MAX;
 
 	if (handle->hdr.feat_mask & KERNEL) {
-		handle->kernel.output_dir = opts->dirname;
-		handle->kernel.skip_out = opts->kernel_skip_out;
+		struct uftrace_kernel_reader *kernel;
 
-		if (setup_kernel_data(&handle->kernel) == 0)
+		kernel = xzalloc(sizeof(*kernel));
+
+		kernel->handle   = handle;
+		kernel->dirname  = opts->dirname;
+		kernel->skip_out = opts->kernel_skip_out;
+
+		if (setup_kernel_data(kernel) == 0) {
+			handle->kernel = kernel;
 			load_kernel_symbol(opts->dirname);
+		}
+		else {
+			free(kernel);
+			handle->kernel = NULL;
+		}
 	}
+
+	if (handle->hdr.feat_mask & EVENT)
+		read_events_file(handle);
+
+	if (handle->hdr.feat_mask & PERF_EVENT)
+		setup_perf_data(handle);
 
 	ret = 0;
 
@@ -424,9 +510,19 @@ void close_data_file(struct opts *opts, struct ftrace_file_handle *handle)
 	if (opts->exename == handle->info.exename)
 		opts->exename = NULL;
 
-	if (has_kernel_data(&handle->kernel))
-		finish_kernel_data(&handle->kernel);
+	if (has_kernel_data(handle->kernel)) {
+		finish_kernel_data(handle->kernel);
+		free(handle->kernel);
+	}
 
-	clear_ftrace_info(&handle->info);
+	if (has_perf_data(handle))
+		finish_perf_data(handle);
+
+	delete_sessions(&handle->sessions);
+
+	if (handle->hdr.feat_mask & AUTO_ARGS)
+		finish_auto_args();
+
+	clear_uftrace_info(&handle->info);
 	reset_task_handle(handle);
 }

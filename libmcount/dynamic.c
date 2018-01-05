@@ -7,10 +7,10 @@
 #define PR_DOMAIN  DBG_DYNAMIC
 
 #include "libmcount/mcount.h"
+#include "libmcount/internal.h"
 #include "utils/utils.h"
 #include "utils/symbol.h"
 #include "utils/filter.h"
-#include "utils/compiler.h"
 
 static struct mcount_dynamic_info *mdinfo;
 static struct mcount_dynamic_stats {
@@ -148,6 +148,9 @@ static int do_dynamic_update(struct symtabs *symtabs, char *patch_funcs)
 			nopatched_name = name;
 		if (!found)
 			stats.nomatch++;
+
+		if (is_regex)
+			regfree(&re);
 
 		name = strtok(NULL, ";");
 	}

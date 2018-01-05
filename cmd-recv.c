@@ -13,6 +13,7 @@
 #include <linux/limits.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sys/wait.h>
 
 #include "uftrace.h"
 #include "utils/utils.h"
@@ -61,6 +62,7 @@ static int signal_fd(struct opts *opts)
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTERM);
+	sigaddset(&mask, SIGCHLD);
 
 	if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0)
 		pr_err("signal block failed");
@@ -157,6 +159,25 @@ void send_trace_kernel_data(int sock, int cpu, void *data, size_t len)
 		pr_err("send kernel data failed");
 }
 
+void send_trace_perf_data(int sock, int cpu, void *data, size_t len)
+{
+	int32_t msg_cpu = htonl(cpu);
+	struct uftrace_msg msg = {
+		.magic = htons(UFTRACE_MSG_MAGIC),
+		.type  = htons(UFTRACE_MSG_SEND_PERF_DATA),
+		.len   = htonl(sizeof(msg_cpu) + len),
+	};
+	struct iovec iov[] = {
+		{ .iov_base = &msg,     .iov_len = sizeof(msg), },
+		{ .iov_base = &msg_cpu, .iov_len = sizeof(msg_cpu), },
+		{ .iov_base = data,     .iov_len = len, },
+	};
+
+	pr_dbg2("send UFTRACE_MSG_SEND_PERF_DATA\n");
+	if (writev_all(sock, iov, ARRAY_SIZE(iov)) < 0)
+		pr_err("send kernel data failed");
+}
+
 void send_trace_metadata(int sock, const char *dirname, char *filename)
 {
 	int fd;
@@ -168,7 +189,7 @@ void send_trace_metadata(int sock, const char *dirname, char *filename)
 	struct uftrace_msg msg = {
 		.magic = htons(UFTRACE_MSG_MAGIC),
 		.type  = htons(UFTRACE_MSG_SEND_META_DATA),
-		.len   = htonl(sizeof(namelen) + namelen),
+		.len   = sizeof(namelen) + namelen,
 	};
 	struct iovec iov[4] = {
 		{ .iov_base = &msg,     .iov_len = sizeof(msg), },
@@ -189,7 +210,7 @@ void send_trace_metadata(int sock, const char *dirname, char *filename)
 	len = stbuf.st_size;
 	buf = xmalloc(len);
 
-	msg.len += htonl(len);
+	msg.len = htonl(msg.len + len);
 	iov[3].iov_base = buf;
 	iov[3].iov_len  = len;
 
@@ -363,6 +384,35 @@ static void recv_trace_kernel_data(int sock, int len)
 	free(filename);
 }
 
+static void recv_trace_perf_data(int sock, int len)
+{
+	struct client_data *client;
+	int32_t cpu;
+	char *filename = NULL;
+	void *buffer;
+
+	client = find_client(sock);
+	if (client == NULL)
+		pr_err("no client on this socket\n");
+
+	if (read_all(sock, &cpu, sizeof(cpu)) < 0)
+		pr_err("recv cpu failed");
+	cpu = ntohl(cpu);
+
+	xasprintf(&filename, "perf-cpu%d.dat", cpu);
+
+	len -= sizeof(cpu);
+	buffer = xmalloc(len);
+
+	if (read_all(sock, buffer, len) < 0)
+		pr_err("recv buffer failed");
+
+	write_client_file(client, filename, 1, buffer, len);
+
+	free(buffer);
+	free(filename);
+}
+
 static void recv_trace_metadata(int sock, int len)
 {
 	struct client_data *client;
@@ -447,6 +497,20 @@ static void recv_trace_end(int sock, int efd)
 	close(sock);
 }
 
+static void execute_run_cmd(char **argv) {
+	if (!argv)
+		return;
+
+	int pid = fork();
+	if (pid < 0)
+		pr_err("cannot start child process");
+
+	if (pid == 0) {
+		execvp(argv[0], argv);
+		pr_err("Failed to execute '%s'", argv[0]);
+	}
+}
+
 static void epoll_add(int efd, int fd, unsigned event)
 {
 	struct epoll_event ev = {
@@ -479,7 +543,7 @@ static void handle_server_sock(struct epoll_event *ev, int efd)
 	pr_dbg("new connection added from %s\n", hbuf);
 }
 
-static void handle_client_sock(struct epoll_event *ev, int efd)
+static void handle_client_sock(struct epoll_event *ev, int efd, struct opts *opts)
 {
 	int sock = ev->data.fd;
 	struct uftrace_msg msg;
@@ -513,6 +577,10 @@ static void handle_client_sock(struct epoll_event *ev, int efd)
 		pr_dbg2("receive UFTRACE_MSG_SEND_KERNEL_DATA\n");
 		recv_trace_kernel_data(sock, msg.len);
 		break;
+	case UFTRACE_MSG_SEND_PERF_DATA:
+		pr_dbg2("receive UFTRACE_MSG_SEND_PERF_DATA\n");
+		recv_trace_perf_data(sock, msg.len);
+		break;
 	case UFTRACE_MSG_SEND_INFO:
 		pr_dbg2("receive UFTRACE_MSG_SEND_INFO\n");
 		recv_trace_info(sock, msg.len);
@@ -524,6 +592,7 @@ static void handle_client_sock(struct epoll_event *ev, int efd)
 	case UFTRACE_MSG_SEND_END:
 		pr_dbg2("receive UFTRACE_MSG_SEND_END\n");
 		recv_trace_end(sock, efd);
+		execute_run_cmd(opts->run_cmd);
 		break;
 	default:
 		pr_dbg("unknown message: %d\n", msg.type);
@@ -533,6 +602,7 @@ static void handle_client_sock(struct epoll_event *ev, int efd)
 
 int command_recv(int argc, char *argv[], struct opts *opts)
 {
+	struct signalfd_siginfo si;
 	int sock;
 	int sigfd;
 	int efd;
@@ -566,12 +636,17 @@ int command_recv(int argc, char *argv[], struct opts *opts)
 			pr_err("epoll wait failed");
 
 		for (i = 0; i < len; i++) {
-			if (ev[i].data.fd == sigfd)
-				uftrace_done = true;
+			if (ev[i].data.fd == sigfd) {
+				int nr = read(sigfd, &si, sizeof si);
+				if (nr > 0 && si.ssi_signo == SIGCHLD)
+					waitpid(-1, NULL, WNOHANG);
+				else
+					uftrace_done = true;
+			}
 			else if (ev[i].data.fd == sock)
 				handle_server_sock(&ev[i], efd);
 			else
-				handle_client_sock(&ev[i], efd);
+				handle_client_sock(&ev[i], efd, opts);
 		}
 	}
 

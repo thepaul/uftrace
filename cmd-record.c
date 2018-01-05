@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -16,6 +17,7 @@
 #include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/epoll.h>
+#include <fnmatch.h>
 
 #include "uftrace.h"
 #include "libmcount/mcount.h"
@@ -23,6 +25,8 @@
 #include "utils/symbol.h"
 #include "utils/list.h"
 #include "utils/filter.h"
+#include "utils/kernel.h"
+#include "utils/perf.h"
 
 #define SHMEM_NAME_SIZE (64 - (int)sizeof(struct list_head))
 
@@ -51,6 +55,8 @@ static pthread_mutex_t write_list_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool buf_done;
 static int thread_ctl[2];
 
+static bool has_perf_event;
+
 
 static bool can_use_fast_libmcount(struct opts *opts)
 {
@@ -60,7 +66,8 @@ static bool can_use_fast_libmcount(struct opts *opts)
 		return false;
 	if (getenv("UFTRACE_FILTER") || getenv("UFTRACE_TRIGGER") ||
 	    getenv("UFTRACE_ARGUMENT") || getenv("UFTRACE_RETVAL") ||
-	    getenv("UFTRACE_PATCH"))
+	    getenv("UFTRACE_PATCH") || getenv("UFTRACE_SCRIPT") ||
+	    getenv("UFTRACE_AUTO_ARGS"))
 		return false;
 	return true;
 }
@@ -147,12 +154,24 @@ static void setup_child_environ(struct opts *opts, int pfd)
 		}
 	}
 
+	if (opts->auto_args)
+		setenv("UFTRACE_AUTO_ARGS", "1", 1);
+
 	if (opts->patch) {
 		char *patch_str = uftrace_clear_kernel(opts->patch);
 
 		if (patch_str) {
 			setenv("UFTRACE_PATCH", patch_str, 1);
 			free(patch_str);
+		}
+	}
+
+	if (opts->event) {
+		char *event_str = uftrace_clear_kernel(opts->event);
+
+		if (event_str) {
+			setenv("UFTRACE_EVENT", event_str, 1);
+			free(event_str);
 		}
 	}
 
@@ -178,6 +197,9 @@ static void setup_child_environ(struct opts *opts, int pfd)
 			/* do not update GOTPLT after resolving symbols */
 			setenv("LD_BIND_NOT", "1", 1);
 		}
+
+		if (opts->nest_libcall)
+			setenv("UFTRACE_NEST_LIBCALL", "1", 1);
 	}
 
 	if (strcmp(opts->dirname, UFTRACE_DIR_NAME))
@@ -214,8 +236,12 @@ static void setup_child_environ(struct opts *opts, int pfd)
 	snprintf(buf, sizeof(buf), "%d", demangler);
 	setenv("UFTRACE_DEMANGLE", buf, 1);
 
-	if (opts->kernel && check_kernel_pid_filter())
+	if ((opts->kernel || has_kernel_event(opts->event)) &&
+	    check_kernel_pid_filter())
 		setenv("UFTRACE_KERNEL_PID_UPDATE", "1", 1);
+
+	if (opts->script_file)
+		setenv("UFTRACE_SCRIPT", opts->script_file, 1);
 
 	if (opts->lib_path)
 		snprintf(buf, sizeof(buf), "%s/libmcount/", opts->lib_path);
@@ -269,22 +295,32 @@ static uint64_t calc_feat_mask(struct opts *opts)
 	/* save mcount_max_stack */
 	features |= MAX_STACK;
 
+	/* provide automatic argument/return value spec */
+	features |= AUTO_ARGS;
+
 	if (opts->libcall)
 		features |= PLTHOOK;
 
 	if (opts->kernel)
 		features |= KERNEL;
 
-	if (opts->args)
+	if (opts->args || opts->auto_args)
 		features |= ARGUMENT;
 
-	if (opts->retval)
+	if (opts->retval || opts->auto_args)
 		features |= RETVAL;
+
+	if (opts->event)
+		features |= EVENT;
+
+	if (has_perf_event)
+		features |= PERF_EVENT;
 
 	return features;
 }
 
-static int fill_file_header(struct opts *opts, int status, struct rusage *rusage)
+static int fill_file_header(struct opts *opts, int status, struct rusage *rusage,
+			    char *elapsed_time)
 {
 	int fd, efd;
 	int ret = -1;
@@ -296,11 +332,8 @@ static int fill_file_header(struct opts *opts, int status, struct rusage *rusage
 	pr_dbg3("fill header (metadata) info in %s\n", filename);
 
 	fd = open(filename, O_WRONLY | O_CREAT| O_TRUNC, 0644);
-	if (fd < 0) {
-		pr_log("cannot open info file: %s\n", strerror(errno));
-		free(filename);
-		return -1;
-	}
+	if (fd < 0)
+		pr_err("cannot open info file");
 
 	efd = open(opts->exename, O_RDONLY);
 	if (efd < 0)
@@ -323,7 +356,8 @@ static int fill_file_header(struct opts *opts, int status, struct rusage *rusage
 	if (write(fd, &hdr, sizeof(hdr)) != (int)sizeof(hdr))
 		pr_err("writing header info failed");
 
-	fill_ftrace_info(&hdr.info_mask, fd, opts, status, rusage);
+	fill_uftrace_info(&hdr.info_mask, fd, opts, status,
+			  rusage, elapsed_time);
 
 try_write:
 	ret = pwrite(fd, &hdr, sizeof(hdr), 0);
@@ -411,15 +445,16 @@ static void write_buffer(struct buf_list *buf, struct opts *opts, int sock)
 }
 
 struct writer_arg {
-	struct list_head	list;
-	struct list_head	bufs;
-	struct opts		*opts;
-	struct uftrace_kernel	*kern;
-	int			sock;
-	int			idx;
-	int			tid;
-	int			nr_cpu;
-	int			cpus[];
+	struct list_head		list;
+	struct list_head		bufs;
+	struct opts			*opts;
+	struct uftrace_kernel_writer	*kern;
+	struct uftrace_perf_writer	*perf;
+	int				sock;
+	int				idx;
+	int				tid;
+	int				nr_cpu;
+	int				cpus[];
 };
 
 static void write_buf_list(struct list_head *buf_head, struct opts *opts,
@@ -452,13 +487,96 @@ static void write_buf_list(struct list_head *buf_head, struct opts *opts,
 	pthread_mutex_unlock(&free_list_lock);
 }
 
+static int setup_pollfd(struct pollfd **pollfd, struct writer_arg *warg,
+			bool setup_perf, bool setup_kernel)
+{
+	int nr_poll = 1;
+	struct pollfd *p;
+	int i;
+
+	if (setup_perf)
+		nr_poll += warg->nr_cpu;
+	if (setup_kernel)
+		nr_poll += warg->nr_cpu;
+
+	p = xcalloc(nr_poll, sizeof(*p));
+
+	p[0].fd = thread_ctl[0];
+	p[0].events = POLLIN;
+	nr_poll = 1;
+
+	if (setup_perf) {
+		for (i = 0; i < warg->nr_cpu; i++) {
+			p[i + nr_poll].fd = warg->perf->event_fd[warg->cpus[i]];
+			p[i + nr_poll].events = POLLIN;
+		}
+		nr_poll += warg->nr_cpu;
+	}
+
+	if (setup_kernel) {
+		for (i = 0; i < warg->nr_cpu; i++) {
+			p[i + nr_poll].fd = warg->kern->traces[warg->cpus[i]];
+			p[i + nr_poll].events = POLLIN;
+		}
+		nr_poll += warg->nr_cpu;
+	}
+
+	*pollfd = p;
+	return nr_poll;
+}
+
+static bool handle_pollfd(struct pollfd *pollfd, struct writer_arg *warg,
+			  bool trace_task, bool trace_perf, bool trace_kernel,
+			  int timeout)
+{
+	int start = trace_task ? 0 : 1;
+	int nr_poll = trace_task ? 1 : 0;
+	bool check_task = false;
+	int i;
+
+	if (trace_perf)
+		nr_poll += warg->nr_cpu;
+	if (trace_kernel)
+		nr_poll += warg->nr_cpu;
+
+	if (poll(&pollfd[start], nr_poll, timeout) < 0)
+		return false;
+
+	for (i = start; i < nr_poll; i++) {
+		if (!(pollfd[i].revents & POLLIN))
+			continue;
+
+		if (i == 0)
+			check_task = true;
+		else if (trace_perf && i < (warg->nr_cpu + 1)) {
+			record_perf_data(warg->perf, warg->cpus[i - 1],
+					 warg->sock);
+		}
+		else if (trace_kernel) {
+			int idx = i - (nr_poll - warg->nr_cpu);
+
+			record_kernel_trace_pipe(warg->kern,
+						 warg->cpus[idx],
+						 warg->sock);
+		}
+	}
+
+	return check_task;
+}
+
+static void finish_pollfd(struct pollfd *pollfd)
+{
+	free(pollfd);
+}
+
 void *writer_thread(void *arg)
 {
 	struct buf_list *buf, *pos;
 	struct writer_arg *warg = arg;
 	struct opts *opts = warg->opts;
-	struct pollfd pollfd[warg->nr_cpu + 1];
+	struct pollfd *pollfd;
 	int i, dummy;
+	sigset_t sigset;
 
 	if (opts->rt_prio) {
 		struct sched_param param = {
@@ -466,36 +584,21 @@ void *writer_thread(void *arg)
 		};
 
 		if (sched_setscheduler(0, SCHED_FIFO, &param) < 0)
-			pr_log("set scheduling param failed\n");
+			pr_warn("set scheduling param failed\n");
 	}
 
-	pollfd[0].fd = thread_ctl[0];
-	pollfd[0].events = POLLIN;
+	sigfillset(&sigset);
+	pthread_sigmask(SIG_BLOCK, &sigset, NULL);
 
-	for (i = 0; i < warg->nr_cpu; i++) {
-		pollfd[i + 1].fd = warg->kern->traces[warg->cpus[i]];
-		pollfd[i + 1].events = POLLIN;
-	}
+	setup_pollfd(&pollfd, warg, has_perf_event, opts->kernel);
 
 	pr_dbg2("start writer thread %d\n", warg->idx);
 	while (!buf_done) {
 		LIST_HEAD(head);
 		bool check_list = false;
 
-		if (poll(pollfd, warg->nr_cpu + 1, 1000) < 0)
-			goto out;
-
-		for (i = 0; i < warg->nr_cpu + 1; i++) {
-			if (pollfd[i].revents & POLLIN) {
-				if (i == 0)
-					check_list = true;
-				else
-					record_kernel_trace_pipe(warg->kern,
-								 warg->cpus[i-1],
-								 warg->sock);
-			}
-		}
-
+		check_list = handle_pollfd(pollfd, warg, true, has_perf_event,
+					   opts->kernel, 1000);
 		if (!check_list)
 			continue;
 
@@ -540,23 +643,21 @@ void *writer_thread(void *arg)
 			}
 			pthread_mutex_unlock(&write_list_lock);
 
-			if (!opts->kernel)
+			if (!has_perf_event && !opts->kernel)
 				continue;
 
-			poll(&pollfd[1], warg->nr_cpu, 0);
-
-			for (i = 0; i < warg->nr_cpu; i++) {
-				if (pollfd[i+1].revents & POLLIN) {
-					record_kernel_trace_pipe(warg->kern,
-								 warg->cpus[i],
-								 warg->sock);
-				}
-			}
+			handle_pollfd(pollfd, warg, false, has_perf_event,
+				      opts->kernel, 0);
 		}
 	}
 	pr_dbg2("stop writer thread %d\n", warg->idx);
 
-out:
+	if (has_perf_event) {
+		for (i = 0; i < warg->nr_cpu; i++)
+			record_perf_data(warg->perf, warg->cpus[i], warg->sock);
+	}
+
+	finish_pollfd(pollfd);
 	free(warg);
 	return NULL;
 }
@@ -916,14 +1017,14 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 		record_mmap_file(dirname, buf, bufsize);
 		break;
 
-	case UFTRACE_MSG_TASK:
+	case UFTRACE_MSG_TASK_START:
 		if (msg.len != sizeof(tmsg))
 			pr_err_ns("invalid message length\n");
 
 		if (read_all(pfd, &tmsg, sizeof(tmsg)) < 0)
 			pr_err("reading pipe failed");
 
-		pr_dbg2("MSG TASK : %d/%d\n", tmsg.pid, tmsg.tid);
+		pr_dbg2("MSG TASK_START : %d/%d\n", tmsg.pid, tmsg.tid);
 
 		/* check existing tid (due to exec) */
 		list_for_each_entry(pos, &tid_list_head, list) {
@@ -937,6 +1038,24 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 			add_tid_list(tmsg.pid, tmsg.tid);
 
 		write_task_info(dirname, &tmsg);
+		break;
+
+	case UFTRACE_MSG_TASK_END:
+		if (msg.len != sizeof(tmsg))
+			pr_err_ns("invalid message length\n");
+
+		if (read_all(pfd, &tmsg, sizeof(tmsg)) < 0)
+			pr_err("reading pipe failed");
+
+		pr_dbg2("MSG TASK_END : %d/%d\n", tmsg.pid, tmsg.tid);
+
+		/* mark test exited */
+		list_for_each_entry(pos, &tid_list_head, list) {
+			if (pos->tid == tmsg.tid) {
+				pos->exited = true;
+				break;
+			}
+		}
 		break;
 
 	case UFTRACE_MSG_FORK_START:
@@ -1042,8 +1161,12 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 		/* exename will be freed with the dlib */
 		break;
 
+	case UFTRACE_MSG_FINISH:
+		pr_dbg2("MSG FINISH\n");
+		break;
+
 	default:
-		pr_log("Unknown message type: %u\n", msg.type);
+		pr_warn("Unknown message type: %u\n", msg.type);
 		break;
 	}
 }
@@ -1141,47 +1264,61 @@ static void send_kernel_metadata(int sock, const char *dirname)
 	send_trace_metadata(sock, dirname, "kallsyms");
 }
 
-static void save_module_symbols(struct opts *opts, struct symtabs *symtabs)
+static void send_event_file(int sock, const char *dirname)
 {
-	struct ftrace_proc_maps *map, *tmp;
-	LIST_HEAD(modules);
-	struct dirent **map_list;
-	char sid[20] = { 0, };
-	int i, maps;
+	char buf[PATH_MAX];
 
-	ftrace_setup_filter_module(opts->filter, &modules, symtabs->filename);
-	ftrace_setup_filter_module(opts->trigger, &modules, symtabs->filename);
-	ftrace_setup_filter_module(opts->args, &modules, symtabs->filename);
-	ftrace_setup_filter_module(opts->retval, &modules, symtabs->filename);
-
-	if (list_empty(&modules))
+	/* kernel events doesn't create the events file */
+	snprintf(buf, sizeof(buf), "%s/events.txt", dirname);
+	if (access(buf, F_OK) != 0)
 		return;
+
+	send_trace_metadata(sock, dirname, "events.txt");
+}
+
+static void save_session_symbols(struct opts *opts)
+{
+	struct dirent **map_list;
+	int i, maps;
 
 	maps = scandir(opts->dirname, &map_list, filter_map, alphasort);
 	if (maps <= 0)
 		pr_err("cannot find map files");
 
 	for (i = 0; i < maps; i++) {
+		struct symtabs symtabs = {
+			.loaded = false,
+		};
+		struct uftrace_mmap *map, *tmp;
+		char sid[20] = { 0, };
+
 		if (sid[0] == '\0')
 			sscanf(map_list[i]->d_name, "sid-%[^.].map", sid);
 		free(map_list[i]);
+
+		pr_dbg2("reading symbols for session %s\n", sid);
+		read_session_map(opts->dirname, &symtabs, sid);
+
+		/* main executable */
+		load_symtabs(&symtabs, opts->dirname, symtabs.maps->libname);
+		save_symbol_file(&symtabs, opts->dirname, symtabs.filename);
+
+		/* shared libraries */
+		load_module_symtabs(&symtabs);
+		save_module_symtabs(&symtabs);
+
+		map = symtabs.maps;
+		while (map) {
+			tmp = map;
+			map = map->next;
+
+			free(tmp);
+		}
+		symtabs.maps = NULL;
+
+		unload_symtabs(&symtabs);
 	}
 	free(map_list);
-
-	read_session_map(opts->dirname, symtabs, sid);
-	load_module_symtabs(symtabs, &modules);
-	save_module_symtabs(symtabs, &modules);
-
-	map = symtabs->maps;
-	while (map) {
-		tmp = map;
-		map = map->next;
-
-		free(tmp);
-	}
-	symtabs->maps = NULL;
-
-	ftrace_cleanup_filter_module(&modules);
 }
 
 static bool child_exited;
@@ -1201,10 +1338,11 @@ static void sigchld_handler(int sig, siginfo_t *sainfo, void *context)
 	child_exited = true;
 }
 
-static void print_child_time(struct timespec *ts1, struct timespec *ts2)
+static char *get_child_time(struct timespec *ts1, struct timespec *ts2)
 {
 #define SEC_TO_NSEC  (1000000000ULL)
 
+	char *elapsed_time = NULL;
 	uint64_t  sec = ts2->tv_sec  - ts1->tv_sec;
 	uint64_t nsec = ts2->tv_nsec - ts1->tv_nsec;
 
@@ -1213,7 +1351,13 @@ static void print_child_time(struct timespec *ts1, struct timespec *ts2)
 		sec--;
 	}
 
-	pr_out("elapsed time: %"PRIu64".%09"PRIu64" sec\n", sec, nsec);
+	xasprintf(&elapsed_time, "%"PRIu64".%09"PRIu64" sec", sec, nsec);
+	return elapsed_time;
+}
+
+static void print_child_time(char *elapsed_time)
+{
+	pr_out("elapsed time: %s\n", elapsed_time);
 }
 
 static void print_child_usage(struct rusage *ru)
@@ -1224,7 +1368,7 @@ static void print_child_usage(struct rusage *ru)
 	       ru->ru_utime.tv_sec, ru->ru_utime.tv_usec);
 }
 
-#define UFTRACE_MSG  "Cannot trace '%s': No such file\n"			\
+#define UFTRACE_MSG  "Cannot trace '%s': No such executable file\n"	\
 "\tNote that uftrace doesn't search $PATH for you.\n"			\
 "\tIf you really want to trace executables in the $PATH,\n"		\
 "\tplease give it the absolute pathname (like /usr/bin/%s).\n"
@@ -1244,6 +1388,9 @@ static void print_child_usage(struct rusage *ru)
 #define ARGUMENT_MSG  "uftrace: -A or -R might not work for binaries"	\
 " with -finstrument-functions\n"
 
+#define STATIC_MSG  "Cannot trace static binary: %s\n"			\
+"\tIt seems to be compiled with -static, rebuild the binary without it.\n"
+
 #ifndef  EM_AARCH64
 # define EM_AARCH64  183
 #endif
@@ -1251,6 +1398,7 @@ static void print_child_usage(struct rusage *ru)
 static void check_binary(struct opts *opts)
 {
 	int fd;
+	int chk;
 	size_t i;
 	char elf_ident[EI_NIDENT];
 	uint16_t e_type;
@@ -1294,8 +1442,16 @@ static void check_binary(struct opts *opts)
 	if (i == ARRAY_SIZE(supported_machines))
 		pr_err_ns(MACHINE_MSG, opts->exename, e_machine);
 
+	chk = check_static_binary(opts->exename);
+	if (chk) {
+		if (chk < 0)
+			pr_err_ns("Cannot check '%s'\n", opts->exename);
+		else
+			pr_err_ns(STATIC_MSG, opts->exename);
+	}
+
 	if (!opts->force) {
-		int chk = check_trace_functions(opts->exename);
+		chk = check_trace_functions(opts->exename);
 
 		if (chk == 0 && !opts->patch) {
 			/* there's no function to trace */
@@ -1313,69 +1469,49 @@ static void check_binary(struct opts *opts)
 	close(fd);
 }
 
-int command_record(int argc, char *argv[], struct opts *opts)
+static bool check_linux_perf_event(char *events)
 {
-	int pid;
-	int status;
-	int pfd[2];
+	char *str, *tmp, *evt;
+	bool found = false;
+
+	if (events == NULL)
+		return false;
+
+	str = tmp = xstrdup(events);
+
+	evt = strtok(tmp, ";");
+	while (evt) {
+		if (fnmatch(evt, "linux:schedule", 0) == 0) {
+			found = true;
+			break;
+		}
+		evt = strtok(NULL, ";");
+	}
+
+	free(str);
+	return found;
+}
+
+struct writer_data {
+	int				pid;
+	int				pipefd;
+	int				sock;
+	int				nr_cpu;
+	int				status;
+	pthread_t			*writers;
+	struct timespec			ts1, ts2;
+	struct rusage			usage;
+	struct uftrace_kernel_writer	kernel;
+	struct uftrace_perf_writer	perf;
+};
+
+static void setup_writers(struct writer_data *wd, struct opts *opts)
+{
+	struct uftrace_kernel_writer *kernel = &wd->kernel;
+	struct uftrace_perf_writer *perf = &wd->perf;
 	struct sigaction sa = {
 		.sa_flags = 0,
 	};
-	int remaining = 0;
-	struct symtabs symtabs = {
-		.loaded = false,
-	};
-	struct timespec ts1, ts2;
-	struct rusage usage;
-	pthread_t *writers;
-	struct uftrace_kernel kernel;
-	struct dlopen_list *dlib, *tmp;
-	int efd;
-	uint64_t go = 1;
-	int sock = -1;
-	int nr_cpu;
-	int i, k;
-	int ret = UFTRACE_EXIT_SUCCESS;
-
-	if (pipe(pfd) < 0)
-		pr_err("cannot setup internal pipe");
-
-	if (create_directory(opts->dirname) < 0)
-		return -1;
-
-	check_binary(opts);
-
-	fflush(stdout);
-
-	efd = eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
-	if (efd < 0)
-		pr_dbg("creating eventfd failed: %d\n", efd);
-
-	pid = fork();
-	if (pid < 0)
-		pr_err("cannot start child process");
-
-	if (pid == 0) {
-		uint64_t dummy;
-
-		close(pfd[0]);
-
-		setup_child_environ(opts, pfd[1]);
-
-		/* wait for parent ready */
-		if (read(efd, &dummy, sizeof(dummy)) != (ssize_t)sizeof(dummy))
-			pr_err("waiting for parent failed");
-
-		/*
-		 * I don't think the traced binary is in PATH.
-		 * So use plain 'execv' rather than 'execvp'.
-		 */
-		execv(opts->exename, &argv[opts->idx]);
-		abort();
-	}
-
-	clock_gettime(CLOCK_MONOTONIC, &ts1);
-	close(pfd[1]);
 
 	sigfillset(&sa.sa_mask);
 	sa.sa_handler = NULL;
@@ -1384,120 +1520,134 @@ int command_record(int argc, char *argv[], struct opts *opts)
 	sigaction(SIGCHLD, &sa, NULL);
 
 	if (opts->host) {
-		sock = setup_client_socket(opts);
-		send_trace_dir_name(sock, opts->dirname);
+		wd->sock = setup_client_socket(opts);
+		send_trace_dir_name(wd->sock, opts->dirname);
 	}
+	else
+		wd->sock = -1;
 
-	nr_cpu = sysconf(_SC_NPROCESSORS_ONLN);
+	wd->nr_cpu = sysconf(_SC_NPROCESSORS_ONLN);
 
-	if (opts->kernel) {
-		kernel.pid = pid;
-		kernel.output_dir = opts->dirname;
-		kernel.depth = opts->kernel_depth ?: 1;
-		kernel.bufsize = opts->kernel_bufsize;
+	if (opts->kernel || has_kernel_event(opts->event)) {
+		int err;
+
+		kernel->pid = wd->pid;
+		kernel->output_dir = opts->dirname;
+		kernel->depth = opts->kernel_depth ?: 1;
+		kernel->bufsize = opts->kernel_bufsize;
 
 		if (!opts->nr_thread) {
 			if (opts->kernel_depth >= 4)
-				opts->nr_thread = nr_cpu;
+				opts->nr_thread = wd->nr_cpu;
 			else if (opts->kernel_depth >= 2)
-				opts->nr_thread = nr_cpu / 2;
+				opts->nr_thread = wd->nr_cpu / 2;
 		}
 
 		if (!opts->kernel_bufsize) {
 			if (opts->kernel_depth >= 8)
-				kernel.bufsize = 4096 * 1024;
+				kernel->bufsize = 4096 * 1024;
 			else if (opts->kernel_depth >= 4)
-				kernel.bufsize = 3072 * 1024;
+				kernel->bufsize = 3072 * 1024;
 			else if (opts->kernel_depth >= 2)
-				kernel.bufsize = 2048 * 1024;
+				kernel->bufsize = 2048 * 1024;
 		}
 
-		if (setup_kernel_tracing(&kernel, opts) < 0) {
+		err = setup_kernel_tracing(kernel, opts);
+		if (err) {
+			if (err == -EPERM)
+				pr_warn("kernel tracing requires root privilege\n");
+			else
+				pr_warn("kernel tracing disabled due to an error\n"
+				        "does CONFIG_FTRACE enable in kernel?\n");
+
+
 			opts->kernel = false;
-			pr_log("kernel tracing disabled due to an error\n");
 		}
 	}
 
 	if (!opts->nr_thread)
-		opts->nr_thread = DIV_ROUND_UP(nr_cpu, 4);
-	else if (opts->nr_thread > nr_cpu)
-		opts->nr_thread = nr_cpu;
+		opts->nr_thread = DIV_ROUND_UP(wd->nr_cpu, 4);
+	else if (opts->nr_thread > wd->nr_cpu)
+		opts->nr_thread = wd->nr_cpu;
+
+	if (has_perf_event) {
+		if (setup_perf_record(perf, wd->nr_cpu, wd->pid,
+				      opts->dirname) < 0)
+			has_perf_event = false;
+	}
 
 	pr_dbg("creating %d thread(s) for recording\n", opts->nr_thread);
-	writers = xmalloc(opts->nr_thread * sizeof(*writers));
+	wd->writers = xmalloc(opts->nr_thread * sizeof(*wd->writers));
 
 	if (pipe(thread_ctl) < 0)
 		pr_err("cannot create an eventfd for writer thread");
+}
 
-	if (opts->kernel && start_kernel_tracing(&kernel) < 0) {
+static void start_tracing(struct writer_data *wd, struct opts *opts, int ready_fd)
+{
+	int i, k;
+	uint64_t go = 1;
+
+	clock_gettime(CLOCK_MONOTONIC, &wd->ts1);
+
+	if (opts->kernel && start_kernel_tracing(&wd->kernel) < 0) {
 		opts->kernel = false;
-		pr_log("kernel tracing disabled due to an error\n");
+		pr_warn("kernel tracing disabled due to an error\n");
 	}
 
 	for (i = 0; i < opts->nr_thread; i++) {
 		struct writer_arg *warg;
-		int cpu_per_thread = DIV_ROUND_UP(nr_cpu, opts->nr_thread);
+		int cpu_per_thread = DIV_ROUND_UP(wd->nr_cpu, opts->nr_thread);
 		size_t sizeof_warg = sizeof(*warg) + sizeof(int) * cpu_per_thread;
 
-		warg = xmalloc(sizeof_warg);
+		warg = xzalloc(sizeof_warg);
 		warg->opts = opts;
 		warg->idx  = i;
-		warg->sock = sock;
-		warg->kern = &kernel;
+		warg->sock = wd->sock;
+		warg->kern = &wd->kernel;
+		warg->perf = &wd->perf;
 		warg->nr_cpu = 0;
 		INIT_LIST_HEAD(&warg->list);
 		INIT_LIST_HEAD(&warg->bufs);
 
-		if (opts->kernel) {
+		if (opts->kernel || has_perf_event) {
 			warg->nr_cpu = cpu_per_thread;
 
 			for (k = 0; k < cpu_per_thread; k++) {
-				if (i * cpu_per_thread + k < nr_cpu)
+				if (i * cpu_per_thread + k < wd->nr_cpu)
 					warg->cpus[k] = i * cpu_per_thread + k;
 				else
 					warg->cpus[k] = -1;
 			}
 		}
 
-		pthread_create(&writers[i], NULL, writer_thread, warg);
+		pthread_create(&wd->writers[i], NULL, writer_thread, warg);
 	}
 
 	/* signal child that I'm ready */
-	if (write(efd, &go, sizeof(go)) != (ssize_t)sizeof(go))
+	if (write(ready_fd, &go, sizeof(go)) != (ssize_t)sizeof(go))
 		pr_err("signal to child failed");
+}
 
-	close(efd);
+static int stop_tracing(struct writer_data *wd, struct opts *opts)
+{
+	int status = -1;
+	int ret = UFTRACE_EXIT_SUCCESS;
 
+	/* child finished, read remaining data in the pipe */
 	while (!uftrace_done) {
-		struct pollfd pollfd = {
-			.fd = pfd[0],
-			.events = POLLIN,
-		};
-		int ret;
+		int remaining = 0;
 
-		ret = poll(&pollfd, 1, 1000);
-		if (ret < 0 && errno == EINTR)
-			continue;
-		if (ret < 0)
-			pr_err("error during poll");
-
-		if (pollfd.revents & POLLIN)
-			read_record_mmap(pfd[0], opts->dirname, opts->bufsize);
-
-		if (pollfd.revents & (POLLERR | POLLHUP))
-			break;
-	}
-
-	clock_gettime(CLOCK_MONOTONIC, &ts2);
-
-	while (!uftrace_done) {
-		if (ioctl(pfd[0], FIONREAD, &remaining) < 0)
+		if (ioctl(wd->pipefd, FIONREAD, &remaining) < 0)
 			break;
 
 		if (remaining) {
-			read_record_mmap(pfd[0], opts->dirname, opts->bufsize);
+			read_record_mmap(wd->pipefd, opts->dirname, opts->bufsize);
 			continue;
 		}
+
+		/* wait for SIGCHLD or FORK_END */
+		usleep(1000);
 
 		/*
 		 * It's possible to receive a remaining FORK_START message.
@@ -1505,23 +1655,22 @@ int command_record(int argc, char *argv[], struct opts *opts)
 		 * order to get proper pid.  Otherwise replay will fail with
 		 * pid of -1.
 		 */
-		if (child_exited && check_tid_list())
+		if (check_tid_list())
 			break;
 
 		pr_dbg2("waiting for FORK2\n");
-		usleep(1000);
 	}
 
 	if (child_exited) {
-		wait4(pid, &status, WNOHANG, &usage);
+		wait4(wd->pid, &status, WNOHANG, &wd->usage);
 		if (WIFEXITED(status)) {
 			pr_dbg("child terminated with exit code: %d\n",
 			       WEXITSTATUS(status));
 
-			if (!WEXITSTATUS(status))
-				ret = UFTRACE_EXIT_SUCCESS;
-			else
+			if (WEXITSTATUS(status))
 				ret = UFTRACE_EXIT_FAILURE;
+			else
+				ret = UFTRACE_EXIT_SUCCESS;
 		}
 		else {
 			pr_yellow("child terminated by signal: %d: %s\n",
@@ -1529,41 +1678,63 @@ int command_record(int argc, char *argv[], struct opts *opts)
 			ret = UFTRACE_EXIT_SIGNALED;
 		}
 	}
-	else {
-		status = -1;
-		getrusage(RUSAGE_CHILDREN, &usage);
-		ret = UFTRACE_EXIT_UNKNOWN;
-	}
+	else if (opts->keep_pid)
+		memset(&wd->usage, 0, sizeof(wd->usage));
+	else
+		getrusage(RUSAGE_CHILDREN, &wd->usage);
 
 	stop_all_writers();
 	if (opts->kernel)
-		stop_kernel_tracing(&kernel);
+		stop_kernel_tracing(&wd->kernel);
 
-	if (fill_file_header(opts, status, &usage) < 0)
+	clock_gettime(CLOCK_MONOTONIC, &wd->ts2);
+
+	wd->status = status;
+	return ret;
+}
+
+static void finish_writers(struct writer_data *wd, struct opts *opts)
+{
+	int i;
+	char *elapsed_time = get_child_time(&wd->ts1, &wd->ts2);
+
+	if (fill_file_header(opts, wd->status, &wd->usage, elapsed_time) < 0)
 		pr_err("cannot generate data file");
 
 	if (opts->time) {
-		print_child_time(&ts1, &ts2);
-		print_child_usage(&usage);
+		print_child_time(elapsed_time);
+		print_child_usage(&wd->usage);
 	}
 
+	free(elapsed_time);
+
 	if (shmem_lost_count)
-		pr_log("LOST %d records\n", shmem_lost_count);
+		pr_warn("LOST %d records\n", shmem_lost_count);
 
 	for (i = 0; i < opts->nr_thread; i++)
-		pthread_join(writers[i], NULL);
-	free(writers);
+		pthread_join(wd->writers[i], NULL);
+	free(wd->writers);
 	close(thread_ctl[0]);
 
 	flush_shmem_list(opts->dirname, opts->bufsize);
-	record_remaining_buffer(opts, sock);
+	record_remaining_buffer(opts, wd->sock);
 	unlink_shmem_list();
 	free_tid_list();
 
-	load_symtabs(&symtabs, opts->dirname, opts->exename);
-	save_symbol_file(&symtabs, opts->dirname, opts->exename);
-	save_module_symbols(opts, &symtabs);
+	if (opts->kernel)
+		finish_kernel_tracing(&wd->kernel);
+	if (has_perf_event)
+		finish_perf_record(&wd->perf);
+}
 
+static void write_symbol_files(struct writer_data *wd, struct opts *opts)
+{
+	struct dlopen_list *dlib, *tmp;
+
+	/* main executable and shared libraries */
+	save_session_symbols(opts);
+
+	/* dynamically loaded libraries using dlopen() */
 	list_for_each_entry_safe(dlib, tmp, &dlopen_libs, list) {
 		struct symtabs dlib_symtabs = {
 			.loaded = false,
@@ -1578,10 +1749,9 @@ int command_record(int argc, char *argv[], struct opts *opts)
 		free(dlib);
 	}
 
-	if (opts->kernel)
-		finish_kernel_tracing(&kernel);
-
 	if (opts->host) {
+		int sock = wd->sock;
+
 		send_task_file(sock, opts->dirname);
 		send_map_files(sock, opts->dirname);
 		send_sym_files(sock, opts->dirname);
@@ -1589,6 +1759,8 @@ int command_record(int argc, char *argv[], struct opts *opts)
 
 		if (opts->kernel)
 			send_kernel_metadata(sock, opts->dirname);
+		if (opts->event)
+			send_event_file(sock, opts->dirname);
 
 		send_trace_end(sock);
 		close(sock);
@@ -1597,7 +1769,109 @@ int command_record(int argc, char *argv[], struct opts *opts)
 	}
 	else if (geteuid() == 0)
 		chown_directory(opts->dirname);
+}
 
-	unload_symtabs(&symtabs);
+int do_main_loop(int pfd[2], int ready, struct opts *opts, int pid)
+{
+	int ret;
+	struct writer_data wd;
+
+	wd.pid = pid;
+	wd.pipefd = pfd[0];
+	close(pfd[1]);
+
+	setup_writers(&wd, opts);
+	start_tracing(&wd, opts, ready);
+	close(ready);
+
+	while (!uftrace_done) {
+		struct pollfd pollfd = {
+			.fd = pfd[0],
+			.events = POLLIN,
+		};
+
+		ret = poll(&pollfd, 1, 1000);
+		if (ret < 0 && errno == EINTR)
+			continue;
+		if (ret < 0)
+			pr_err("error during poll");
+
+		if (pollfd.revents & POLLIN)
+			read_record_mmap(pfd[0], opts->dirname, opts->bufsize);
+
+		if (pollfd.revents & (POLLERR | POLLHUP))
+			break;
+	}
+
+	ret = stop_tracing(&wd, opts);
+	finish_writers(&wd, opts);
+
+	write_symbol_files(&wd, opts);
+	return ret;
+}
+
+int do_child_exec(int pfd[2], int ready, struct opts *opts, char *argv[])
+{
+	uint64_t dummy;
+
+	close(pfd[0]);
+
+	setup_child_environ(opts, pfd[1]);
+
+	/* wait for parent ready */
+	if (read(ready, &dummy, sizeof(dummy)) != (ssize_t)sizeof(dummy))
+		pr_err("waiting for parent failed");
+
+	/*
+	 * I don't think the traced binary is in PATH.
+	 * So use plain 'execv' rather than 'execvp'.
+	 */
+	execv(opts->exename, &argv[opts->idx]);
+	abort();
+}
+
+int command_record(int argc, char *argv[], struct opts *opts)
+{
+	int pid;
+	int pfd[2];
+	int efd;
+	int ret = -1;
+
+	if (pipe(pfd) < 0)
+		pr_err("cannot setup internal pipe");
+
+	if (create_directory(opts->dirname) < 0)
+		return -1;
+
+	/* apply script-provided options */
+	if (opts->script_file)
+		parse_script_opt(opts);
+
+	check_binary(opts);
+
+	has_perf_event = check_linux_perf_event(opts->event);
+
+	fflush(stdout);
+
+	efd = eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
+	if (efd < 0)
+		pr_dbg("creating eventfd failed: %d\n", efd);
+
+	pid = fork();
+	if (pid < 0)
+		pr_err("cannot start child process");
+
+	if (pid == 0) {
+		if (opts->keep_pid)
+			ret = do_main_loop(pfd, efd, opts, getppid());
+		else
+			do_child_exec(pfd, efd, opts, argv);
+		return ret;
+	}
+
+	if (opts->keep_pid)
+		do_child_exec(pfd, efd, opts, argv);
+	else
+		ret = do_main_loop(pfd, efd, opts, pid);
 	return ret;
 }

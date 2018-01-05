@@ -47,6 +47,7 @@ This command shows information like below:
     # exe image           : /home/namhyung/tmp/abc
     # build id            : a3c50d25f7dd98dab68e94ef0f215edb06e98434
     # exit status         : exited with code: 0
+    # elapsed time        : 0.003219479 sec
     # cpu time            : 0.003 / 0.000 sec (sys / user)
     # context switch      : 1 / 1 (voluntary / involuntary)
     # max rss             : 3104 KB
@@ -76,6 +77,32 @@ To see the symbol table, one can use the `--symbols` option.
     [ 3] __monstartup (0x400560) size: 16
     [ 4] mcount (0x400570) size: 16
     [ 5] __cxa_atexit (0x400580) size: 16
+
+
+You can get symbol information from ELF binary directly without trace data.
+
+    $ uftrace info --symbols abc
+    Normal symbols
+    ==============
+    [ 0] 0x3e0: main (size: 144)
+    [ 1] 0x470: __x86.get_pc_thunk.bx (size: 203)
+    [ 2] 0x53b: c (size: 57)
+    [ 3] 0x574: b (size: 50)
+    [ 4] 0x5a6: a (size: 58)
+    [ 5] 0x5e0: __libc_csu_init (size: 96)
+    [ 6] 0x640: __libc_csu_fini (size: 2)
+    [ 7] 0x642: __sym_end (size: 0)
+
+
+    Dynamic symbols
+    ===============
+    [ 0] 0x380: __cyg_profile_func_enter (size: 16)
+    [ 1] 0x390: __cyg_profile_func_exit (size: 16)
+    [ 2] 0x3a0: getpid (size: 16)
+    [ 3] 0x3b0: __libc_start_main (size: 16)
+    [ 4] 0x3c0: atoi (size: 16)
+    [ 5] 0x3d0: __dynsym_end (size: 0)
+
 
 SEE ALSO
 ========

@@ -31,7 +31,9 @@ class TestCase(TestBase):
         return TestBase.TEST_SUCCESS
 
     def runcmd(self):
-        return '%s report -d %s --diff %s' % (TestBase.ftrace, XDIR, YDIR)
+        uftrace = TestBase.ftrace
+        options = '--sort-column 0 --diff-policy full,percent'  # old behavior
+        return '%s report -d %s --diff %s %s' % (uftrace, XDIR, YDIR, options)
 
     def post(self, ret):
         sp.call(['rm', '-rf', XDIR, YDIR])

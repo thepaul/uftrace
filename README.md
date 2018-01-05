@@ -10,9 +10,12 @@ of the Linux kernel (especially function graph tracer) and supports
 userspace programs.  It supports various kind of commands and filters
 to help analysis of the program execution and performance.
 
+![uftrace-live-demo](doc/uftrace-live-demo.gif)
+
  * Homepage: https://github.com/namhyung/uftrace
  * Tutorial: https://github.com/namhyung/uftrace/wiki/Tutorial
  * Chat: https://gitter.im/uftrace/uftrace
+ * Mailing list: [uftrace@googlegroups.com](https://groups.google.com/forum/#!forum/uftrace)
 
 
 Features
@@ -43,17 +46,18 @@ The uftrace command has following subcommands:
  * `record` : runs a program and saves the trace data
  * `replay` : shows program execution in the trace data
  * `report` : shows performance statistics in the trace data
- * `live` : does record and replay in a row (default)
- * `info` : shows system and program info in the trace data
- * `dump` : shows low-level trace data
- * `recv` : saves the trace data from network
- * `graph` : shows function call graph in the trace data
+ * `live`   : does record and replay in a row (default)
+ * `info`   : shows system and program info in the trace data
+ * `dump`   : shows low-level trace data
+ * `recv`   : saves the trace data from network
+ * `graph`  : shows function call graph in the trace data
+ * `script` : runs a script for recorded trace data
 
 You can use `-?` or `--help` option to see available commands and options.
 
     $ uftrace
     Usage: uftrace [OPTION...]
-                [record|replay|live|report|info|dump|recv|graph] [<program>]
+                [record|replay|live|report|info|dump|recv|graph|script] [<program>]
     Try `uftrace --help' or `uftrace --usage' for more information.
 
 If omitted, it defaults to the `live` command which is almost same as running
@@ -103,7 +107,7 @@ With the classic hello world program, the output would look like below (Note,
 I changed it to use fprintf() with stderr rather than the plain printf() to make
 it invoke system call directly):
 
-    $ sudo uftrace -k hello
+    $ sudo uftrace -k tests/t-hello
     Hello world
     # DURATION    TID     FUNCTION
        1.365 us [21901] | __monstartup();
@@ -122,7 +126,7 @@ Also it can record and show function arguments and return value with `-A` and
 `-R` options respectively.  The following example records first argument and
 return value of 'fib' (fibonacci number) function.
 
-    $ uftrace record -A fib@arg1 -R fib@retval fibonacci 5
+    $ uftrace record -A fib@arg1 -R fib@retval tests/t-fibonacci 5
 
     $ uftrace replay
     # DURATION    TID     FUNCTION
@@ -162,17 +166,12 @@ The `graph` command shows function call graph of given function.  In the above
 example, function graph of function 'main' looks like below:
 
     $ uftrace graph  main
-    #
-    # function graph for 'main' (session: 8823ea321c31e531)
-    #
-    
-    backtrace
-    ================================
+    # Function Call Graph for 'main' (session: 073f1e84aa8b09d3)
+    =============== BACKTRACE ===============
      backtrace #0: hit 1, time  25.024 us
        [0] main (0x40066b)
     
-    calling functions
-    ================================
+    ========== FUNCTION CALL GRAPH ==========
       25.024 us : (1) main
        2.706 us :  +-(1) atoi
                 :  | 
@@ -193,7 +192,7 @@ The `info` command shows system and program information when recorded.
     $ uftrace info
     # system information
     # ==================
-    # program version     : uftrace v0.6
+    # program version     : uftrace v0.8.1
     # recorded on         : Tue May 24 11:21:59 2016
     # cmdline             : uftrace record tests/t-abc 
     # cpu info            : Intel(R) Core(TM) i7-3930K CPU @ 3.20GHz
@@ -211,6 +210,7 @@ The `info` command shows system and program information when recorded.
     # exe image           : /home/namhyung/project/uftrace/tests/t-abc
     # build id            : a3c50d25f7dd98dab68e94ef0f215edb06e98434
     # exit status         : exited with code: 0
+    # elapsed time        : 0.003219479 sec
     # cpu time            : 0.000 / 0.003 sec (sys / user)
     # context switch      : 1 / 1 (voluntary / involuntary)
     # max rss             : 3072 KB
@@ -237,10 +237,10 @@ For more advanced setup, please refer
 
 Limitations
 ===========
-- It can only trace a native C/C++ application compiled with -pg option.
+- It can trace a native C/C++ application on Linux.
 - It *cannot* trace already running process.
 - It *cannot* be used for system-wide tracing.
-- It only supports x86_64 and ARM (v6,7) for now.
+- It supports x86_64 and ARM (v6 or later) and AArch64 for now.
 
 
 License

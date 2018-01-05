@@ -6,7 +6,7 @@
 #define PR_FMT     "dynamic"
 #define PR_DOMAIN  DBG_DYNAMIC
 
-#include "libmcount/mcount.h"
+#include "libmcount/internal.h"
 #include "utils/utils.h"
 #include "utils/symbol.h"
 
@@ -139,6 +139,18 @@ void mcount_arch_find_module(struct mcount_dynamic_info *mdi)
 			goto out;
 		}
 
+		/* handle position independent code */
+		if (ehdr.e_type == ET_DYN) {
+			struct xray_instr_map *xrmap;
+
+			for (i = 0; i < adi->xrmap_count; i++) {
+				xrmap = &adi->xrmap[i];
+
+				xrmap->addr  += mdi->addr;
+				xrmap->entry += mdi->addr;
+			}
+		}
+
 		mdi->arch = adi;
 		break;
 	}
@@ -148,11 +160,13 @@ out:
 	free(names);
 }
 
+#define CALL_INSN_SIZE 5
+
 static unsigned long get_target_addr(struct mcount_dynamic_info *mdi, unsigned long addr)
 {
 	while (mdi) {
 		if (mdi->addr <= addr && addr < mdi->addr + mdi->size)
-			return mdi->trampoline - (addr + 5);
+			return mdi->trampoline - (addr + CALL_INSN_SIZE);
 
 		mdi = mdi->next;
 	}
@@ -165,16 +179,16 @@ static int patch_fentry_func(struct mcount_dynamic_info *mdi, struct sym *sym)
 	unsigned char *insn = (void *)sym->addr;
 	unsigned int target_addr;
 
-	/* get the jump offset to the trampoline */
-	target_addr = get_target_addr(mdi, sym->addr);
-	if (target_addr == 0)
-		return -2;
-
 	/* only support calls to __fentry__ at the beginning */
 	if (memcmp(insn, nop, sizeof(nop))) {
 		pr_dbg2("skip non-applicable functions: %s\n", sym->name);
 		return -2;
 	}
+
+	/* get the jump offset to the trampoline */
+	target_addr = get_target_addr(mdi, sym->addr);
+	if (target_addr == 0)
+		return -2;
 
 	/* make a "call" insn with 4-byte offset */
 	insn[0] = 0xe8;
@@ -249,16 +263,22 @@ static int update_xray_func(struct mcount_dynamic_info *mdi, struct sym *sym)
 	struct arch_dynamic_info *adi = mdi->arch;
 	struct xray_instr_map *xrmap;
 
-	/* xray always provides a pair of entry and exit */
-	for (i = 0; i < adi->xrmap_count; i += 2) {
+	/* xray provides a pair of entry and exit (or more) */
+	for (i = 0; i < adi->xrmap_count; i++) {
 		xrmap = &adi->xrmap[i];
 
 		if (xrmap->addr < sym->addr || xrmap->addr >= sym->addr + sym->size)
 			continue;
 
-		ret = patch_xray_func(mdi, sym, xrmap);
-		if (ret == 0)
-			ret = patch_xray_func(mdi, sym, xrmap + 1);
+		while ((ret = patch_xray_func(mdi, sym, xrmap)) == 0) {
+			if (i == adi->xrmap_count - 1)
+				break;
+			i++;
+
+			if (xrmap->entry != xrmap[1].entry)
+				break;
+			xrmap++;
+		}
 
 		break;
 	}

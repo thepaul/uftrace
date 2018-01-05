@@ -1,4 +1,4 @@
-VERSION := 0.7
+VERSION := 0.8.1
 
 # Makefiles suck: This macro sets a default value of $(2) for the
 # variable named by $(1), unless the variable has been set by
@@ -48,12 +48,16 @@ endif
 RM = rm -f
 INSTALL = install
 
-export ARCH CC AR LD RM srcdir objdir
+export ARCH CC AR LD RM srcdir objdir LDFLAGS
 
 COMMON_CFLAGS := -O2 -g -D_GNU_SOURCE $(CFLAGS) $(CPPFLAGS)
 COMMON_CFLAGS +=  -iquote $(srcdir) -iquote $(objdir) -iquote $(srcdir)/arch/$(ARCH)
 #CFLAGS-DEBUG = -g -D_GNU_SOURCE $(CFLAGS_$@)
 COMMON_LDFLAGS := -lelf -lrt -ldl -pthread $(LDFLAGS)
+ifneq ($(elfdir),)
+  COMMON_CFLAGS +=  -I$(elfdir)/include
+  COMMON_LDFLAGS += -L$(elfdir)/lib
+endif
 
 COMMON_CFLAGS += -W -Wall -Wno-unused-parameter -Wno-missing-field-initializers
 
@@ -66,7 +70,7 @@ TRACEEVENT_CFLAGS = $(COMMON_CFLAGS) $(CFLAGS_$@) $(CFLAGS_traceevent)
 LIB_CFLAGS = $(COMMON_CFLAGS) $(CFLAGS_$@) $(CFLAGS_lib) -fPIC -fvisibility=hidden
 
 UFTRACE_LDFLAGS = $(COMMON_LDFLAGS) $(LDFLAGS_$@) $(LDFLAGS_uftrace)
-LIB_LDFLAGS = $(COMMON_LDFLAGS) $(LDFLAGS_$@) $(LDFLAGS_lib)
+LIB_LDFLAGS = $(COMMON_LDFLAGS) $(LDFLAGS_$@) $(LDFLAGS_lib) -Wl,--no-undefined
 
 export UFTRACE_CFLAGS LIB_CFLAGS
 
@@ -94,7 +98,7 @@ UFTRACE_OBJS := $(patsubst $(srcdir)/%.c,$(objdir)/%.o,$(UFTRACE_SRCS))
 UFTRACE_ARCH_OBJS := $(objdir)/arch/$(ARCH)/uftrace.o
 
 UFTRACE_HDRS := $(filter-out $(srcdir)/version.h,$(wildcard $(srcdir)/*.h $(srcdir)/utils/*.h))
-UFTRACE_HDRS += $(srcdir)/libmcount/mcount.h
+UFTRACE_HDRS += $(srcdir)/libmcount/mcount.h $(wildcard $(srcdir)/arch/$(ARCH)/*.h)
 
 LIBMCOUNT_SRCS := $(filter-out %-nop.c,$(wildcard $(srcdir)/libmcount/*.c))
 LIBMCOUNT_OBJS := $(patsubst $(srcdir)/%.c,$(objdir)/%.op,$(LIBMCOUNT_SRCS))
@@ -105,7 +109,9 @@ LIBMCOUNT_FAST_SINGLE_OBJS := $(patsubst $(objdir)/%.op,$(objdir)/%-fast-single.
 LIBMCOUNT_UTILS_SRCS += $(srcdir)/utils/symbol.c $(srcdir)/utils/debug.c
 LIBMCOUNT_UTILS_SRCS += $(srcdir)/utils/rbtree.c $(srcdir)/utils/filter.c
 LIBMCOUNT_UTILS_SRCS += $(srcdir)/utils/demangle.c $(srcdir)/utils/utils.c
-LIBMCOUNT_UTILS_OBJS := $(patsubst $(srcdir)/utils/%.c,$(objdir)/%.op,$(LIBMCOUNT_UTILS_SRCS))
+LIBMCOUNT_UTILS_SRCS += $(srcdir)/utils/script.c $(srcdir)/utils/script-python.c
+LIBMCOUNT_UTILS_SRCS += $(srcdir)/utils/auto-args.c
+LIBMCOUNT_UTILS_OBJS := $(patsubst $(srcdir)/utils/%.c,$(objdir)/libmcount/%.op,$(LIBMCOUNT_UTILS_SRCS))
 
 LIBMCOUNT_NOP_SRCS := $(srcdir)/libmcount/mcount-nop.c
 LIBMCOUNT_NOP_OBJS := $(patsubst $(srcdir)/%.c,$(objdir)/%.op,$(LIBMCOUNT_NOP_SRCS))
@@ -113,9 +119,11 @@ LIBMCOUNT_NOP_OBJS := $(patsubst $(srcdir)/%.c,$(objdir)/%.op,$(LIBMCOUNT_NOP_SR
 LIBMCOUNT_ARCH_OBJS := $(objdir)/arch/$(ARCH)/mcount-entry.op
 
 COMMON_DEPS := $(objdir)/.config $(UFTRACE_HDRS)
+LIBMCOUNT_DEPS := $(COMMON_DEPS) $(srcdir)/libmcount/internal.h
 
 CFLAGS_$(objdir)/mcount.op = -pthread
 CFLAGS_$(objdir)/cmd-record.o = -DINSTALL_LIB_PATH='"$(libdir)"'
+CFLAGS_$(objdir)/cmd-live.o = -DINSTALL_LIB_PATH='"$(libdir)"'
 LDFLAGS_$(objdir)/uftrace = -L$(objdir)/libtraceevent -ltraceevent -ldl
 
 LIBMCOUNT_FAST_CFLAGS := -DDISABLE_MCOUNT_FILTER
@@ -130,7 +138,7 @@ MAKEFLAGS = --no-print-directory
 
 all: $(objdir)/.config $(TARGETS)
 
-$(objdir)/.config: $(srcdir)/configure
+$(objdir)/.config: $(srcdir)/configure $(srcdir)/check-deps/Makefile
 	$(QUIET_GEN)$(srcdir)/configure -p -o $@ $(MAKEOVERRIDES)
 	@$(MAKE) -C $(objdir)
 # The above recursive make will handle all build procedure with
@@ -140,22 +148,22 @@ $(objdir)/.config: $(srcdir)/configure
 config: $(srcdir)/configure
 	$(QUIET_GEN)$(srcdir)/configure -o $(objdir)/.config $(MAKEOVERRIDES)
 
-$(LIBMCOUNT_UTILS_OBJS): $(objdir)/%.op: $(srcdir)/utils/%.c $(COMMON_DEPS)
+$(LIBMCOUNT_UTILS_OBJS): $(objdir)/libmcount/%.op: $(srcdir)/utils/%.c $(LIBMCOUNT_DEPS)
 	$(QUIET_CC_FPIC)$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
-$(LIBMCOUNT_OBJS): $(objdir)/%.op: $(srcdir)/%.c $(COMMON_DEPS)
+$(LIBMCOUNT_OBJS): $(objdir)/%.op: $(srcdir)/%.c $(LIBMCOUNT_DEPS)
 	$(QUIET_CC_FPIC)$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
-$(LIBMCOUNT_FAST_OBJS): $(objdir)/%-fast.op: $(srcdir)/%.c $(COMMON_DEPS)
+$(LIBMCOUNT_FAST_OBJS): $(objdir)/%-fast.op: $(srcdir)/%.c $(LIBMCOUNT_DEPS)
 	$(QUIET_CC_FPIC)$(CC) $(LIB_CFLAGS) $(LIBMCOUNT_FAST_CFLAGS) -c -o $@ $<
 
-$(LIBMCOUNT_SINGLE_OBJS): $(objdir)/%-single.op: $(srcdir)/%.c $(COMMON_DEPS)
+$(LIBMCOUNT_SINGLE_OBJS): $(objdir)/%-single.op: $(srcdir)/%.c $(LIBMCOUNT_DEPS)
 	$(QUIET_CC_FPIC)$(CC) $(LIB_CFLAGS) $(LIBMCOUNT_SINGLE_CFLAGS) -c -o $@ $<
 
-$(LIBMCOUNT_FAST_SINGLE_OBJS): $(objdir)/%-fast-single.op: $(srcdir)/%.c $(COMMON_DEPS)
+$(LIBMCOUNT_FAST_SINGLE_OBJS): $(objdir)/%-fast-single.op: $(srcdir)/%.c $(LIBMCOUNT_DEPS)
 	$(QUIET_CC_FPIC)$(CC) $(LIB_CFLAGS) $(LIBMCOUNT_FAST_SINGLE_CFLAGS) -c -o $@ $<
 
-$(LIBMCOUNT_NOP_OBJS): $(objdir)/%.op: $(srcdir)/%.c $(COMMON_DEPS)
+$(LIBMCOUNT_NOP_OBJS): $(objdir)/%.op: $(srcdir)/%.c $(LIBMCOUNT_DEPS)
 	$(QUIET_CC_FPIC)$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
 $(objdir)/libmcount/libmcount.so: $(LIBMCOUNT_OBJS) $(LIBMCOUNT_UTILS_OBJS) $(LIBMCOUNT_ARCH_OBJS)
@@ -173,7 +181,7 @@ $(objdir)/libmcount/libmcount-fast-single.so: $(LIBMCOUNT_FAST_SINGLE_OBJS) $(LI
 $(objdir)/libmcount/libmcount-nop.so: $(LIBMCOUNT_NOP_OBJS)
 	$(QUIET_LINK)$(CC) -shared -o $@ $^ $(LIB_LDFLAGS)
 
-$(LIBMCOUNT_ARCH_OBJS): $(wildcard $(srcdir)/arch/$(ARCH)/*.[cS]) $(COMMON_DEPS)
+$(LIBMCOUNT_ARCH_OBJS): $(wildcard $(srcdir)/arch/$(ARCH)/*.[cS]) $(LIBMCOUNT_DEPS)
 	@$(MAKE) -B -C $(srcdir)/arch/$(ARCH) $@
 
 $(UFTRACE_ARCH_OBJS): $(wildcard $(srcdir)/arch/$(ARCH)/*.[cS]) $(COMMON_DEPS)
@@ -191,6 +199,9 @@ $(filter-out $(objdir)/uftrace.o,$(UFTRACE_OBJS)): $(objdir)/%.o: $(srcdir)/%.c 
 $(objdir)/version.h: PHONY
 	@$(srcdir)/misc/version.sh $@ $(VERSION_GIT)
 
+$(srcdir)/utils/auto-args.h: $(srcdir)/misc/prototypes.h $(srcdir)/misc/gen-autoargs.py
+	$(QUIET_GEN)$(srcdir)/misc/gen-autoargs.py -i $< -o $@
+
 $(objdir)/uftrace: $(UFTRACE_OBJS) $(UFTRACE_ARCH_OBJS) $(objdir)/libtraceevent/libtraceevent.a
 	$(QUIET_LINK)$(CC) $(UFTRACE_CFLAGS) -o $@ $(UFTRACE_OBJS) $(UFTRACE_ARCH_OBJS) $(UFTRACE_LDFLAGS)
 
@@ -198,6 +209,13 @@ install: all
 	$(Q)$(INSTALL) -d -m 755 $(DESTDIR)$(bindir)
 	$(Q)$(INSTALL) -d -m 755 $(DESTDIR)$(libdir)
 	$(Q)$(INSTALL) -d -m 755 $(DESTDIR)$(etcdir)/bash_completion.d
+ifneq ($(wildcard $(elfdir)/lib/libelf.so),)
+ifeq ($(wildcard $(prefix)/lib/libelf.so),)
+	# install libelf only when it's not in the install directory.
+	$(call QUIET_INSTALL, libelf)
+	$(Q)$(INSTALL) $(elfdir)/lib/libelf.so   $(DESTDIR)$(libdir)/libelf.so
+endif
+endif
 	$(call QUIET_INSTALL, uftrace)
 	$(Q)$(INSTALL) $(objdir)/uftrace         $(DESTDIR)$(bindir)/uftrace
 	$(call QUIET_INSTALL, libmcount)
@@ -235,11 +253,15 @@ clean:
 	$(call QUIET_CLEAN, uftrace)
 	$(Q)$(RM) $(objdir)/*.o $(objdir)/*.op $(objdir)/*.so $(objdir)/*.a
 	$(Q)$(RM) $(objdir)/utils/*.o $(objdir)/utils/*.op $(objdir)/libmcount/*.op
-	$(Q)$(RM) $(objdir)/gmon.out $(TARGETS)
+	$(Q)$(RM) $(objdir)/gmon.out $(srcdir)/scripts/*.pyc $(TARGETS)
 	$(Q)$(RM) $(objdir)/uftrace-*.tar.gz $(objdir)/version.h
 	@$(MAKE) -sC $(srcdir)/arch/$(ARCH) clean
 	@$(MAKE) -sC $(srcdir)/tests ARCH=$(ARCH) clean
 	@$(MAKE) -sC $(srcdir)/doc clean
 	@$(MAKE) -sC $(srcdir)/libtraceevent clean
 
-.PHONY: all config clean test dist doc PHONY
+ctags:
+	@find . -name "*\.[chS]" -o -path ./tests -prune -o -path ./check-deps -prune \
+		| xargs ctags --regex-asm='/^(GLOBAL|ENTRY|END)\(([^)]*)\).*/\2/'
+
+.PHONY: all config clean test dist doc ctags PHONY

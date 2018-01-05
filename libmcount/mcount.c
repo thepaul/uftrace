@@ -6,7 +6,6 @@
  * Released under the GPL v2.
  */
 
-#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -15,129 +14,120 @@
 #include <fcntl.h>
 #include <assert.h>
 #include <signal.h>
-#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
-#include <gelf.h>
-#include <dlfcn.h>
-#include <link.h>
 
 /* This should be defined before #include "utils.h" */
 #define PR_FMT     "mcount"
 #define PR_DOMAIN  DBG_MCOUNT
 
 #include "libmcount/mcount.h"
+#include "libmcount/internal.h"
 #include "mcount-arch.h"
 #include "utils/utils.h"
 #include "utils/symbol.h"
 #include "utils/filter.h"
-#include "utils/compiler.h"
+#include "utils/script.h"
 
-uint64_t mcount_threshold;  /* nsec */
+/* time filter in nsec */
+uint64_t mcount_threshold;
+
+/* symbol table of main executable */
 struct symtabs symtabs = {
-	.flags = SYMTAB_FL_DEMANGLE | SYMTAB_FL_ADJ_OFFSET |
-		 SYMTAB_FL_SKIP_NORMAL | SYMTAB_FL_SKIP_DYNAMIC,
+	.flags = SYMTAB_FL_DEMANGLE | SYMTAB_FL_ADJ_OFFSET,
 };
-int shmem_bufsize = SHMEM_BUFFER_SIZE;
-bool mcount_setup_done;
-bool mcount_finished;
 
+/* size of shmem buffer to save uftrace_record */
+int shmem_bufsize = SHMEM_BUFFER_SIZE;
+
+/* global flag to control mcount behavior */
+unsigned long mcount_global_flags = MCOUNT_GFL_SETUP;
+
+/* TSD key to save mtd below */
 pthread_key_t mtd_key = (pthread_key_t)-1;
+
+/* thread local data to trace function execution */
 TLS struct mcount_thread_data mtd;
 
-static int pfd = -1;
+/* pipe file descriptor to communite to uftrace */
+int pfd = -1;
+
+/* maximum depth of mcount rstack */
 static int mcount_rstack_max = MCOUNT_RSTACK_MAX;
-static char *mcount_exename;
-static bool kernel_pid_update;
+
+/* name of main executable */
+char *mcount_exename;
+
+/* whether it should update pid filter manually */
+bool kernel_pid_update;
+
+/* system page size */
+int page_size_in_kb;
+
+/* call depth to filter */
+static int __maybe_unused mcount_depth = MCOUNT_DEFAULT_DEPTH;
+
+/* boolean flag to turn on/off recording */
+static bool __maybe_unused mcount_enabled = true;
+
+/* function filtering mode - inclusive or exclusive */
+static enum filter_mode __maybe_unused mcount_filter_mode = FILTER_MODE_NONE;
+
+/* tree of trigger actions */
+static struct rb_root __maybe_unused mcount_triggers = RB_ROOT;
 
 #ifndef DISABLE_MCOUNT_FILTER
-static int mcount_depth = MCOUNT_DEFAULT_DEPTH;
-static bool mcount_enabled = true;
-static enum filter_mode mcount_filter_mode = FILTER_MODE_NONE;
-
-static struct rb_root mcount_triggers = RB_ROOT;
-#endif /* DISABLE_MCOUNT_FILTER */
-
-uint64_t mcount_gettime(void)
+static void mcount_filter_init(void)
 {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec;
-}
+	char *filter_str    = getenv("UFTRACE_FILTER");
+	char *trigger_str   = getenv("UFTRACE_TRIGGER");
+	char *argument_str  = getenv("UFTRACE_ARGUMENT");
+	char *retval_str    = getenv("UFTRACE_RETVAL");
+	char *autoargs_str  = getenv("UFTRACE_AUTO_ARGS");
 
-int gettid(struct mcount_thread_data *mtdp)
-{
-	if (!mtdp->tid)
-		mtdp->tid = syscall(SYS_gettid);
+	load_module_symtabs(&symtabs);
 
-	return mtdp->tid;
-}
+	/* setup auto-args only if argument/return value is used */
+	if (argument_str || retval_str || autoargs_str ||
+	    (trigger_str && (strstr(trigger_str, "arg") ||
+			     strstr(trigger_str, "retval"))))
+		setup_auto_args();
 
-/* kernel never updates pid filter for a forked child */
-static void update_kernel_tid(int tid)
-{
-	static const char *TRACING_DIR = "/sys/kernel/debug/tracing";
-	char *filename = NULL;
-	char buf[8];
-	int fd;
-	ssize_t len;
+	uftrace_setup_filter(filter_str, &symtabs, &mcount_triggers,
+			     &mcount_filter_mode, false);
+	uftrace_setup_trigger(trigger_str, &symtabs, &mcount_triggers,
+			      &mcount_filter_mode, false);
+	uftrace_setup_argument(argument_str, &symtabs, &mcount_triggers, false);
+	uftrace_setup_retval(retval_str, &symtabs, &mcount_triggers, false);
 
-	xasprintf(&filename, "%s/set_ftrace_pid", TRACING_DIR);
-	fd = open(filename, O_WRONLY | O_APPEND);
-	if (fd < 0)
-		return;
-
-	snprintf(buf, sizeof(buf), "%d", tid);
-	len = strlen(buf);
-	if (write(fd, buf, len) != len)
-		pr_dbg("update kernel ftrace tid filter failed\n");
-
-	close(fd);
-
-	free(filename);
-}
-
-const char *session_name(void)
-{
-	static char session[SESSION_ID_LEN + 1];
-	static uint64_t session_id;
-	int fd;
-
-	if (!session_id) {
-		fd = open("/dev/urandom", O_RDONLY);
-		if (fd < 0)
-			pr_err("cannot open urandom file");
-
-		if (read(fd, &session_id, sizeof(session_id)) != 8)
-			pr_err("reading from urandom");
-
-		close(fd);
-
-		snprintf(session, sizeof(session), "%0*"PRIx64,
-			 SESSION_ID_LEN, session_id);
+	if (autoargs_str) {
+		uftrace_setup_argument(get_auto_argspec_str(), &symtabs,
+				       &mcount_triggers, true);
+		uftrace_setup_retval(get_auto_retspec_str(), &symtabs,
+				     &mcount_triggers, true);
 	}
-	return session;
+
+	if (getenv("UFTRACE_DEPTH"))
+		mcount_depth = strtol(getenv("UFTRACE_DEPTH"), NULL, 0);
+
+	if (getenv("UFTRACE_DISABLED"))
+		mcount_enabled = false;
 }
 
-void ftrace_send_message(int type, void *data, size_t len)
+static void mcount_filter_setup(struct mcount_thread_data *mtdp)
 {
-	struct uftrace_msg msg = {
-		.magic = UFTRACE_MSG_MAGIC,
-		.type = type,
-		.len = len,
-	};
-	struct iovec iov[2] = {
-		{ .iov_base = &msg, .iov_len = sizeof(msg), },
-		{ .iov_base = data, .iov_len = len, },
-	};
-
-	if (pfd < 0)
-		return;
-
-	len += sizeof(msg);
-	if (writev(pfd, iov, 2) != (ssize_t)len)
-		pr_err("writing shmem name to pipe");
+	mtdp->filter.depth  = mcount_depth;
+	mtdp->filter.time   = mcount_threshold;
+	mtdp->enable_cached = mcount_enabled;
+	mtdp->argbuf        = xmalloc(mcount_rstack_max * ARGBUF_SIZE);
 }
+
+static void mcount_filter_release(struct mcount_thread_data *mtdp)
+{
+	free(mtdp->argbuf);
+	mtdp->argbuf = NULL;
+}
+#endif /* DISABLE_MCOUNT_FILTER */
 
 static void send_session_msg(struct mcount_thread_data *mtdp, const char *sess_id)
 {
@@ -145,7 +135,7 @@ static void send_session_msg(struct mcount_thread_data *mtdp, const char *sess_i
 		.task = {
 			.time = mcount_gettime(),
 			.pid = getpid(),
-			.tid = gettid(mtdp),
+			.tid = mcount_gettid(mtdp),
 		},
 		.namelen = strlen(mcount_exename),
 	};
@@ -164,50 +154,19 @@ static void send_session_msg(struct mcount_thread_data *mtdp, const char *sess_i
 	if (pfd < 0)
 		return;
 
-	memcpy(sess.sid, sess_id, sizeof(sess.sid));
+	mcount_memcpy4(sess.sid, sess_id, sizeof(sess.sid));
 
-	if (writev(pfd, iov, 3) != len)
-		pr_err("write tid info failed");
-}
-
-static void send_dlopen_msg(struct mcount_thread_data *mtdp, const char *sess_id,
-			    uint64_t timestamp,  uint64_t base_addr,
-			    const char *libname)
-{
-	struct uftrace_msg_dlopen dlop = {
-		.task = {
-			.time = timestamp,
-			.pid = getpid(),
-			.tid = gettid(mtdp),
-		},
-		.base_addr = base_addr,
-		.namelen = strlen(libname),
-	};
-	struct uftrace_msg msg = {
-		.magic = UFTRACE_MSG_MAGIC,
-		.type = UFTRACE_MSG_DLOPEN,
-		.len = sizeof(dlop) + dlop.namelen,
-	};
-	struct iovec iov[3] = {
-		{ .iov_base = &msg, .iov_len = sizeof(msg), },
-		{ .iov_base = &dlop, .iov_len = sizeof(dlop), },
-		{ .iov_base = (void *)libname, .iov_len = dlop.namelen, },
-	};
-	int len = sizeof(msg) + msg.len;
-
-	if (pfd < 0)
-		return;
-
-	memcpy(dlop.sid, sess_id, sizeof(dlop.sid));
-
-	if (writev(pfd, iov, 3) != len)
-		pr_err("write tid info failed");
+	if (writev(pfd, iov, 3) != len) {
+		if (!mcount_should_stop())
+			pr_err("write tid info failed");
+	}
 }
 
 /* to be used by pthread_create_key() */
 static void mtd_dtor(void *arg)
 {
 	struct mcount_thread_data *mtdp = arg;
+	struct uftrace_msg_task tmsg;
 
 	/* this thread is done, do not enter anymore */
 	mtdp->recursion_guard = true;
@@ -215,16 +174,113 @@ static void mtd_dtor(void *arg)
 	free(mtdp->rstack);
 	mtdp->rstack = NULL;
 
-#ifndef DISABLE_MCOUNT_FILTER
-	free(mtdp->argbuf);
-	mtdp->argbuf = NULL;
-#endif
+	mcount_filter_release(mtdp);
 	shmem_finish(mtdp);
+
+	tmsg.pid = getpid(),
+	tmsg.tid = mcount_gettid(mtdp),
+	tmsg.time = mcount_gettime();
+
+	/* dtor for script support */
+	if (SCRIPT_ENABLED && script_str)
+		script_uftrace_end();
+
+	uftrace_send_message(UFTRACE_MSG_TASK_END, &tmsg, sizeof(tmsg));
+}
+
+static struct sigaction old_sigact[2];
+
+static const struct {
+	int code;
+	char *msg;
+} sigsegv_codes[] = {
+	{ SEGV_MAPERR, "address not mapped" },
+	{ SEGV_ACCERR, "invalid permission" },
+#ifdef SEGV_BNDERR
+	{ SEGV_BNDERR, "bound check failed" },
+#endif
+#ifdef SEGV_PKUERR
+	{ SEGV_PKUERR, "protection key check failed" },
+#endif
+};
+
+static void segv_handler(int sig, siginfo_t *si, void *ctx)
+{
+	struct mcount_thread_data *mtdp;
+	struct mcount_ret_stack *rstack;
+	int idx;
+
+	/* set line buffer mode not to discard crash message */
+	setlinebuf(outfp);
+
+	for (idx = 0; idx < (int)ARRAY_SIZE(sigsegv_codes); idx++) {
+		if (sig != SIGSEGV)
+			break;
+
+		if (si->si_code == sigsegv_codes[idx].code) {
+			pr_red("Segmentation fault: %s (addr: %p)\n",
+			       sigsegv_codes[idx].msg, si->si_addr);
+			break;
+		}
+	}
+	if (sig != SIGSEGV || idx == (int)ARRAY_SIZE(sigsegv_codes)) {
+		pr_red("process crashed by signal %d: %s (si_code: %d)\n",
+		       sig, strsignal(sig), si->si_code);
+	}
+
+	mtdp = get_thread_data();
+	if (check_thread_data(mtdp))
+		goto out;
+
+	mcount_rstack_restore(mtdp);
+
+	idx = mtdp->idx - 1;
+	/* flush current rstack on crash */
+	rstack = &mtdp->rstack[idx];
+	record_trace_data(mtdp, rstack, NULL);
+
+	if (dbg_domain[PR_DOMAIN]) {
+		pr_red("Backtrace from uftrace:\n");
+		pr_red("=====================================\n");
+
+		while (rstack >= mtdp->rstack) {
+			struct sym *parent, *child;
+			char *pname, *cname;
+
+			parent = find_symtabs(&symtabs, rstack->parent_ip);
+			pname = symbol_getname(parent, rstack->parent_ip);
+			child  = find_symtabs(&symtabs, rstack->child_ip);
+			cname = symbol_getname(child, rstack->child_ip);
+
+			pr_red("[%d] (%s[%lx] <= %s[%lx])\n", idx--,
+			       cname, rstack->child_ip, pname, rstack->parent_ip);
+
+			symbol_putname(parent, pname);
+			symbol_putname(child, cname);
+
+			rstack--;
+		}
+	}
+
+out:
+	sigaction(sig, &old_sigact[(sig == SIGSEGV)], NULL);
+	raise(sig);
 }
 
 static void mcount_init_file(void)
 {
-	send_session_msg(&mtd, session_name());
+	struct sigaction sa = {
+		.sa_sigaction = segv_handler,
+		.sa_flags = SA_SIGINFO,
+	};
+
+	send_session_msg(&mtd, mcount_session_name());
+	pr_dbg("new session started: %.*s: %s\n",
+	       SESSION_ID_LEN, mcount_session_name(), basename(mcount_exename));
+
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGABRT, &sa, &old_sigact[0]);
+	sigaction(SIGSEGV, &sa, &old_sigact[1]);
 }
 
 struct mcount_thread_data * mcount_prepare(void)
@@ -245,12 +301,7 @@ struct mcount_thread_data * mcount_prepare(void)
 	mtdp->recursion_guard = true;
 	compiler_barrier();
 
-#ifndef DISABLE_MCOUNT_FILTER
-	mtdp->filter.depth  = mcount_depth;
-	mtdp->filter.time   = mcount_threshold;
-	mtdp->enable_cached = mcount_enabled;
-	mtdp->argbuf = xmalloc(mcount_rstack_max * ARGBUF_SIZE);
-#endif
+	mcount_filter_setup(mtdp);
 	mtdp->rstack = xmalloc(mcount_rstack_max * sizeof(*mtd.rstack));
 
 	pthread_once(&once_control, mcount_init_file);
@@ -260,24 +311,42 @@ struct mcount_thread_data * mcount_prepare(void)
 
 	/* time should be get after session message sent */
 	tmsg.pid = getpid(),
-	tmsg.tid = gettid(mtdp),
+	tmsg.tid = mcount_gettid(mtdp),
 	tmsg.time = mcount_gettime();
 
-	ftrace_send_message(UFTRACE_MSG_TASK, &tmsg, sizeof(tmsg));
+	uftrace_send_message(UFTRACE_MSG_TASK_START, &tmsg, sizeof(tmsg));
 
-	if (kernel_pid_update)
-		update_kernel_tid(gettid(mtdp));
+	update_kernel_tid(tmsg.tid);
 
 	return mtdp;
 }
 
-bool mcount_check_rstack(struct mcount_thread_data *mtdp)
+static void mcount_finish(void)
+{
+	if (mcount_global_flags & MCOUNT_GFL_FINISH)
+		return;
+
+	mcount_global_flags |= MCOUNT_GFL_FINISH;
+	mtd_dtor(&mtd);
+
+	__sync_synchronize();
+
+	pthread_key_delete(mtd_key);
+	if (pfd != -1) {
+		close(pfd);
+		pfd = -1;
+	}
+
+	finish_auto_args();
+}
+
+static bool mcount_check_rstack(struct mcount_thread_data *mtdp)
 {
 	if (mtdp->idx >= mcount_rstack_max) {
 		static bool warned = false;
 
 		if (!warned) {
-			pr_log("too deeply nested calls: %d\n", mtdp->idx);
+			pr_warn("too deeply nested calls: %d\n", mtdp->idx);
 			warned = true;
 		}
 		return true;
@@ -286,10 +355,12 @@ bool mcount_check_rstack(struct mcount_thread_data *mtdp)
 }
 
 #ifndef DISABLE_MCOUNT_FILTER
+extern void * get_argbuf(struct mcount_thread_data *, struct mcount_ret_stack *);
+
 /* update filter state from trigger result */
 enum filter_result mcount_entry_filter_check(struct mcount_thread_data *mtdp,
 					     unsigned long child,
-					     struct ftrace_trigger *tr)
+					     struct uftrace_trigger *tr)
 {
 	pr_dbg3("<%d> enter %lx\n", mtdp->idx, child);
 
@@ -345,9 +416,6 @@ enum filter_result mcount_entry_filter_check(struct mcount_thread_data *mtdp,
 
 #undef FLAGS_TO_CHECK
 
-	if (!mcount_enabled)
-		return FILTER_IN;
-
 	if (mtdp->filter.depth <= 0)
 		return FILTER_OUT;
 
@@ -358,7 +426,7 @@ enum filter_result mcount_entry_filter_check(struct mcount_thread_data *mtdp,
 /* save current filter state to rstack */
 void mcount_entry_filter_record(struct mcount_thread_data *mtdp,
 				struct mcount_ret_stack *rstack,
-				struct ftrace_trigger *tr,
+				struct uftrace_trigger *tr,
 				struct mcount_regs *regs)
 {
 	if (mtdp->filter.out_count > 0 ||
@@ -368,7 +436,8 @@ void mcount_entry_filter_record(struct mcount_thread_data *mtdp,
 	rstack->filter_depth = mtdp->filter.saved_depth;
 	rstack->filter_time  = mtdp->filter.saved_time;
 
-#define FLAGS_TO_CHECK  (TRIGGER_FL_FILTER | TRIGGER_FL_RETVAL | TRIGGER_FL_TRACE)
+#define FLAGS_TO_CHECK  (TRIGGER_FL_FILTER | TRIGGER_FL_RETVAL |	\
+			 TRIGGER_FL_TRACE | TRIGGER_FL_FINISH)
 
 	if (tr->flags & FLAGS_TO_CHECK) {
 		if (tr->flags & TRIGGER_FL_FILTER) {
@@ -386,6 +455,13 @@ void mcount_entry_filter_record(struct mcount_thread_data *mtdp,
 
 		if (tr->flags & TRIGGER_FL_TRACE)
 			rstack->flags |= MCOUNT_FL_TRACE;
+
+		if (tr->flags & TRIGGER_FL_FINISH) {
+			record_trace_data(mtdp, rstack, NULL);
+			uftrace_send_message(UFTRACE_MSG_FINISH, NULL, 0);
+			mcount_finish();
+			return;
+		}
 	}
 
 #undef FLAGS_TO_CHECK
@@ -395,30 +471,90 @@ void mcount_entry_filter_record(struct mcount_thread_data *mtdp,
 
 		if (!mcount_enabled) {
 			rstack->flags |= MCOUNT_FL_DISABLED;
-		}
-		else if (tr->flags & TRIGGER_FL_ARGUMENT) {
-			save_argument(mtdp, rstack, tr->pargs, regs);
-		}
-
-		if (mtdp->enable_cached != mcount_enabled) {
 			/*
 			 * Flush existing rstack when mcount_enabled is off
 			 * (i.e. disabled).  Note that changing to enabled is
 			 * already handled in record_trace_data() on exit path
 			 * using the MCOUNT_FL_DISALBED flag.
 			 */
-			if (!mcount_enabled)
+			if (unlikely(mtdp->enable_cached))
 				record_trace_data(mtdp, rstack, NULL);
+		}
+		else {
+			if (tr->flags & TRIGGER_FL_ARGUMENT)
+				save_argument(mtdp, rstack, tr->pargs, regs);
+			if (tr->flags & TRIGGER_FL_READ)
+				save_trigger_read(mtdp, rstack, tr->read);
 
-			mtdp->enable_cached = mcount_enabled;
+			if (mtdp->nr_events) {
+				bool flush = false;
+				int i;
+
+				/*
+				 * Flush rstacks if async event was recorded
+				 * as it only has limited space for the events.
+				 */
+				for (i = 0; i < mtdp->nr_events; i++)
+					if (mtdp->event[i].idx == ASYNC_IDX)
+						flush = true;
+
+				if (flush)
+					record_trace_data(mtdp, rstack, NULL);
+			}
 		}
 
-		if (tr->flags & TRIGGER_FL_RECOVER) {
-			mcount_rstack_restore();
-			*rstack->parent_loc = (unsigned long) mcount_return;
-			rstack->flags |= MCOUNT_FL_RECOVER;
+		/* script hooking for function entry */
+		if (SCRIPT_ENABLED && script_str) {
+			unsigned long entry_addr = rstack->child_ip;
+			struct sym *sym = find_symtabs(&symtabs, entry_addr);
+			char *symname = symbol_getname(sym, entry_addr);
+			struct script_context sc_ctx;
+
+			if (!script_match_filter(symname))
+				goto skip;
+
+			sc_ctx.tid       = mcount_gettid(mtdp);
+			sc_ctx.depth     = rstack->depth;
+			sc_ctx.timestamp = rstack->start_time;
+			sc_ctx.address   = entry_addr;
+			sc_ctx.name      = symname;
+
+			if (tr->flags & TRIGGER_FL_ARGUMENT) {
+				unsigned *argbuf = get_argbuf(mtdp, rstack);
+
+				sc_ctx.arglen  = argbuf[0];
+				sc_ctx.argbuf  = &argbuf[1];
+				sc_ctx.argspec = tr->pargs;
+			}
+			else {
+				/* prevent access to arguments */
+				sc_ctx.arglen  = 0;
+			}
+
+			/* accessing argument in script might change arch-context */
+			mcount_save_arch_context(&mtdp->arch);
+			script_uftrace_entry(&sc_ctx);
+			mcount_restore_arch_context(&mtdp->arch);
+
+skip:
+			symbol_putname(sym, symname);
+		}
+
+#define FLAGS_TO_CHECK  (TRIGGER_FL_RECOVER | TRIGGER_FL_TRACE_ON | TRIGGER_FL_TRACE_OFF)
+
+		if (tr->flags & FLAGS_TO_CHECK) {
+			if (tr->flags & TRIGGER_FL_RECOVER) {
+				mcount_rstack_restore(mtdp);
+				*rstack->parent_loc = (unsigned long) mcount_return;
+				rstack->flags |= MCOUNT_FL_RECOVER;
+			}
+			if (tr->flags & (TRIGGER_FL_TRACE_ON | TRIGGER_FL_TRACE_OFF))
+				mtdp->enable_cached = mcount_enabled;
 		}
 	}
+
+#undef FLAGS_TO_CHECK
+
 }
 
 /* restore filter state from rstack */
@@ -439,7 +575,7 @@ void mcount_exit_filter_record(struct mcount_thread_data *mtdp,
 			mtdp->filter.out_count--;
 
 		if (rstack->flags & MCOUNT_FL_RECOVER)
-			mcount_rstack_reset();
+			mcount_rstack_reset(mtdp);
 	}
 
 #undef FLAGS_TO_CHECK
@@ -451,16 +587,75 @@ void mcount_exit_filter_record(struct mcount_thread_data *mtdp,
 		if (mtdp->record_idx > 0)
 			mtdp->record_idx--;
 
+		if (!mcount_enabled)
+			return;
+
 		if (!(rstack->flags & MCOUNT_FL_RETVAL))
 			retval = NULL;
 
 		if (rstack->end_time - rstack->start_time > time_filter ||
 		    rstack->flags & (MCOUNT_FL_WRITTEN | MCOUNT_FL_TRACE)) {
-			if (!mcount_enabled)
-				return;
-
 			if (record_trace_data(mtdp, rstack, retval) < 0)
 				pr_err("error during record");
+		}
+		else if (mtdp->nr_events) {
+			bool flush = false;
+			int i, k;
+
+			/*
+			 * Record rstacks if async event was recorded
+			 * in the middle of the function.  Otherwise
+			 * update event count to drop filtered ones.
+			 */
+			for (i = 0, k = 0; i < mtdp->nr_events; i++) {
+				if (mtdp->event[i].idx == ASYNC_IDX)
+					flush = true;
+				if (mtdp->event[i].idx < mtdp->idx)
+					k = i + 1;
+			}
+
+			if (flush)
+				record_trace_data(mtdp, rstack, retval);
+			else
+				mtdp->nr_events = k;  /* invalidate sync events */
+		}
+
+		/* script hooking for function exit */
+		if (SCRIPT_ENABLED && script_str) {
+			unsigned long entry_addr = rstack->child_ip;
+			struct sym *sym = find_symtabs(&symtabs, entry_addr);
+			char *symname = symbol_getname(sym, entry_addr);
+			struct script_context sc_ctx;
+
+			if (!script_match_filter(symname))
+				goto skip;
+
+			sc_ctx.tid       = mcount_gettid(mtdp);
+			sc_ctx.depth     = rstack->depth;
+			sc_ctx.timestamp = rstack->start_time;
+			sc_ctx.duration  = rstack->end_time - rstack->start_time;
+			sc_ctx.address   = entry_addr;
+			sc_ctx.name      = symname;
+
+			if (rstack->flags & MCOUNT_FL_RETVAL) {
+				unsigned *argbuf = get_argbuf(mtdp, rstack);
+
+				sc_ctx.arglen  = argbuf[0];
+				sc_ctx.argbuf  = &argbuf[1];
+				sc_ctx.argspec = rstack->pargs;
+			}
+			else {
+				/* prevent access to retval*/
+				sc_ctx.arglen  = 0;
+			}
+
+			/* accessing argument in script might change arch-context */
+			mcount_save_arch_context(&mtdp->arch);
+			script_uftrace_exit(&sc_ctx);
+			mcount_restore_arch_context(&mtdp->arch);
+
+skip:
+			symbol_putname(sym, symname);
 		}
 	}
 }
@@ -468,7 +663,7 @@ void mcount_exit_filter_record(struct mcount_thread_data *mtdp,
 #else /* DISABLE_MCOUNT_FILTER */
 enum filter_result mcount_entry_filter_check(struct mcount_thread_data *mtdp,
 					     unsigned long child,
-					     struct ftrace_trigger *tr)
+					     struct uftrace_trigger *tr)
 {
 	if (mcount_check_rstack(mtdp))
 		return FILTER_RSTACK;
@@ -478,7 +673,7 @@ enum filter_result mcount_entry_filter_check(struct mcount_thread_data *mtdp,
 
 void mcount_entry_filter_record(struct mcount_thread_data *mtdp,
 				struct mcount_ret_stack *rstack,
-				struct ftrace_trigger *tr,
+				struct uftrace_trigger *tr,
 				struct mcount_regs *regs)
 {
 	mtdp->record_idx++;
@@ -514,7 +709,7 @@ int mcount_entry(unsigned long *parent_loc, unsigned long child,
 	enum filter_result filtered;
 	struct mcount_thread_data *mtdp;
 	struct mcount_ret_stack *rstack;
-	struct ftrace_trigger tr;
+	struct uftrace_trigger tr;
 
 	if (unlikely(mcount_should_stop()))
 		return -1;
@@ -569,7 +764,13 @@ unsigned long mcount_exit(long *retval)
 	unsigned long retaddr;
 
 	mtdp = get_thread_data();
-	assert(mtdp);
+	if (unlikely(check_thread_data(mtdp))) {
+		/* mcount_finish() called in the middle */
+		if (mcount_should_stop())
+			return mtd.rstack[--mtd.idx].parent_ip;
+
+		assert(mtdp);
+	}
 
 	mtdp->recursion_guard = true;
 
@@ -588,28 +789,12 @@ unsigned long mcount_exit(long *retval)
 	return retaddr;
 }
 
-static void mcount_finish(void)
-{
-	if (mcount_finished)
-		return;
-
-	mtd_dtor(&mtd);
-	pthread_key_delete(mtd_key);
-
-	if (pfd != -1) {
-		close(pfd);
-		pfd = -1;
-	}
-
-	mcount_finished = true;
-}
-
 static int cygprof_entry(unsigned long parent, unsigned long child)
 {
 	enum filter_result filtered;
 	struct mcount_thread_data *mtdp;
 	struct mcount_ret_stack *rstack;
-	struct ftrace_trigger tr = {
+	struct uftrace_trigger tr = {
 		.flags = 0,
 	};
 
@@ -712,7 +897,7 @@ void xray_entry(unsigned long parent, unsigned long child,
 	enum filter_result filtered;
 	struct mcount_thread_data *mtdp;
 	struct mcount_ret_stack *rstack;
-	struct ftrace_trigger tr = {
+	struct uftrace_trigger tr = {
 		.flags = 0,
 	};
 
@@ -766,6 +951,9 @@ void xray_exit(long *retval)
 	struct mcount_thread_data *mtdp;
 	struct mcount_ret_stack *rstack;
 
+	if (unlikely(mcount_should_stop()))
+		return;
+
 	mtdp = get_thread_data();
 	if (unlikely(check_thread_data(mtdp) || mtdp->recursion_guard))
 		return;
@@ -794,6 +982,30 @@ out:
 	mtdp->recursion_guard = false;
 }
 
+/* save an asynchronous event */
+int mcount_save_event(struct mcount_event_info *mei)
+{
+	struct mcount_thread_data *mtdp;
+
+	if (unlikely(mcount_should_stop()))
+		return -1;
+
+	mtdp = get_thread_data();
+	if (unlikely(check_thread_data(mtdp)))
+		return -1;
+
+	if (mtdp->nr_events < MAX_EVENT) {
+		int i = mtdp->nr_events++;
+
+		mtdp->event[i].id   = mei->id;
+		mtdp->event[i].time = mcount_gettime();
+		mtdp->event[i].dsize = 0;
+		mtdp->event[i].idx   = ASYNC_IDX;
+	}
+
+	return 0;
+}
+
 static void atfork_prepare_handler(void)
 {
 	struct uftrace_msg_task tmsg = {
@@ -801,7 +1013,11 @@ static void atfork_prepare_handler(void)
 		.pid = getpid(),
 	};
 
-	ftrace_send_message(UFTRACE_MSG_FORK_START, &tmsg, sizeof(tmsg));
+	/* call script atfork preparation routine */
+	if (SCRIPT_ENABLED && script_str)
+		script_atfork_prepare();
+
+	uftrace_send_message(UFTRACE_MSG_FORK_START, &tmsg, sizeof(tmsg));
 }
 
 static void atfork_child_handler(void)
@@ -821,112 +1037,22 @@ static void atfork_child_handler(void)
 		mtdp = mcount_prepare();
 	}
 
-	/* flush tid cache */
-	mtdp->tid = 0;
+	/* update tid cache */
+	mtdp->tid = tmsg.tid;
+	/* flush event data */
+	mtdp->nr_events = 0;
 
 	mtdp->recursion_guard = true;
 
 	clear_shmem_buffer(mtdp);
 	prepare_shmem_buffer(mtdp);
 
-	ftrace_send_message(UFTRACE_MSG_FORK_END, &tmsg, sizeof(tmsg));
+	uftrace_send_message(UFTRACE_MSG_FORK_END, &tmsg, sizeof(tmsg));
+
+	update_kernel_tid(tmsg.tid);
 
 	mtdp->recursion_guard = false;
 }
-
-static void build_debug_domain(char *dbg_domain_str)
-{
-	int i, len;
-
-	if (dbg_domain_str == NULL)
-		return;
-
-	len = strlen(dbg_domain_str);
-	for (i = 0; i < len; i += 2) {
-		const char *pos;
-		char domain = dbg_domain_str[i];
-		int level = dbg_domain_str[i+1] - '0';
-		int d;
-
-		pos = strchr(DBG_DOMAIN_STR, domain);
-		if (pos == NULL)
-			continue;
-
-		d = pos - DBG_DOMAIN_STR;
-		dbg_domain[d] = level;
-	}
-}
-
-struct dlopen_base_data {
-	const char *libname;
-	unsigned long base_addr;
-};
-
-static const char *simple_basename(const char *pathname)
-{
-	const char *p = strrchr(pathname, '/');
-
-	return p ? p + 1 : pathname;
-}
-
-static int dlopen_base_callback(struct dl_phdr_info *info,
-				size_t size, void *arg)
-{
-	struct dlopen_base_data *data = arg;
-
-	if (!strstr(simple_basename(info->dlpi_name), data->libname))
-		return 0;
-
-	data->base_addr = info->dlpi_addr;
-	data->libname = info->dlpi_name; /* update to use full path */
-	return 0;
-}
-
-static void (*old_segfault_handler)(int);
-
-static void segfault_handler(int sig)
-{
-	mcount_rstack_restore();
-
-	signal(sig, old_segfault_handler);
-	raise(sig);
-}
-
-void mcount_rstack_restore(void)
-{
-	int idx;
-	struct mcount_thread_data *mtdp;
-
-	mtdp = get_thread_data();
-	if (unlikely(check_thread_data(mtdp)))
-		return;
-
-	/* restore return addresses - reverse order due to tail calls */
-	for (idx = mtdp->idx - 1; idx >= 0; idx--)
-		*mtdp->rstack[idx].parent_loc = mtdp->rstack[idx].parent_ip;
-}
-
-void mcount_rstack_reset(void)
-{
-	int idx;
-	struct mcount_thread_data *mtdp;
-	struct mcount_ret_stack *rstack;
-
-	mtdp = get_thread_data();
-	if (unlikely(check_thread_data(mtdp)))
-		return;
-
-	for (idx = mtdp->idx - 1; idx >= 0; idx--) {
-		rstack = &mtdp->rstack[idx];
-
-		if (rstack->dyn_idx == MCOUNT_INVALID_DYNIDX)
-			*rstack->parent_loc = (unsigned long)mcount_return;
-		else
-			*rstack->parent_loc = (unsigned long)plthook_return;
-	}
-}
-
-static void mcount_hook_functions(void);
 
 static void mcount_startup(void)
 {
@@ -938,17 +1064,14 @@ static void mcount_startup(void)
 	char *threshold_str;
 	char *color_str;
 	char *demangle_str;
-	char *filter_str;
-	char *trigger_str;
-	char *argument_str;
-	char *retval_str;
 	char *plthook_str;
 	char *patch_str;
+	char *event_str;
 	char *dirname;
 	struct stat statbuf;
-	LIST_HEAD(modules);
+	bool nest_libcall;
 
-	if (mcount_setup_done || mtd.recursion_guard)
+	if (!(mcount_global_flags & MCOUNT_GFL_SETUP) || mtd.recursion_guard)
 		return;
 
 	mtd.recursion_guard = true;
@@ -967,12 +1090,13 @@ static void mcount_startup(void)
 	color_str = getenv("UFTRACE_COLOR");
 	threshold_str = getenv("UFTRACE_THRESHOLD");
 	demangle_str = getenv("UFTRACE_DEMANGLE");
-	filter_str = getenv("UFTRACE_FILTER");
-	trigger_str = getenv("UFTRACE_TRIGGER");
-	argument_str = getenv("UFTRACE_ARGUMENT");
-	retval_str = getenv("UFTRACE_RETVAL");
 	plthook_str = getenv("UFTRACE_PLTHOOK");
 	patch_str = getenv("UFTRACE_PATCH");
+	event_str = getenv("UFTRACE_EVENT");
+	script_str = getenv("UFTRACE_SCRIPT");
+	nest_libcall = !!getenv("UFTRACE_NEST_LIBCALL");
+
+	page_size_in_kb = getpagesize() / KB;
 
 	if (logfd_str) {
 		int fd = strtol(logfd_str, NULL, 0);
@@ -983,8 +1107,6 @@ static void mcount_startup(void)
 			setvbuf(logfp, NULL, _IOLBF, 1024);
 		}
 	}
-
-	old_segfault_handler = signal(SIGSEGV, segfault_handler);
 
 	if (debug_str) {
 		debug = strtol(debug_str, NULL, 0);
@@ -1009,6 +1131,11 @@ static void mcount_startup(void)
 		}
 	}
 
+	if (getenv("UFTRACE_LIST_EVENT")) {
+		mcount_list_events();
+		exit(0);
+	}
+
 	if (bufsize_str)
 		shmem_bufsize = strtol(bufsize_str, NULL, 0);
 
@@ -1018,36 +1145,12 @@ static void mcount_startup(void)
 
 	symtabs.dirname = dirname;
 
-	if (filter_str || trigger_str || argument_str || retval_str || patch_str)
-		symtabs.flags &= ~SYMTAB_FL_SKIP_NORMAL;
-	if (plthook_str)
-		symtabs.flags &= ~SYMTAB_FL_SKIP_DYNAMIC;
-
 	mcount_exename = read_exename();
-	record_proc_maps(dirname, session_name(), &symtabs);
-	set_kernel_base(&symtabs, session_name());
+	record_proc_maps(dirname, mcount_session_name(), &symtabs);
+	set_kernel_base(&symtabs, mcount_session_name());
 	load_symtabs(&symtabs, NULL, mcount_exename);
 
-#ifndef DISABLE_MCOUNT_FILTER
-	ftrace_setup_filter_module(filter_str, &modules, mcount_exename);
-	ftrace_setup_filter_module(trigger_str, &modules, mcount_exename);
-	ftrace_setup_filter_module(argument_str, &modules, mcount_exename);
-	ftrace_setup_filter_module(retval_str, &modules, mcount_exename);
-
-	load_module_symtabs(&symtabs, &modules);
-
-	ftrace_setup_filter(filter_str, &symtabs, &mcount_triggers,
-			    &mcount_filter_mode);
-	ftrace_setup_trigger(trigger_str, &symtabs, &mcount_triggers);
-	ftrace_setup_argument(argument_str, &symtabs, &mcount_triggers);
-	ftrace_setup_retval(retval_str, &symtabs, &mcount_triggers);
-
-	if (getenv("UFTRACE_DEPTH"))
-		mcount_depth = strtol(getenv("UFTRACE_DEPTH"), NULL, 0);
-
-	if (getenv("UFTRACE_DISABLED"))
-		mcount_enabled = false;
-#endif /* DISABLE_MCOUNT_FILTER */
+	mcount_filter_init();
 
 	if (maxstack_str)
 		mcount_rstack_max = strtol(maxstack_str, NULL, 0);
@@ -1058,21 +1161,12 @@ static void mcount_startup(void)
 	if (patch_str)
 		mcount_dynamic_update(&symtabs, patch_str);
 
-	if (plthook_str) {
-		if (symtabs.dsymtab.nr_sym == 0) {
-			pr_dbg("skip PLT hooking due to no dynamic symbols\n");
-			goto out;
-		}
+	if (event_str)
+		mcount_setup_events(dirname, event_str);
 
-		setup_dynsym_indexes(&symtabs);
+	if (plthook_str)
+		mcount_setup_plthook(mcount_exename, nest_libcall);
 
-		if (hook_pltgot(mcount_exename, symtabs.maps->start) < 0)
-			pr_dbg("error when hooking plt: skipping...\n");
-		else
-			plthook_setup(&symtabs);
-	}
-
-out:
 	if (getenv("UFTRACE_KERNEL_PID_UPDATE"))
 		kernel_pid_update = true;
 
@@ -1080,14 +1174,15 @@ out:
 
 	mcount_hook_functions();
 
-#ifndef DISABLE_MCOUNT_FILTER
-	ftrace_cleanup_filter_module(&modules);
-#endif /* DISABLE_MCOUNT_FILTER */
+	/* initialize script binding */
+	if (SCRIPT_ENABLED && script_str)
+		if (script_init(script_str) < 0)
+			script_str = NULL;
 
 	compiler_barrier();
 	pr_dbg("mcount setup done\n");
 
-	mcount_setup_done = true;
+	mcount_global_flags &= ~MCOUNT_GFL_SETUP;
 	mtd.recursion_guard = false;
 }
 
@@ -1097,145 +1192,21 @@ static void mcount_cleanup(void)
 	destroy_dynsym_indexes();
 
 #ifndef DISABLE_MCOUNT_FILTER
-	ftrace_cleanup_filter(&mcount_triggers);
+	uftrace_cleanup_filter(&mcount_triggers);
 #endif
-}
+	if (SCRIPT_ENABLED && script_str)
+		script_finish();
 
-/*
- * hooking functions
- */
-static int (*real_backtrace)(void **buffer, int sz);
-static void (*real_cxa_throw)(void *exc, void *type, void *dest);
-static void (*real_cxa_end_catch)(void);
-static void * (*real_dlopen)(const char *filename, int flags);
+	unload_symtabs(&symtabs);
 
-static void mcount_hook_functions(void)
-{
-	real_backtrace		= dlsym(RTLD_NEXT, "backtrace");
-	real_cxa_throw		= dlsym(RTLD_NEXT, "__cxa_throw");
-	real_cxa_end_catch	= dlsym(RTLD_NEXT, "__cxa_end_catch");
-	real_dlopen		= dlsym(RTLD_NEXT, "dlopen");
-}
-
-__visible_default int backtrace(void **buffer, int sz)
-{
-	int ret;
-
-	if (real_backtrace == NULL)
-		return 0;
-
-	mcount_rstack_restore();
-	ret = real_backtrace(buffer, sz);
-	mcount_rstack_reset();
-
-	return ret;
-}
-
-__visible_default void __cxa_throw(void *exception, void *type, void *dest)
-{
-	struct mcount_thread_data *mtdp;
-
-	/*
-	 * restore return addresses so that it can unwind stack frames
-	 * safely during the exception handling.
-	 * It pairs to __cxa_end_catch().
-	 */
-	mcount_rstack_restore();
-
-	mtdp = get_thread_data();
-	if (!check_thread_data(mtdp))
-		pr_dbg("exception thrown from [%d]\n", mtdp->idx);
-
-	real_cxa_throw(exception, type, dest);
-}
-
-__visible_default void __cxa_end_catch(void)
-{
-	struct mcount_thread_data *mtdp;
-	struct mcount_ret_stack *rstack;
-	unsigned long retaddr;
-
-	/* get frame address where exception handler returns */
-	retaddr = (unsigned long)__builtin_frame_address(0);
-
-	real_cxa_end_catch();
-
-	pr_dbg("exception returned at frame: %#lx\n", retaddr);
-
-	mcount_rstack_restore();
-
-	mtdp = get_thread_data();
-	if (!check_thread_data(mtdp)) {
-		int idx;
-
-		/* it needs to find how much stack frame was unwinded */
-		for (idx = mtdp->idx - 1; idx >= 0; idx--) {
-			rstack = &mtdp->rstack[idx];
-
-			pr_dbg2("[%d] parent at %p\n", idx, rstack->parent_loc);
-			if (rstack->parent_loc == &mtdp->cygprof_dummy)
-				break;
-
-			if ((unsigned long)rstack->parent_loc > retaddr)
-				break;
-
-			/* record unwinded functions */
-			if (!(rstack->flags & MCOUNT_FL_NORECORD))
-				rstack->end_time = mcount_gettime();
-
-			mcount_exit_filter_record(mtdp, rstack, NULL);
-		}
-
-		/* we're in ENTER state, so add 1 to the index */
-		mtdp->idx = idx + 1;
-		pr_dbg("[%d] exception returned\n", mtdp->idx);
-
-		mcount_rstack_reset();
-	}
-}
-
-__visible_default void * dlopen(const char *filename, int flags)
-{
-	struct mcount_thread_data *mtdp;
-	uint64_t timestamp = mcount_gettime();
-	void *ret = real_dlopen(filename, flags);
-	struct dlopen_base_data data = {
-		.libname = simple_basename(filename),
-	};
-
-	if (unlikely(mcount_should_stop()))
-		return ret;
-
-	mtdp = get_thread_data();
-	if (unlikely(check_thread_data(mtdp))) {
-		mtdp = mcount_prepare();
-		if (mtdp == NULL)
-			return ret;
-	}
-	else {
-		if (unlikely(mtdp->recursion_guard))
-			return ret;
-
-		mtdp->recursion_guard = true;
-	}
-
-	dl_iterate_phdr(dlopen_base_callback, &data);
-
-	/*
-	 * get timestamp before calling dlopen() so that
-	 * it can have symbols in static initializers which
-	 * called during the dlopen.
-	 */
-	send_dlopen_msg(mtdp, session_name(), timestamp,
-			data.base_addr, data.libname);
-
-	mtdp->recursion_guard = false;
-	return ret;
+	pr_dbg("exit from libmcount\n");
 }
 
 /*
  * external interfaces
  */
+#define UFTRACE_ALIAS(_func) void uftrace_##_func(void) __alias(_func)
+
 void __visible_default __monstartup(unsigned long low, unsigned long high)
 {
 }
@@ -1246,23 +1217,37 @@ void __visible_default _mcleanup(void)
 
 void __visible_default mcount_restore(void)
 {
-	mcount_rstack_restore();
+	struct mcount_thread_data *mtdp;
+
+	mtdp = get_thread_data();
+	if (unlikely(check_thread_data(mtdp)))
+		return;
+
+	mcount_rstack_restore(mtdp);
 }
 
 void __visible_default mcount_reset(void)
 {
-	mcount_rstack_reset();
+	struct mcount_thread_data *mtdp;
+
+	mtdp = get_thread_data();
+	if (unlikely(check_thread_data(mtdp)))
+		return;
+
+	mcount_rstack_reset(mtdp);
 }
 
 void __visible_default __cyg_profile_func_enter(void *child, void *parent)
 {
 	cygprof_entry((unsigned long)parent, (unsigned long)child);
 }
+UFTRACE_ALIAS(__cyg_profile_func_enter);
 
 void __visible_default __cyg_profile_func_exit(void *child, void *parent)
 {
 	cygprof_exit((unsigned long)parent, (unsigned long)child);
 }
+UFTRACE_ALIAS(__cyg_profile_func_exit);
 
 #ifndef UNIT_TEST
 /*
@@ -1311,4 +1296,5 @@ TEST_CASE(mcount_thread_data)
 
 	return TEST_OK;
 }
+
 #endif /* UNIT_TEST */

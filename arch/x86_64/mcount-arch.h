@@ -1,5 +1,5 @@
-#ifndef __MCOUNT_ARCH_H__
-#define __MCOUNT_ARCH_H__
+#ifndef MCOUNT_ARCH_H
+#define MCOUNT_ARCH_H
 
 #define mcount_regs  mcount_regs
 
@@ -44,4 +44,12 @@ enum x86_reg_index {
 	X86_REG_XMM7,
 };
 
-#endif /* __MCOUNT_ARCH_H__ */
+#define HAVE_MCOUNT_ARCH_CONTEXT
+struct mcount_arch_context {
+	double xmm[ARCH_MAX_FLOAT_REGS];
+};
+
+#define ARCH_PLT0_SIZE  16
+#define ARCH_PLTHOOK_ADDR_OFFSET  6
+
+#endif /* MCOUNT_ARCH_H */

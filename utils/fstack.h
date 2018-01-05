@@ -1,5 +1,5 @@
-#ifndef __FTRACE_FSTACK_H__
-#define __FTRACE_FSTACK_H__
+#ifndef UFTRACE_FSTACK_H
+#define UFTRACE_FSTACK_H
 
 #include <stdio.h>
 #include <stdint.h>
@@ -8,7 +8,7 @@
 #include "../uftrace.h"
 
 struct sym;
-struct ftrace_trigger;
+struct uftrace_trigger;
 
 enum fstack_flag {
 	FSTACK_FL_FILTERED	= (1U << 0),
@@ -36,6 +36,7 @@ struct ftrace_task_handle {
 	bool valid;
 	bool done;
 	bool lost_seen;
+	bool fork_handled;
 	bool fstack_set;
 	bool display_depth_set;
 	FILE *fp;
@@ -51,7 +52,9 @@ struct ftrace_task_handle {
 	int user_stack_count;
 	int display_depth;
 	int user_display_depth;
+	int fork_display_depth;
 	int column_index;
+	int event_color;
 	enum context ctx;
 	uint64_t timestamp;
 	uint64_t timestamp_last;
@@ -112,6 +115,12 @@ int read_task_args(struct ftrace_task_handle *task,
 		   struct uftrace_record *rstack,
 		   bool is_retval);
 
+static inline bool is_user_record(struct ftrace_task_handle *task,
+				  struct uftrace_record *rec)
+{
+	return rec == &task->ustack;
+}
+
 static inline bool is_kernel_record(struct ftrace_task_handle *task,
 				    struct uftrace_record *rec)
 {
@@ -119,21 +128,22 @@ static inline bool is_kernel_record(struct ftrace_task_handle *task,
 }
 
 void setup_task_filter(char *tid_filter, struct ftrace_file_handle *handle);
-void setup_fstack_args(char *argspec, struct ftrace_file_handle *handle);
+void setup_fstack_args(char *argspec, char *retspec,
+		       struct ftrace_file_handle *handle, bool auto_args);
 int fstack_setup_filters(struct opts *opts, struct ftrace_file_handle *handle);
 
 int fstack_entry(struct ftrace_task_handle *task,
 		 struct uftrace_record *rstack,
-		 struct ftrace_trigger *tr);
+		 struct uftrace_trigger *tr);
 void fstack_exit(struct ftrace_task_handle *task);
 int fstack_update(int type, struct ftrace_task_handle *task,
 		  struct fstack *fstack);
 struct ftrace_task_handle *fstack_skip(struct ftrace_file_handle *handle,
 				       struct ftrace_task_handle *task,
-				       int curr_depth);
+				       int curr_depth, bool event_skip_out);
 bool fstack_check_filter(struct ftrace_task_handle *task);
 void get_argspec_string(struct ftrace_task_handle *task,
 		        char *args, size_t len,
 		        enum argspec_string_bits str_mode);
 
-#endif /* __FTRACE_FSTACK_H__ */
+#endif /* UFTRACE_FSTACK_H */

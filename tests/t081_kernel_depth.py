@@ -10,16 +10,16 @@ class TestCase(TestBase):
    1.540 us [27711] | __monstartup();
    1.089 us [27711] | __cxa_atexit();
             [27711] | main() {
-            [27711] |   open() {
+            [27711] |   fopen() {
             [27711] |     sys_open() {
   12.732 us [27711] |       do_sys_open();
   14.039 us [27711] |     } /* sys_open */
-  17.193 us [27711] |   } /* open */
-            [27711] |   close() {
+  17.193 us [27711] |   } /* fopen */
+            [27711] |   fclose() {
             [27711] |     sys_close() {
    0.591 us [27711] |       __close_fd();
    1.429 us [27711] |     } /* sys_close */
-   8.028 us [27711] |   } /* close */
+   8.028 us [27711] |   } /* fclose */
   26.938 us [27711] | } /* main */
 """)
 
@@ -34,3 +34,6 @@ class TestCase(TestBase):
     def runcmd(self):
         return '%s -k --kernel-depth=2 -N %s@kernel -N %s@kernel %s' % \
             (TestBase.ftrace, 'exit_to_usermode_loop', 'smp_irq_work_interrupt', 't-' + self.name)
+
+    def fixup(self, cflags, result):
+        return result.replace('sys_open', 'sys_openat')

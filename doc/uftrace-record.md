@@ -45,6 +45,9 @@ OPTIONS
 \--no-pltbind
 :   Do not bind dynamic symbol address.  This option uses the `LD_BIND_NOT` environment variable to trace library function calls which might be missing due to concurrent (first) accesses.  It is not meaningful to use this option with the `--no-libcall` option.
 
+\--nest-libcall
+:   Trace function calls between libraries.  By default, uftrace only record library call from the main executable.  Implies `--force`.
+
 -D *DEPTH*, \--depth=*DEPTH*
 :   Set global trace limit in nesting level.
 
@@ -69,14 +72,14 @@ OPTIONS
 \--disable
 :   Start uftrace with tracing disabled.  This is only meaningful when used with a `trace_on` trigger.
 
-\--demangle=*TYPE*
-:   Use demangled C++ symbol names for filters, triggers, arguments and/or return values.  Possible values are "full", "simple" and "no".  Default is "simple" which ignores function arguments and template parameters.
-
 -A *SPEC*, \--argument=*SPEC*
 :   Record function arguments.  This option can be used more than once.  See *ARGUMENTS*.
 
 -R *SPEC*, \--retval=*SPEC*
 :   Record function return values.  This option can be used more than once.  See *ARGUMENTS*.
+
+\--auto-args
+:   Automatically record arguments and return values of well-known library functions.  Recommend to use it with `--nest-libcall`.
 
 \--num-thread=*NUM*
 :   Use NUM threads to record trace data.  Default is 1/4 of online CPUs (but when full kernel tracing is enabled, it will use the full number of CPUs).
@@ -91,10 +94,19 @@ OPTIONS
 :   Set kernel max function depth separately.  Implies `--kernel`.
 
 \--kernel-buffer=*SIZE*
-:   Set kernel tracing buffer size.  The default value (in the kernel) is 1408k.  Implies `--kernel`.
+:   Set kernel tracing buffer size.  The default value (in the kernel) is 1408k.
 
 -P *FUNC*, \--patch=*FUNC*
 :   Patch FUNC dynamically.  This is only applicable binaries built with `-pg -mfentry -mnop-mcount` on x86_64.  This option can be used more than once.  See *DYNAMIC TRACING*.
+
+-E *EVENT*, \--event=*EVENT*
+:   Enable event tracing.  The event should be available on the system.
+
+\--keep-pid
+:   Retain same pid for traced program.  For some daemon processes, it is important to have same pid when forked.  Running under uftrace normally changes pid as it calls fork() again internally.
+
+-S *SCRIPT_PATH*, \--script=*SCRIPT_PATH*
+:   Add a script to do addtional work at the entry and exit of function.  The type of script is detected by the postfix such as '.py' for python.
 
 
 FILTERS
@@ -213,9 +225,12 @@ The uftrace tool supports triggering actions on selected function calls with or 
 
     <trigger>    :=  <symbol> "@" <actions>
     <actions>    :=  <action>  | <action> "," <actions>
-    <action>     :=  "depth="<num> | "trace" | "trace_on" | "trace_off" | "recover" | "time="<time_spec>
+    <action>     :=  "depth="<num> | "trace" | "trace_on" | "trace_off" | "recover" |
+                     "time="<time_spec> | "read="<read_spec> | "finish" |
+                     "filter" | "notrace"
     <time_spec>  :=  <num> [ <time_unit> ]
     <time_unit>  :=  "ns" | "us" | "ms" | "s"
+    <read_spec>  :=  "proc/statm" | "page-fault"
 
 The `depth` trigger is to change filter depth during execution of the function.  It can be used to apply different filter depths for different functions.
 
@@ -239,6 +254,26 @@ The 'recover' trigger is for some corner cases in which the process accesses the
 
 The 'time' trigger is to change time filter setting during execution of the function.  It can be used to apply differernt time filter for different functions.
 
+The `read` trigger is to read some information at runtime.  As of now, reading process memory stat ("proc/statm") from /proc filesystem and number of page faults ("page-fault") using getrusage(2) are supported only.  The results are printed in comments like below.
+
+    $ uftrace record -T b@read=proc/statm ./abc
+    $ uftrace replay
+    # DURATION    TID     FUNCTION
+                [ 1234] | main() {
+                [ 1234] |   a() {
+                [ 1234] |     /* read:proc/statm (size=6808KB, rss=777KB, shared=713KB) */
+                [ 1234] |     b() {
+                [ 1234] |       c() {
+       1.448 us [ 1234] |         getpid();
+      10.270 us [ 1234] |       } /* c */
+      11.250 us [ 1234] |     } /* b */
+      18.380 us [ 1234] |   } /* a */
+      19.537 us [ 1234] | } /* main */
+
+The 'finish' trigger is to end recording.  The process still can run and this can be useful to trace unterminated processes like daemon.
+
+The 'filter' and 'notrace' triggers have same effect as -F/--filter and -N/--notrace options respectively.
+
 Triggers only work for user-level functions for now.
 
 
@@ -252,14 +287,14 @@ The uftrace tool supports recording function arguments and/or return values usin
     <int_spec>    :=  "arg" N [ "/" <format> [ <size> ] ] [ "%" ( <reg> | <stack> ) ]
     <float_spec>  :=  "fparg" N [ "/" ( <size> | "80" ) ] [ "%" ( <reg> | <stack> ) ]
     <ret_spec>    :=  "retval" [ "/" <format> [ <size> ] ]
-    <format>      :=  "i" | "u" | "x" | "s" | "c" | "f"
+    <format>      :=  "i" | "u" | "x" | "s" | "c" | "f" | "S" | "p"
     <size>        :=  "8" | "16" | "32" | "64"
     <reg>         :=  <arch-specific register name>  # "rdi", "xmm0", "r0", ...
     <stack>       :=  "stack" [ "+" ] <offset>
 
 The `-A`/`--argument` option takes argN where N is an index of the arguments.  The index starts from 1 and corresponds to the argument passing order of the calling convention on the system.  Note that the indexes of arguments are separately counted for integer (or pointer) and floating-point type, and they can interfere depending on the calling convention.  The argN is for integer arguments and fpargN is for floating-point arguments.
 
-Users can optionally specify a format and size for the arguments and/or return values.  Without this, uftrace treats them as 'long int' type for integers and 'double' for floating-point numbers.  The "i" format makes it signed integer type and "u" format is for unsigned type.  Both are printed as decimal while "x" format makes it printed as hexadecimal.  The "s" format is for string type and "c" format is for character type.  Finally, the "f" format is for floating-point type and is meaningful only for return value (generally).  Note that fpargN doesn't take the format field since it's always floating-point.
+Users can optionally specify a format and size for the arguments and/or return values.  Without this, uftrace treats them as 'long int' type for integers and 'double' for floating-point numbers.  The "i" format makes it signed integer type and "u" format is for unsigned type.  Both are printed as decimal while "x" format makes it printed as hexadecimal.  The "s" format is for null-terminated string type and "c" format is for character type.  The "f" format is for floating-point type and is meaningful only for return value (generally).  Note that fpargN doesn't take the format field since it's always floating-point.  The "S" format is for std::string, but it only supports libstdc++ library as of yet.  Finally, the "p" format is for function pointer. Once the target address is recorded, it will be displayed as function name.
 
 Please beware when using string type arguments since it can crash the program if the (pointer) value is invalid.
 
@@ -284,7 +319,7 @@ Examples are below:
 
     $ uftrace record -A puts@arg1/s -R puts@retval ./hello
     Hello world
-    
+
     $ uftrace replay
     # DURATION    TID     FUNCTION
        1.457 us [21534] | __monstartup();
@@ -357,6 +392,60 @@ For example, you can build the target program by clang with the below option and
        3.005 us [11098] | } /* main */
 
 
+SCRIPT EXECUTION
+================
+The uftrace tool supports script execution for each function entry and exit.  The supported script is only Python 2.7 as of now.
+
+The user can write four functions. 'uftrace_entry' and 'uftrace_exit' are executed whenever each function is executed at the entry and exit.  However 'uftrace_begin' and 'uftrace_end' are only executed once when the target program begins and ends.
+
+    $ cat scripts/simple.py
+    def uftrace_begin():
+        print("program begins...")
+
+    def uftrace_entry(ctx):
+        func = ctx["name"]
+        print("entry : " + func + "()")
+
+    def uftrace_exit(ctx):
+        func = ctx["name"]
+        print("exit  : " + func + "()")
+
+    def uftrace_end():
+        print("program is finished")
+
+The above script can be executed in record time as follows:
+
+    $ uftrace record -S scripts/simple.py -F main tests/t-abc
+    program begins...
+    entry : main()
+    entry : a()
+    entry : b()
+    entry : c()
+    entry : getpid()
+    exit  : getpid()
+    exit  : c()
+    exit  : b()
+    exit  : a()
+    exit  : main()
+    program is finished
+
+The 'ctx' variable is a dictionary type that contains the below information.
+
+    /* context information passed to script */
+    script_context = {
+        int       tid;
+        int       depth;
+        long      timestamp;
+        long      duration;    # exit only
+        long      address;
+        string    name;
+        list      args;        # entry only (if available)
+        value     retval;      # exit  only (if available)
+    };
+
+Each field in 'script_context' can be read inside the script.  Please see `uftrace-script`(1) for details about scripting.
+
+
 SEE ALSO
 ========
-`uftrace`(1), `uftrace-replay`(1), `uftrace-report`(1), `uftrace-recv`(1)
+`uftrace`(1), `uftrace-replay`(1), `uftrace-report`(1), `uftrace-recv`(1), `uftrace-script`(1)
