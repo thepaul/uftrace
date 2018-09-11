@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 from runtest import TestBase
-import re
 
 class TestCase(TestBase):
     def __init__(self):
@@ -17,4 +16,4 @@ class TestCase(TestBase):
 """)
 
     def runcmd(self):
-        return '%s -F main -A ^str -R ^str %s hello' % (TestBase.ftrace, 't-' + self.name)
+        return '%s -F main -A ^str -R ^str %s hello' % (TestBase.uftrace_cmd, 't-' + self.name)

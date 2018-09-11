@@ -52,12 +52,13 @@ The uftrace command has following subcommands:
  * `recv`   : saves the trace data from network
  * `graph`  : shows function call graph in the trace data
  * `script` : runs a script for recorded trace data
+ * `tui`    : show text user interface for graph and report
 
-You can use `-?` or `--help` option to see available commands and options.
+You can use `-h`, `-?` or `--help` option to see available commands and options.
 
     $ uftrace
     Usage: uftrace [OPTION...]
-                [record|replay|live|report|info|dump|recv|graph|script] [<program>]
+                [record|replay|live|report|info|dump|recv|graph|script|tui] [<program>]
     Try `uftrace --help' or `uftrace --usage' for more information.
 
 If omitted, it defaults to the `live` command which is almost same as running
@@ -185,7 +186,7 @@ The `dump` command shows raw output of each trace record.  You can see the resul
 in the chrome browser, once the data is processed with `uftrace dump --chrome`.
 Below is a trace of clang (LLVM) compiling a small C++ template metaprogram.
 
-![uftrace-chrome-dump](https://github.com/namhyung/uftrace/blob/master/doc/uftrace-chrome.png)
+![uftrace-chrome-dump](doc/uftrace-chrome.png)
 
 The `info` command shows system and program information when recorded.
 
@@ -217,13 +218,20 @@ The `info` command shows system and program information when recorded.
     # page fault          : 0 / 172 (major / minor)
     # disk iops           : 0 / 24 (read / write)
 
+The `script` command allows user to run a custom script on a data recorded.
+Currently python (version 2.7) is supported only.
+
+The `tui` command is for interactive text-based user interface using ncurses.
+It provides basic functionality of `graph`, `report` and `info` commands as of
+now.
+
 
 How to install uftrace
 ======================
 
 The uftrace is written in C and tried to minimize external dependencies.
-Currently it requires `libelf` in elfutils package to build, and there're some
-more optional dependencies.
+Currently it does not require any of them but there're some optional
+dependencies to enable advanced features.
 
 Once you installed required software(s) on your system, it can be built and
 installed like following:
@@ -232,7 +240,7 @@ installed like following:
     $ sudo make install
 
 For more advanced setup, please refer
-[INSTALL.md](https://github.com/namhyung/uftrace/blob/master/INSTALL.md) file.
+[INSTALL.md](INSTALL.md) file.
 
 
 Limitations

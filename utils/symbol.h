@@ -10,10 +10,21 @@
 #define UFTRACE_SYMBOL_H
 
 #include <stdint.h>
-#include <limits.h>
+#include <elf.h>
 
-#include "utils.h"
-#include "list.h"
+#include "utils/utils.h"
+#include "utils/list.h"
+#include "utils/dwarf.h"
+
+#ifdef HAVE_LIBELF
+# include "utils/symbol-libelf.h"
+#else
+# include "utils/symbol-rawelf.h"
+#endif
+
+#ifndef  STT_GNU_IFUNC
+# define STT_GNU_IFUNC  10
+#endif
 
 enum symtype {
 	ST_UNKNOWN,
@@ -48,6 +59,7 @@ struct uftrace_mmap {
 	char prot[4];
 	uint32_t len;
 	struct symtab symtab;
+	struct debug_info dinfo;
 	char libname[];
 };
 
@@ -61,12 +73,15 @@ enum symtab_flag {
 
 struct symtabs {
 	bool loaded;
+	bool loaded_debug;
 	const char *dirname;
 	const char *filename;
 	enum symtab_flag flags;
 	struct symtab symtab;
 	struct symtab dsymtab;
+	struct debug_info dinfo;
 	uint64_t kernel_base;
+	uint64_t exec_base;
 	struct uftrace_mmap *maps;
 };
 
@@ -85,19 +100,23 @@ static inline uint64_t get_real_address(uint64_t addr)
 	return addr;
 }
 
-void set_kernel_base(struct symtabs *symtabs, const char *session_id);
+uint64_t get_kernel_base(char *str);
+
+extern struct sym sched_sym;
 
 struct sym * find_symtabs(struct symtabs *symtabs, uint64_t addr);
+struct sym * find_sym(struct symtab *symtab, uint64_t addr);
 struct sym * find_symname(struct symtab *symtab, const char *name);
 void load_symtabs(struct symtabs *symtabs, const char *dirname,
 		  const char *filename);
+void unload_symtab(struct symtab *symtab);
 void unload_symtabs(struct symtabs *symtabs);
 void print_symtabs(struct symtabs *symtabs);
 
-typedef struct Elf Elf;
-int arch_load_dynsymtab_bindnow(Elf *elf, struct symtab *dsymtab,
+int arch_load_dynsymtab_bindnow(struct symtab *dsymtab,
+				struct uftrace_elf_data *elf,
 				unsigned long offset, unsigned long flags);
-int load_elf_dynsymtab(struct symtab *dsymtab, Elf *elf,
+int load_elf_dynsymtab(struct symtab *dsymtab, struct uftrace_elf_data *elf,
 		       unsigned long offset, unsigned long flags);
 
 void load_module_symtabs(struct symtabs *symtabs);
@@ -105,22 +124,37 @@ void save_module_symtabs(struct symtabs *symtabs);
 void load_dlopen_symtabs(struct symtabs *symtabs, unsigned long offset,
 			 const char *filename);
 
+enum uftrace_trace_type {
+	TRACE_ERROR   = -1,
+	TRACE_NONE,
+	TRACE_MCOUNT,
+	TRACE_CYGPROF,
+};
+
 bool check_libpthread(const char *filename);
-int check_trace_functions(const char *filename);
+enum uftrace_trace_type check_trace_functions(const char *filename);
 int check_static_binary(const char *filename);
 
 struct sym * find_dynsym(struct symtabs *symtabs, size_t idx);
 size_t count_dynsym(struct symtabs *symtabs);
 
-struct uftrace_mmap *find_map_by_name(struct symtabs *symtabs,
-				      const char *prefix);
+/* map for main executable */
+#define MAP_MAIN (struct uftrace_mmap *)1
+
+/* pseudo-map for kernel image */
+#define MAP_KERNEL (struct uftrace_mmap *)2
+
+struct uftrace_mmap * find_map(struct symtabs *symtabs, uint64_t addr);
+struct uftrace_mmap * find_map_by_name(struct symtabs *symtabs,
+				       const char *prefix);
+struct uftrace_mmap * find_symbol_map(struct symtabs *symtabs, char *name);
 
 int save_kernel_symbol(char *dirname);
 int load_kernel_symbol(char *dirname);
 
 struct symtab * get_kernel_symtab(void);
 int load_symbol_file(struct symtabs *symtabs, const char *symfile,
-		     unsigned long offset);
+		     uint64_t offset);
 void save_symbol_file(struct symtabs *symtabs, const char *dirname,
 		      const char *exename);
 

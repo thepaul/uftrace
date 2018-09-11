@@ -4,7 +4,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <limits.h>
 #include <assert.h>
 #include <byteswap.h>
 
@@ -112,7 +111,7 @@ int read_task_txt_file(struct uftrace_session_link *sess, char *dirname,
 	char *fname = NULL;
 	char *line = NULL;
 	size_t sz = 0;
-	long sec, nsec;
+	unsigned long sec, nsec;
 	struct uftrace_msg_task tmsg;
 	struct uftrace_msg_sess smsg;
 	struct uftrace_msg_dlopen dlop;
@@ -193,6 +192,7 @@ int read_task_txt_file(struct uftrace_session_link *sess, char *dirname,
 		}
 	}
 
+	free(line);
 	fclose(fp);
 	free(fname);
 	return 0;
@@ -246,6 +246,7 @@ int read_events_file(struct ftrace_file_handle *handle)
 		}
 	}
 
+	free(line);
 	fclose(fp);
 	free(fname);
 	return 0;
@@ -363,6 +364,7 @@ int open_data_file(struct opts *opts, struct ftrace_file_handle *handle)
 	int ret = -1;
 	FILE *fp;
 	char buf[PATH_MAX];
+	int saved_errno = 0;
 
 	snprintf(buf, sizeof(buf), "%s/info", opts->dirname);
 
@@ -387,6 +389,8 @@ int open_data_file(struct opts *opts, struct ftrace_file_handle *handle)
 			goto ok;
 		}
 
+		saved_errno = errno;
+
 		/* restore original file name for error reporting */
 		snprintf(buf, sizeof(buf), "%s/info", opts->dirname);
 	}
@@ -409,13 +413,15 @@ ok:
 	handle->kernel = NULL;
 	handle->nr_perf = 0;
 	handle->perf = NULL;
+	handle->last_perf_idx = -1;
+	handle->perf_event_processed = false;
 	INIT_LIST_HEAD(&handle->events);
 
 	if (fread(&handle->hdr, sizeof(handle->hdr), 1, fp) != 1)
 		pr_err("cannot read header data");
 
 	if (memcmp(handle->hdr.magic, UFTRACE_MAGIC_STR, UFTRACE_MAGIC_LEN))
-		pr_err_ns("invalid magic string found!");
+		pr_err_ns("invalid magic string found!\n");
 
 	check_data_order(handle);
 
@@ -428,10 +434,10 @@ ok:
 
 	if (handle->hdr.version < UFTRACE_FILE_VERSION_MIN ||
 	    handle->hdr.version > UFTRACE_FILE_VERSION)
-		pr_err_ns("unsupported file version: %u", handle->hdr.version);
+		pr_err_ns("unsupported file version: %u\n", handle->hdr.version);
 
 	if (read_uftrace_info(handle->hdr.info_mask, handle) < 0)
-		pr_err_ns("cannot read uftrace header info!");
+		pr_err_ns("cannot read uftrace header info!\n");
 
 	fclose(fp);
 
@@ -449,9 +455,9 @@ ok:
 		if (read_task_file(sessions, opts->dirname, true, sym_rel) < 0 &&
 		    read_task_txt_file(sessions, opts->dirname, true, sym_rel) < 0) {
 			if (errno == ENOENT)
-				pr_warn("no trace data found\n");
+				saved_errno = ENODATA;
 			else
-				pr_warn("invalid trace data\n");
+				saved_errno = errno;
 		}
 	}
 
@@ -463,11 +469,21 @@ ok:
 		}
 
 		setup_fstack_args(handle->info.argspec, handle->info.retspec,
-				  handle, false);
+				  handle, false, handle->info.patt_type);
+
 		if (handle->info.auto_args_enabled) {
-			setup_fstack_args(handle->info.autoarg,
-					  handle->info.autoret,
-					  handle, true);
+			char *autoarg = handle->info.autoarg;
+			char *autoret = handle->info.autoret;
+
+			if (handle->hdr.feat_mask & DEBUG_INFO) {
+				if (handle->info.patt_type == PATT_REGEX)
+					autoarg = autoret = ".";
+				else  /* PATT_GLOB */
+					autoarg = autoret = "*";
+			}
+
+			setup_fstack_args(autoarg, autoret,
+					  handle, true, handle->info.patt_type);
 		}
 	}
 
@@ -499,7 +515,10 @@ ok:
 	if (handle->hdr.feat_mask & PERF_EVENT)
 		setup_perf_data(handle);
 
-	ret = 0;
+	if (saved_errno)
+		errno = saved_errno;
+	else
+		ret = 0;
 
 out:
 	return ret;

@@ -1,7 +1,7 @@
 /*
  * internal routines and data structures for handling mcount records
  *
- * Copyright (C) 2014-2017, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
+ * Copyright (C) 2014-2018, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
  *
  * Released under the GPL v2.
  */
@@ -12,7 +12,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
-#include <limits.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -35,8 +34,8 @@ enum filter_result {
 struct filter_control {
 	int in_count;
 	int out_count;
-	int depth;
-	int saved_depth;
+	uint16_t depth;
+	uint16_t saved_depth;
 	uint64_t time;
 	uint64_t saved_time;
 };
@@ -57,6 +56,7 @@ struct mcount_shmem {
 /* first 4 byte saves the actual size of the argbuf */
 #define ARGBUF_SIZE  1024
 #define EVTBUF_SIZE  (ARGBUF_SIZE - 16)
+#define EVTBUF_HDR   (offsetof(struct mcount_event, data))
 
 struct mcount_event {
 	uint64_t	time;
@@ -69,6 +69,18 @@ struct mcount_event {
 #define ASYNC_IDX 0xffff
 
 #define MAX_EVENT  4
+
+#ifndef DISABLE_MCOUNT_FILTER
+struct mcount_mem_regions {
+	struct rb_root root;
+	unsigned long  heap;
+	unsigned long  brk;
+};
+void finish_mem_region(struct mcount_mem_regions *regions);
+#else
+struct mcount_mem_regions {};
+static inline void finish_mem_region(struct mcount_mem_regions *regions) {}
+#endif
 
 /*
  * The idx and record_idx are to save current index of the rstack.
@@ -84,7 +96,8 @@ struct mcount_thread_data {
 	int				tid;
 	int				idx;
 	int				record_idx;
-	bool				recursion_guard;
+	bool				recursion_marker;
+	bool				in_exception;
 	unsigned long			cygprof_dummy;
 	struct mcount_ret_stack		*rstack;
 	void				*argbuf;
@@ -93,6 +106,7 @@ struct mcount_thread_data {
 	struct mcount_shmem		shmem;
 	struct mcount_event		event[MAX_EVENT];
 	int				nr_events;
+	struct mcount_mem_regions	mem_regions;
 	struct mcount_arch_context	arch;
 };
 
@@ -116,6 +130,9 @@ static inline void mcount_restore_arch_context(struct mcount_arch_context *ctx) 
 
 extern TLS struct mcount_thread_data mtd;
 
+bool mcount_guard_recursion(struct mcount_thread_data *mtdp, bool force);
+void mcount_unguard_recursion(struct mcount_thread_data *mtdp);
+
 extern uint64_t mcount_threshold;  /* nsec */
 extern pthread_key_t mtd_key;
 extern int shmem_bufsize;
@@ -123,6 +140,7 @@ extern int pfd;
 extern char *mcount_exename;
 extern int page_size_in_kb;
 extern bool kernel_pid_update;
+extern bool mcount_auto_recover;
 
 enum mcount_global_flag {
 	MCOUNT_GFL_SETUP	= (1U << 0),
@@ -137,7 +155,6 @@ static inline bool mcount_should_stop(void)
 }
 
 #ifdef DISABLE_MCOUNT_FILTER
-static inline void mcount_filter_init(void) {}
 static inline void mcount_filter_setup(struct mcount_thread_data *mtdp) {}
 static inline void mcount_filter_release(struct mcount_thread_data *mtdp) {}
 #endif /* DISABLE_MCOUNT_FILTER */
@@ -210,10 +227,12 @@ extern void build_debug_domain(char *dbg_domain_str);
 
 extern void mcount_rstack_restore(struct mcount_thread_data *mtdp);
 extern void mcount_rstack_reset(struct mcount_thread_data *mtdp);
+extern void mcount_rstack_reset_exception(struct mcount_thread_data *mtdp,
+					  unsigned long frame_addr);
+extern void mcount_auto_restore(struct mcount_thread_data *mtdp);
+extern void mcount_auto_reset(struct mcount_thread_data *mtdp);
 
 extern void prepare_shmem_buffer(struct mcount_thread_data *mtdp);
-extern void get_new_shmem_buffer(struct mcount_thread_data *mtdp);
-extern void finish_shmem_buffer(struct mcount_thread_data *mtdp, int idx);
 extern void clear_shmem_buffer(struct mcount_thread_data *mtdp);
 extern void shmem_finish(struct mcount_thread_data *mtdp);
 
@@ -273,7 +292,9 @@ struct mcount_arg_context {
 			long	hi;
 		} ll;
 		unsigned char	v[16];
-	} val;
+	} __align(16) val;
+	struct mcount_mem_regions *regions;
+	struct mcount_arch_context *arch;
 };
 
 extern void mcount_arch_get_arg(struct mcount_arg_context *ctx,
@@ -305,19 +326,21 @@ void save_retval(struct mcount_thread_data *mtdp,
 		 struct mcount_ret_stack *rstack, long *retval);
 void save_trigger_read(struct mcount_thread_data *mtdp,
 		       struct mcount_ret_stack *rstack,
-		       enum trigger_read_type type);
+		       enum trigger_read_type type, bool diff);
 #endif  /* DISABLE_MCOUNT_FILTER */
 
 struct mcount_dynamic_info {
 	struct mcount_dynamic_info *next;
 	char *mod_name;
-	unsigned long addr;
-	unsigned long size;
+	unsigned long base_addr;
+	unsigned long text_addr;
+	unsigned long text_size;
 	unsigned long trampoline;
 	void *arch;
 };
 
-int mcount_dynamic_update(struct symtabs *symtabs, char *patch_funcs);
+int mcount_dynamic_update(struct symtabs *symtabs, char *patch_funcs,
+			  enum uftrace_pattern_type ptype);
 
 /* these should be implemented for each architecture */
 int mcount_setup_trampoline(struct mcount_dynamic_info *adi);
@@ -335,7 +358,8 @@ struct mcount_event_info {
 	struct list_head list;
 };
 
-int mcount_setup_events(char *dirname, char *event_str);
+int mcount_setup_events(char *dirname, char *event_str,
+			enum uftrace_pattern_type ptype);
 struct mcount_event_info * mcount_lookup_event(unsigned long addr);
 int mcount_save_event(struct mcount_event_info *mei);
 void mcount_finish_events(void);
@@ -344,5 +368,9 @@ void mcount_list_events(void);
 int mcount_arch_enable_event(struct mcount_event_info *mei);
 
 void mcount_hook_functions(void);
+
+int prepare_pmu_event(enum uftrace_event_id id);
+int read_pmu_event(enum uftrace_event_id id, void *buf);
+void finish_pmu_event(void);
 
 #endif /* UFTRACE_MCOUNT_INTERNAL_H */

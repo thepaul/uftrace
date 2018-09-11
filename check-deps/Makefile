@@ -7,12 +7,15 @@ CHECK_LIST += have_libpython2.7
 CHECK_LIST += perf_clockid
 CHECK_LIST += perf_context_switch
 CHECK_LIST += arm_has_hardfp
+CHECK_LIST += have_libncurses
+CHECK_LIST += cc_has_wstringop_truncation
+CHECK_LIST += have_libdw
 
 #
 # This is needed for checking build dependency
 #
 
-CHECK_CFLAGS  = $(CFLAGS)  $(CFLAGS_$@)
+CHECK_CFLAGS  = $(CFLAGS)  $(CFLAGS_$@) -Werror
 CHECK_LDFLAGS = $(LDFLAGS) $(LDFLAGS_$@)
 
 CFLAGS_cc_has_mfentry = -mfentry
@@ -20,6 +23,11 @@ LDFLAGS_cxa_demangle = -lstdc++
 LDFLAGS_have_libelf = -lelf
 CFLAGS_cc_has_mno_sse2 = -mno-sse2
 LDFLAGS_have_libpython2.7 = -lpython2.7
+CFLAGS_have_libncurses  = $(shell pkg-config --cflags ncursesw 2> /dev/null)
+LDFLAGS_have_libncurses = $(shell pkg-config --libs   ncursesw 2> /dev/null)
+CFLAGS_cc_has_wstringop_truncation = -Wno-stringop-truncation
+CFLAGS_have_libdw  = $(shell pkg-config --cflags libdw 2> /dev/null)
+LDFLAGS_have_libdw = $(shell pkg-config --libs   libdw 2> /dev/null || echo "-ldw")
 
 check-build: check-tstamp $(CHECK_LIST)
 

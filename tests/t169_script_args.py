@@ -20,21 +20,26 @@ class TestCase(TestBase):
         TestBase.__init__(self, 'openclose', 'fopen(/dev/null)')
 
     def pre(self):
+        script_cmd = '%s script' % (TestBase.uftrace_cmd)
+        p = sp.Popen(script_cmd.split(), stdout=sp.PIPE, stderr=sp.PIPE)
+        if p.communicate()[1].decode(errors='ignore').startswith('WARN:'):
+            return TestBase.TEST_SKIP
+
         f = open(FILE, 'w')
         f.write(script)
         f.close()
 
-        uftrace = TestBase.ftrace
+        uftrace = TestBase.uftrace_cmd
         options = '-A fopen@arg1/s'
         program = 't-' + self.name
         record_cmd = '%s record -d %s %s %s' % (uftrace, TDIR, options, program)
 
         self.pr_debug("record command: %s" % record_cmd)
-        sp.call(record_cmd.split())
+        sp.call(record_cmd.split(), stdout=sp.PIPE)
         return TestBase.TEST_SUCCESS
 
     def runcmd(self):
-        uftrace = TestBase.ftrace
+        uftrace = TestBase.uftrace_cmd
         options = '-S ' + FILE
         return '%s script -d %s %s' % (uftrace, TDIR, options)
 

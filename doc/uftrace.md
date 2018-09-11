@@ -9,7 +9,7 @@ uftrace - Function graph tracer for userspace
 
 SYNOPSIS
 ========
-uftrace [*record*|*replay*|*live*|*report*|*info*|*dump*|*recv*|*graph*|*script*] [*options*] COMMAND [*command-options*]
+uftrace [*record*|*replay*|*live*|*report*|*info*|*dump*|*recv*|*graph*|*script*|*tui*] [*options*] COMMAND [*command-options*]
 
 
 DESCRIPTION
@@ -50,10 +50,15 @@ graph
 script
 :   Run a script for recorded function trace
 
+tui
+:   Show text user interface for graph and report
 
 OPTIONS
 =======
 -?, \--help
+:   Print help message and list of options with description
+
+-h, \--help
 :   Print help message and list of options with description
 
 \--usage
@@ -69,7 +74,7 @@ OPTIONS
 :   Print debug messages.  This option is same as `-v`/`--verbose` and is provided only for backward compatibility.
 
 \--debug-domain=*DOMAIN*[,*DOMAIN*, ...]
-:   Limit the printing of debug messages to those belonging to one of the DOMAINs specified.  Available domains are: uftrace, symbol, demangle, filter, fstack, session, kernel, mcount, dynamic and event.  The domains can have an their own debug level optionally (preceded by a colon).  For example, `-v --debug-domain=filter:2` will apply debug level of 2 to the "filter" domain and apply debug level of 1 to others.
+:   Limit the printing of debug messages to those belonging to one of the DOMAINs specified.  Available domains are: uftrace, symbol, demangle, filter, fstack, session, kernel, mcount, dynamic, event, script and dwarf.  The domains can have an their own debug level optionally (preceded by a colon).  For example, `-v --debug-domain=filter:2` will apply debug level of 2 to the "filter" domain and apply debug level of 1 to others.
 
 -d *DATA*, \--data=*DATA*
 :   Specify name of trace data (directory).  Default is `uftrace.data`.
@@ -89,4 +94,4 @@ OPTIONS
 
 SEE ALSO
 ========
-`uftrace-live`(1), `uftrace-record`(1), `uftrace-replay`(1), `uftrace-report`(1), `uftrace-info`(1), `uftrace-dump`(1), `uftrace-recv`(1), `uftrace-graph`(1), `uftrace-script`(1)
+`uftrace-live`(1), `uftrace-record`(1), `uftrace-replay`(1), `uftrace-report`(1), `uftrace-info`(1), `uftrace-dump`(1), `uftrace-recv`(1), `uftrace-graph`(1), `uftrace-script`(1), `uftrace-tui(1)`

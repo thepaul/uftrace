@@ -1,6 +1,5 @@
 #include <string.h>
 #include <link.h>
-#include <regex.h>
 
 /* This should be defined before #include "utils.h" */
 #define PR_FMT     "dynamic"
@@ -45,24 +44,34 @@ static int find_dynamic_module(struct dl_phdr_info *info, size_t sz, void *data)
 {
 	const char *name = info->dlpi_name;
 	struct mcount_dynamic_info *mdi;
+	bool base_addr_set = false;
 	unsigned i;
 
 	if ((data == NULL && name[0] == '\0') || strstr(name, data)) {
 		mdi = xmalloc(sizeof(*mdi));
 		mdi->mod_name = xstrdup(name);
+		mdi->base_addr = 0;
 
 		for (i = 0; i < info->dlpi_phnum; i++) {
 			if (info->dlpi_phdr[i].p_type != PT_LOAD)
 				continue;
 
+			if (!base_addr_set) {
+				mdi->base_addr = info->dlpi_phdr[i].p_vaddr;
+				base_addr_set = true;
+			}
+
 			if (!(info->dlpi_phdr[i].p_flags & PF_X))
 				continue;
 
 			/* find address and size of code segment */
-			mdi->addr = info->dlpi_phdr[i].p_vaddr + info->dlpi_addr;
-			mdi->size = info->dlpi_phdr[i].p_memsz;
+			mdi->text_addr = info->dlpi_phdr[i].p_vaddr;
+			mdi->text_size = info->dlpi_phdr[i].p_memsz;
 			break;
 		}
+		mdi->base_addr += info->dlpi_addr;
+		mdi->text_addr += info->dlpi_addr;
+
 		mdi->next = mdinfo;
 		mdinfo = mdi;
 
@@ -92,41 +101,31 @@ static int prepare_dynamic_update(void)
 	return ret;
 }
 
-static int do_dynamic_update(struct symtabs *symtabs, char *patch_funcs)
+static int do_dynamic_update(struct symtabs *symtabs, char *patch_funcs,
+			     enum uftrace_pattern_type ptype)
 {
-	char *str;
-	char *pos, *name, *nopatched_name = NULL;
+	char *name, *nopatched_name = NULL;
 	struct symtab *symtab = &symtabs->symtab;
+	struct strv funcs = STRV_INIT;
+	int j;
 
 	if (patch_funcs == NULL)
 		return 0;
 
-	pos = str = strdup(patch_funcs);
-	if (str == NULL)
-		return 0;
+	strv_split(&funcs, patch_funcs, ";");
 
-	name = strtok(pos, ";");
-	while (name) {
-		bool is_regex;
+	strv_for_each(&funcs, name, j) {
 		bool found = false;
-		regex_t re;
 		unsigned i;
 		struct sym *sym;
+		struct uftrace_pattern patt;
 
-		is_regex = strpbrk(name, REGEX_CHARS);
-		if (is_regex) {
-			if (regcomp(&re, name, REG_NOSUB | REG_EXTENDED)) {
-				pr_dbg("regex pattern failed: %s\n", name);
-				free(str);
-				return -1;
-			}
-		}
+		init_filter_pattern(ptype, &patt, name);
 
 		for (i = 0; i < symtab->nr_sym; i++) {
 			sym = &symtab->sym[i];
 
-			if ((is_regex && regexec(&re, sym->name, 0, NULL, 0)) ||
-			    (!is_regex && strcmp(name, sym->name)))
+			if (!match_filter_pattern(&patt, sym->name))
 				continue;
 
 			found = true;
@@ -149,18 +148,16 @@ static int do_dynamic_update(struct symtabs *symtabs, char *patch_funcs)
 		if (!found)
 			stats.nomatch++;
 
-		if (is_regex)
-			regfree(&re);
-
-		name = strtok(NULL, ";");
+		free_filter_pattern(&patt);
 	}
 
-	if (stats.failed || stats.skipped || stats.nomatch)
+	if (stats.failed || stats.skipped || stats.nomatch) {
 		pr_out("%s cannot be patched dynamically\n",
 		       (stats.failed + stats.skipped + stats.nomatch) > 1 ?
 		       "some functions" : nopatched_name);
+	}
 
-	free(str);
+	strv_free(&funcs);
 	return 0;
 }
 
@@ -188,7 +185,8 @@ static float calc_percent(int n, int total)
 	return 100.0 * n / total;
 }
 
-int mcount_dynamic_update(struct symtabs *symtabs, char *patch_funcs)
+int mcount_dynamic_update(struct symtabs *symtabs, char *patch_funcs,
+			  enum uftrace_pattern_type ptype)
 {
 	int ret = 0;
 	int success;
@@ -198,7 +196,7 @@ int mcount_dynamic_update(struct symtabs *symtabs, char *patch_funcs)
 		return -1;
 	}
 
-	ret = do_dynamic_update(symtabs, patch_funcs);
+	ret = do_dynamic_update(symtabs, patch_funcs, ptype);
 
 	success = stats.total - stats.failed - stats.skipped;
 	pr_dbg("dynamic update stats:\n");

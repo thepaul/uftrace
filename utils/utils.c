@@ -6,7 +6,6 @@
 #include <errno.h>
 #include <sys/uio.h>
 #include <sys/stat.h>
-#include <limits.h>
 #include <libgen.h>
 
 #include "uftrace.h"
@@ -82,7 +81,7 @@ int fread_all(void *buf, size_t size, FILE *fp)
 	return 0;
 }
 
-int write_all(int fd, void *buf, size_t size)
+int write_all(int fd, const void *buf, size_t size)
 {
 	int ret;
 
@@ -251,7 +250,7 @@ int chown_directory(char *dirname)
 char *read_exename(void)
 {
 	int len;
-	static char exename[4096];
+	static char exename[PATH_MAX];
 
 	if (!*exename) {
 		len = readlink("/proc/self/exe", exename, sizeof(exename)-1);
@@ -389,7 +388,18 @@ uint64_t parse_time(char *arg, int limited_digits)
 	return val;
 }
 
-char * strjoin(char *left, char *right, char *delim)
+/**
+ * strjoin - join two strings with a delimiter
+ * @left:  string buffer to join (dynamic allocated, can be NULL)
+ * @right: string to join
+ * @delim: delimiter inserted between the two
+ *
+ * This function returns a new string that concatenates @left and @right
+ * with @delim.  Note that if @left is #NULL, @delim will be omitted and
+ * a copy of @right will be returned.  @left must be dynamically allocated
+ * buffer so that it can be passed to realloc.
+ */
+char * strjoin(char *left, char *right, const char *delim)
 {
 	size_t llen = left ? strlen(left) : 0;
 	size_t rlen = strlen(right);
@@ -407,6 +417,118 @@ char * strjoin(char *left, char *right, char *delim)
 
 	strcpy(new + len - rlen - 1, right);
 	return new;
+}
+
+/**
+ * strv_split - split given string and construct a string vector
+ * @strv:  string vector
+ * @str:   input string
+ * @delim: delimiter to split the string
+ *
+ * This function build a string vector using @str splitted by @delim.
+ */
+void strv_split(struct strv *strv, const char *str, const char *delim)
+{
+	int c = 1;
+	char *saved_str = xstrdup(str);
+	char *tmp, *pos;
+	size_t len = strlen(delim);
+
+	tmp = saved_str;
+	while ((pos = strstr(tmp, delim)) != NULL) {
+		tmp = pos + len;
+		c++;
+	}
+
+	strv->nr = c;
+	strv->p = xcalloc(c + 1, sizeof(*strv->p));  /* including NULL at last */
+
+	c = 0;
+	tmp = saved_str;
+
+	while ((pos = strstr(tmp, delim)) != NULL) {
+		*pos = '\0';
+		strv->p[c++] = xstrdup(tmp);
+		tmp = pos + len;
+	}
+	strv->p[c] = xstrdup(tmp);
+
+	free(saved_str);
+}
+
+/**
+ * strv_copy - copy argc and argv to string vector
+ * @strv: string vector
+ * @argc: number of input strings
+ * @argv: array of strings
+ *
+ * This function build a string vector using @argc and @argv.
+ */
+void strv_copy(struct strv *strv, int argc, char *argv[])
+{
+	int i;
+
+	strv->nr = argc;
+	strv->p = xcalloc(argc + 1, sizeof(*strv->p));
+
+	for (i = 0; i < argc; i++)
+		strv->p[i] = xstrdup(argv[i]);
+}
+
+/**
+ * strv_append - add a string to string vector
+ * @strv: string vector
+ * @str:  input string
+ *
+ * This function add @str to @strv.
+ */
+void strv_append(struct strv *strv, const char *str)
+{
+	strv->p = xrealloc(strv->p, (strv->nr + 2) * sizeof(*strv->p));
+
+	strv->p[strv->nr + 0] = xstrdup(str);
+	strv->p[strv->nr + 1] = NULL;
+	strv->nr++;
+}
+
+/**
+ * strv_join - make a string with string vector
+ * @strv:  string vector
+ * @delim: delimiter inserted between strings
+ *
+ * This function returns a new string that concatenates all strings in
+ * @strv with @delim.  Note that if @strv contains a single string,
+ * @delim will be omitted and a copy of @right will be returned.
+ */
+char * strv_join(struct strv *strv, const char *delim)
+{
+	int i;
+	char *s;
+	char *str = NULL;
+
+	strv_for_each(strv, s, i)
+		str = strjoin(str, s, delim);
+
+	return str;
+}
+
+/**
+ * strv_free - release strings in string vector
+ * @strv: string vector
+ *
+ * This function resets @strv and releases all memory in it.
+ */
+void strv_free(struct strv *strv)
+{
+	int i;
+	char *s;
+
+	strv_for_each(strv, s, i)
+		free(s);
+
+	free(strv->p);
+	strv->p = NULL;
+	strv->nr = 0;
 }
 
 #define QUOTE '\''
@@ -595,7 +717,7 @@ char *absolute_dirname(const char *path, char *resolved_path)
 }
 
 #ifdef UNIT_TEST
-TEST_CASE(parse_cmdline)
+TEST_CASE(utils_parse_cmdline)
 {
 	char **cmdv;
 	int argc = -1;
@@ -611,6 +733,46 @@ TEST_CASE(parse_cmdline)
 	TEST_STREQ(cmdv[2], "--run-cmd");
 	TEST_STREQ(cmdv[3], "uftrace replay");
 	free_parsed_cmdline(cmdv);
+
+	return TEST_OK;
+}
+
+TEST_CASE(utils_strv)
+{
+	struct strv strv = STRV_INIT;
+	char *s;
+	int i;
+
+	const char test_str[] = "abc;def;xyz";
+	const char * test_array[] = { "abc", "def", "xyz" };
+
+	TEST_EQ(strv.nr, 0);
+	TEST_EQ(strv.p, NULL);
+
+	strv_split(&strv, test_str, ";");
+	strv_for_each(&strv, s, i)
+		TEST_STREQ(s, test_array[i]);
+
+	s = strv_join(&strv, ";");
+	TEST_STREQ(s, test_str);
+	free(s);
+
+	TEST_EQ(strv.nr, 3);
+	strv_free(&strv);
+	TEST_EQ(strv.nr, 0);
+
+	for (i = 0; i < 3; i++) {
+		strv_append(&strv, test_array[i]);
+		TEST_STREQ(strv.p[i], test_array[i]);
+		TEST_EQ(strv.nr, i + 1);
+	}
+
+	s = strv_join(&strv, ";");
+	TEST_STREQ(s, test_str);
+	free(s);
+
+	TEST_EQ(strv.nr, 3);
+	strv_free(&strv);
 
 	return TEST_OK;
 }

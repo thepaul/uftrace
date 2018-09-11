@@ -14,33 +14,10 @@
 static char *tmp_dirname;
 static void cleanup_tempdir(void)
 {
-	DIR *dp;
-	struct dirent *ent;
-	char path[PATH_MAX];
-
 	if (!tmp_dirname)
 		return;
 
-	dp = opendir(tmp_dirname);
-	if (dp == NULL) {
-		if (errno == ENOENT)
-			return;
-		pr_err("cannot open temp dir");
-	}
-
-	while ((ent = readdir(dp)) != NULL) {
-		if (ent->d_name[0] == '.')
-			continue;
-
-		snprintf(path, sizeof(path), "%s/%s", tmp_dirname, ent->d_name);
-		if (unlink(path) < 0)
-			pr_err("unlink failed: %s", path);
-	}
-
-	closedir(dp);
-
-	if (rmdir(tmp_dirname) < 0)
-		pr_err("rmdir failed: %s", tmp_dirname);
+	remove_directory(tmp_dirname);
 	tmp_dirname = NULL;
 }
 
@@ -56,7 +33,7 @@ static void reset_live_opts(struct opts *opts)
 	opts->filter	= NULL;
 	opts->depth	= MCOUNT_DEFAULT_DEPTH;
 	opts->disabled	= false;
-	opts->threshold = 0;
+	opts->no_event  = false;
 }
 
 static void sigsegv_handler(int sig)
@@ -76,49 +53,39 @@ static bool can_skip_replay(struct opts *opts, int record_result)
 
 static void setup_child_environ(struct opts *opts)
 {
-	char buf[4096];
-	char *old_preload, *old_libpath;
-
-	if (opts->lib_path) {
-		strcpy(buf, opts->lib_path);
-		strcat(buf, "/libmcount:");
-	} else {
-		/* to make strcat() work */
-		buf[0] = '\0';
-	}
+	char *old_preload, *libpath;
 
 #ifdef INSTALL_LIB_PATH
-	strcat(buf, INSTALL_LIB_PATH);
+	if (!opts->lib_path) {
+		char *envbuf = getenv("LD_LIBRARY_PATH");
+
+		if (envbuf) {
+			envbuf = xstrdup(envbuf);
+			libpath = strjoin(envbuf, INSTALL_LIB_PATH, ":");
+			setenv("LD_LIBRARY_PATH", libpath, 1);
+			free(libpath);
+		}
+		else {
+			setenv("LD_LIBRARY_PATH", INSTALL_LIB_PATH, 1);
+		}
+	}
 #endif
 
-	old_libpath = getenv("LD_LIBRARY_PATH");
-	if (old_libpath) {
-		size_t len = strlen(buf) + strlen(old_libpath) + 2;
-		char *libpath = xmalloc(len);
-
-		snprintf(libpath, len, "%s:%s", buf, old_libpath);
-		setenv("LD_LIBRARY_PATH", libpath, 1);
-		free(libpath);
-	}
-	else
-		setenv("LD_LIBRARY_PATH", buf, 1);
-
-	if (opts->lib_path)
-		snprintf(buf, sizeof(buf), "%s/libmcount/libmcount.so", opts->lib_path);
-	else
-		strcpy(buf, "libmcount.so");
+	libpath = get_libmcount_path(opts);
+	if (libpath == NULL)
+		pr_err_ns("cannot found libmcount.so\n");
 
 	old_preload = getenv("LD_PRELOAD");
 	if (old_preload) {
-		size_t len = strlen(buf) + strlen(old_preload) + 2;
+		size_t len = strlen(libpath) + strlen(old_preload) + 2;
 		char *preload = xmalloc(len);
 
-		snprintf(preload, len, "%s:%s", buf, old_preload);
+		snprintf(preload, len, "%s:%s", libpath, old_preload);
 		setenv("LD_PRELOAD", preload, 1);
 		free(preload);
 	}
 	else
-		setenv("LD_PRELOAD", buf, 1);
+		setenv("LD_PRELOAD", libpath, 1);
 }
 
 int command_live(int argc, char *argv[], struct opts *opts)
@@ -153,7 +120,7 @@ int command_live(int argc, char *argv[], struct opts *opts)
 			setup_child_environ(opts);
 			setenv("UFTRACE_LIST_EVENT", "1", 1);
 
-			execv(opts->exename, &argv[opts->idx]);
+			execv(opts->exename, argv);
 			abort();
 		}
 		return 0;

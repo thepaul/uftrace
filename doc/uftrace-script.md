@@ -41,10 +41,13 @@ OPTIONS
 :   Only show functions executed within the time RANGE.  The RANGE can be \<start\>~\<stop\> (separated by "~") and one of \<start\> and \<stop\> can be omitted.  The \<start\> and \<stop\> are timestamp or elapsed time if they have \<time_unit\> postfix, for example '100us'.  The timestamp or elapsed time can be shown with `-f time` or `-f elapsed` option respectively.
 
 -S *SCRIPT_PATH*, \--script=*SCRIPT_PATH*
-:   Add a script to do addtional work at the entry and exit of function.  The type of script is detected by the postfix such as '.py' for python.
+:   Add a script to do additional work at the entry and exit of function.  The type of script is detected by the postfix such as '.py' for python.
 
 \--record COMMAND [*command-options*]
 :   Record a new trace before running a given script.
+
+--match=*TYPE*
+:   Use pattern match using TYPE.  Possible types are `regex` and `glob`.  Default is `regex`.
 
 
 EXAMPLES
@@ -54,7 +57,7 @@ The uftrace tool supports script execution for each function entry and exit.  Th
 The user can write four functions. 'uftrace_entry' and 'uftrace_exit' are executed whenever each function is executed at the entry and exit.  However 'uftrace_begin' and 'uftrace_end' are only executed once when the target program begins and ends.
 
     $ cat scripts/simple.py
-    def uftrace_begin():
+    def uftrace_begin(ctx):
         print("program begins...")
 
     def uftrace_entry(ctx):
@@ -117,7 +120,7 @@ The below is another example that shows the different output compared to previou
 
 The python script above can be modified to do more output customization.
 
-The python script can have an optional "UFTRACE_FUNCS" list which can have name (or regex pattern) of functions to run the script.  If it exists, only matched functions will run the script.  For example, if you add following lines to the script, it will run only for functions with a single letter name.
+The python script can have an optional "UFTRACE_FUNCS" list which can have name (or pattern depending on the --match option) of functions to run the script.  If it exists, only matched functions will run the script.  For example, if you add following lines to the script, it will run only for functions with a single letter name.
 
     $ echo 'UFTRACE_FUNCS = [ "^.$" ]' >> replay.py
     $ uftrace script -S replay.py

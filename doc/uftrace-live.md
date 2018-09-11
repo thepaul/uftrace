@@ -43,8 +43,10 @@ OPTIONS
 -R *SPEC*, \--retval=*SPEC*
 :   Record function return value.  This option can be used more than once.  See *ARGUMENTS*.
 
-\--auto-args
-:   Automatically record arguments and return values of well-known library functions.  Recommend to use it with `--nest-libcall`.
+-a, \--auto-args
+:   Automatically record arguments and return values of known functions.
+    These are usually functions in standard (C language or system) libraries
+    but if debug info is available it includes functions in the user program.
 
 -f *FIELD*, \--output-fields=*FIELD*
 :   Customize field in the output.  Possible values are: duration, tid, time, delta, elapsed and addr.  Multiple fields can be set by using comma.  Special field of 'none' can be used (solely) to hide all fields.  Default is 'duration,tid'.  See *FIELDS*.
@@ -119,7 +121,9 @@ OPTIONS
 :   Show kernel functions only without user functions.
 
 -P *FUNC*, \--patch=*FUNC*
-:   Patch FUNC dynamically.  This is only applicable binaries built with `-pg -mfentry -mnop-mcount` on x86_64.  This option can be used more than once.  See *DYNAMIC TRACING*.
+:   Patch FUNC dynamically.  This is only applicable binaries built by
+    gcc with `-pg -mfentry -mnop-mcount` or clang with `-fxray-instrument`.
+    This option can be used more than once.  See *DYNAMIC TRACING*.
 
 -E *EVENT*, \--event=*EVENT*
 :   Enable event tracing.  The event should be available on the system.
@@ -127,14 +131,27 @@ OPTIONS
 \--list-event
 :   Show available events in the process.
 
+\--event-full
+:   Show all (user) events outside of user functions.
+
+\--no-event
+:   Disable event recording which is used by default.  Note that explicit event
+    tracing by `--event` option is not affected by this.
+
 \--keep-pid
 :   Retain same pid for traced program.  For some daemon processes, it is important to have same pid when forked.  Running under uftrace normally changes pid as it calls fork() again internally.  Note that it might corrupt terminal setting so it'd be better using it with `--no-pager` option.
 
 -S *SCRIPT_PATH*, \--script=*SCRIPT_PATH*
-:   Add a script to do addtional work at the entry and exit of function.  The type of script is detected by the postfix such as '.py' for python.
+:   Add a script to do additional work at the entry and exit of function.  The type of script is detected by the postfix such as '.py' for python.
 
-\--event-full
-:   Show all (user) events outside of user functions.
+\--libname
+:   Show library name along with function name.
+
+--match=*TYPE*
+:   Use pattern match using TYPE.  Possible types are `regex` and `glob`.  Default is `regex`.
+
+--no-randomize-addr
+:   Disable ASLR (Address Space Layout Randomization).  It makes the target process fix its address space layout.
 
 
 FILTERS
@@ -235,7 +252,7 @@ The uftrace tool supports triggering actions on selected function calls with or 
                      "finish" | "filter" | "notrace"
     <time_spec>  :=  <num> [ <time_unit> ]
     <time_unit>  :=  "ns" | "nsec" | "us" | "usec" | "ms" | "msec" | "s" | "sec" | "m" | "min"
-    <read_spec>  :=  "proc/statm" | "page-fault"
+    <read_spec>  :=  "proc/statm" | "page-fault" | "pmu-cycle" | "pmu-cache" | "pmu-branch"
 
 The `depth` trigger is to change filter depth during execution of the function.  It can be used to apply different filter depths for different functions.  And the `backtrace` trigger is used to print a stack backtrace at replay time.
 
@@ -260,18 +277,29 @@ The 'recover' trigger is for some corner cases in which the process accesses the
 
 The 'time' trigger is to change time filter setting during execution of the function.  It can be used to apply different time filter for different functions.
 
-The `read` trigger is to read some information at runtime.  As of now, reading process memory stat ("proc/statm") from the /proc filesystem and number of page faults ("page-fault") using getrusage(2) are supported only.  The results are printed in comments like below.
+The `read` trigger is to read some information at runtime.  The result will be
+recorded as (builtin) events at the beginning and the end of a given function.
+As of now, following events are supported:
 
-    $ uftrace -T b@read=proc/statm ./abc
+ * "proc/statm": process memory stat from /proc filesystem
+ * "page-fault": number of page faults using getrusage(2)
+ * "pmu-cycle":  cpu cycles and instructions using Linux perf-event syscall
+ * "pmu-cache":  (cpu) cache-references and misses using Linux perf-event syscall
+ * "pmu-branch": branch instructions and misses using Linux perf-event syscall
+
+The results are printed in comments like below.
+
+    $ uftrace -T a@read=proc/statm ./abc
     # DURATION    TID     FUNCTION
                 [ 1234] | main() {
                 [ 1234] |   a() {
-                [ 1234] |     /* read:proc/statm (size=6808KB, rss=777KB, shared=713KB) */
+                [ 1234] |     /* read:proc/statm (size=6808KB, rss=776KB, shared=712KB) */
                 [ 1234] |     b() {
                 [ 1234] |       c() {
        1.448 us [ 1234] |         getpid();
       10.270 us [ 1234] |       } /* c */
       11.250 us [ 1234] |     } /* b */
+                [ 1234] |     /* diff:proc/statm (size=+4KB, rss=+0KB, shared=+0KB) */
       18.380 us [ 1234] |   } /* a */
       19.537 us [ 1234] | } /* main */
 
@@ -292,14 +320,14 @@ The uftrace tool supports recording function arguments and/or return values usin
     <int_spec>    :=  "arg" N [ "/" <format> [ <size> ] ] [ "%" ( <reg> | <stack> ) ]
     <float_spec>  :=  "fparg" N [ "/" ( <size> | "80" ) ] [ "%" ( <reg> | <stack> ) ]
     <ret_spec>    :=  "retval" [ "/" <format> [ <size> ] ]
-    <format>      :=  "i" | "u" | "x" | "s" | "c" | "f" | "S" | "p"
+    <format>      :=  "d" | "i" | "u" | "x" | "s" | "c" | "f" | "S" | "p"
     <size>        :=  "8" | "16" | "32" | "64"
     <reg>         :=  <arch-specific register name>  # "rdi", "xmm0", "r0", ...
     <stack>       :=  "stack" [ "+" ] <offset>
 
 The `-A`/`--argument` option takes argN where N is an index of the arguments.  The index starts from 1 and corresponds to the argument passing order of the calling convention on the system.  Note that the indexes of arguments are separately counted for integer (or pointer) and floating-point type, and they can interfere depending on the calling convention.  The argN is for integer arguments and fpargN is for floating-point arguments.
 
-Users can optionally specify a format and size for the arguments and/or return values.  Without this, uftrace treats them as 'long int' type for integers and 'double' for floating-point numbers.  The "i" format makes it signed integer type and "u" format is for unsigned type.  Both are printed as decimal while "x" format makes it printed as hexadecimal.  The "s" format is for null-terminated string type and "c" format is for character type.  The "f" format is for floating-point type and is meaningful only for return value (generally).  Note that fpargN doesn't take the format field since it's always floating-point.  The "S" format is for std::string, but it only supports libstdc++ library as of yet.  Finally, the "p" format is for function pointer. Once the target address is recorded, it will be displayed as function name.
+Users can optionally specify a format and size for the arguments and/or return values.  The "d" format or without format field, uftrace treats them as 'long int' type for integers and 'double' for floating-point numbers.  The "i" format makes it signed integer type and "u" format is for unsigned type.  Both are printed as decimal while "x" format makes it printed as hexadecimal.  The "s" format is for null-terminated string type and "c" format is for character type.  The "f" format is for floating-point type and is meaningful only for return value (generally).  Note that fpargN doesn't take the format field since it's always floating-point.  The "S" format is for std::string, but it only supports libstdc++ library as of yet.  Finally, the "p" format is for function pointer. Once the target address is recorded, it will be displayed as function name.
 
 Please beware when using string type arguments since it can crash the program if the (pointer) value is invalid.
 
@@ -330,7 +358,32 @@ Examples are below:
        7.226 us [21534] |   puts("Hello world") = 12;
        8.708 us [21534] | } /* main */
 
-Note that these arguments and return value are recorded only if the executable was built with the `-pg` option.  Executables built with `-finstrument-functions` will cause uftrace to exit with an error message.  Recording of arguments and return values only works with user-level functions for now.
+Note that these arguments and return value are recorded only if the executable
+was built with the `-pg` option.  Executables built with `-finstrument-functions`
+will ignore it except for library calls.  Recording of arguments and return
+values only works with user-level functions for now.
+
+If the target program is built with debug info like DWARF, uftrace can identify
+number of arguments and their types automatically (when built with libdw).
+Also arguments and return value of some well-known library functions are
+provided even if the debug info is not available.  In these cases user don't
+need to specify format of the arguments and return value manually - just
+function name (or pattern) is enough.  In fact, manual argspec will suppress
+the automatic argspec.
+
+For example, the above example can be written like below:
+
+    $ uftrace -A . -R main -F main ./hello
+    Hello world
+    # DURATION     TID     FUNCTION
+                [ 18948] | main(1, 0x7ffeeb7590b8) {
+       7.183 us [ 18948] |   puts("Hello world");
+       9.832 us [ 18948] | } = 0; /* main */
+
+Note that argument pattern (".") matches to any character so it recorded
+all (supported) functions.  It shows two arguments for "main" and a single
+string argument for "puts".  If you simply want to see all arguments and
+return values of every functions (if supported), use `-a`/`--auto-args` option.
 
 
 FIELDS
@@ -359,6 +412,8 @@ Each field has following meaning:
  * delta: difference between two timestamp in a task
  * elapsed: elapsed time from the first timestamp
  * addr: address of the function
+ * task: task name (comm)
+ * module: library or executable name of the function
 
 The default value is 'duration,tid'.  If given field name starts with "+", then it'll be appended to the default fields.  So "-f +time" is as same as "-f duration,tid,time".  And it also accepts a special field name of 'none' which disables the field display and shows function output only.
 
@@ -427,7 +482,7 @@ The uftrace tool supports script execution for each function entry and exit.  Th
 The user can write four functions. 'uftrace_entry' and 'uftrace_exit' are executed whenever each function is executed at the entry and exit.  However 'uftrace_begin' and 'uftrace_end' are only executed once when the target program begins and ends.
 
     $ cat scripts/simple.py
-    def uftrace_begin():
+    def uftrace_begin(ctx):
         print("program begins...")
 
     def uftrace_entry(ctx):

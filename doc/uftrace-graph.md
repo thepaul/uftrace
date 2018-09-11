@@ -14,7 +14,7 @@ uftrace graph [*options*] [*FUNCTION*]
 
 DESCRIPTION
 ===========
-This command shows a function call graph for the given function in a uftrace record datafile.  If the function name is omitted, `main` is used by default.  The function call graph contains backtrace and calling functions.  Each function in the output is annotated with a hit count and the total time spent running that function.
+This command shows a function call graph for the binary or the given function in a uftrace record datafile.  If the function name is omitted, whole function call graph will be shonw.  If user gives a function name it will show backtrace and calling functions.  Each function in the output is annotated with a hit count and the total time spent running that function.
 
 
 OPTIONS
@@ -37,6 +37,9 @@ OPTIONS
 -D *DEPTH*, \--depth *DEPTH*
 :   Set trace limit in nesting level.
 
+-f *FIELD*, \--output-fields=*FIELD*
+:   Customize field in the output.  Possible values are: total, self and addr.  Multiple fields can be set by using comma.  Special field of 'none' can be used (solely) to hide all fields.  Default is 'total'.  See *FIELDS*.
+
 -r *RANGE*, \--time-range=*RANGE*
 :   Only show functions executed within the time RANGE.  The RANGE can be \<start\>~\<stop\> (separated by "~") and one of \<start\> and \<stop\> can be omitted.  The \<start\> and \<stop\> are timestamp or elapsed time if they have \<time_unit\> postfix, for example '100us'.  The timestamp or elapsed time can be shown with `-f time` or `-f elapsed` option respectively in `uftrace replay`(1).
 
@@ -58,8 +61,14 @@ OPTIONS
 \--event-full
 :   Show all (user) events outside of user functions.
 
+\--no-event
+:   Do not show any events.
+
 \--demangle=*TYPE*
 :   Use demangled C++ symbol names for filters, triggers, arguments and/or return values.  Possible values are "full", "simple" and "no".  Default is "simple" which ignores function arguments and template parameters.
+
+--match=*TYPE*
+:   Use pattern match using TYPE.  Possible types are `regex` and `glob`.  Default is `regex`.
 
 
 EXAMPLES
@@ -86,7 +95,25 @@ This command show data like below:
       10.138 ms [24447] |   } /* bar */
       10.293 ms [24447] | } /* main */
 
-Running the `graph` command on the `main` function shows called functions like below:
+Running the `graph` command shows function call graph like below:
+
+    $ uftrace graph
+    # Function Call Graph for 'loop' (session: 073f1e84aa8b09d3)
+    ========== FUNCTION CALL GRAPH ==========
+      10.293 ms : (1) loop
+      10.293 ms : (1) main
+      46.626 us :  +-(2) foo
+      44.360 us :  | (6) loop
+                :  | 
+      10.138 ms :  +-(1) bar
+      10.100 ms :    (1) usleep
+
+The topmost node is not for function but for the executable.
+The left side shows total time running the function on the right side.  The number in parentheses before the function name is the invocation count.  As you can see, `main` was called once and ran around 10 msec.  It called `foo` twice and then `foo` called `loop` 6 times in total.  The time is the sum of all execution time of the function.
+
+It can also be seen that `main` called `bar` once and that `bar` then called `usleep` once.  To avoid too deep nesting level, it shows calls that have only a single call path at the same level.  So `usleep` is not called from `main` directly.
+
+Running the `graph` command on the `main` function shows called functions and backtrace like below:
 
     $ uftrace graph main
     # Function Call Graph for 'main' (session: 073f1e84aa8b09d3)
@@ -95,17 +122,15 @@ Running the `graph` command on the `main` function shows called functions like b
        [0] main (0x4004f0)
     
     ========== FUNCTION CALL GRAPH ==========
-      10.293 ms : (1) main
-      46.626 us :  +-(2) foo
-      44.360 us :  | (6) loop
-                :  | 
-      10.138 ms :  +-(1) bar
-      10.100 ms :    (1) usleep
+    # TOTAL TIME   FUNCTION
+       10.293 ms : (1) main
+       46.626 us :  +-(2) foo
+       44.360 us :  | (6) loop
+                 :  | 
+       10.138 ms :  +-(1) bar
+       10.100 ms :    (1) usleep
 
-The left side shows total time running the function on the right side.  The number in parentheses before the function name is the invocation count.  As you can see, `main` was called once and ran around 10 msec.  It called `foo` twice and then `foo` called `loop` 6 times in total.  The time is the sum of all execution time of the function.
-
-It can also be seen that `main` called `bar` once and that `bar` then called `usleep` once.  To avoid too deep nesting level, it shows calls that have only a single call path at the same level.  So `usleep` is not called from `main` directly.
-
+Note that the 'main' is the top-level function so it has no backtrace above itself.
 Running graph command on a leaf function looks like below.
 
     $ uftrace graph loop
@@ -117,11 +142,51 @@ Running graph command on a leaf function looks like below.
        [2] loop (0x400f5f6)
     
     ========== FUNCTION CALL GRAPH ==========
-      44.360 us : (6) loop
+    # TOTAL TIME   FUNCTION
+       44.360 us : (6) loop
 
 The backtrace shows that loop is called from `foo` and that `foo` is called from `main`.  Since `loop` is a leaf function, it didn't call any other function.  In this case, `loop` was called only from a single path so backtrace #0 is hit 6 times.
 
 
+FIELDS
+======
+The uftrace allows for user to customize the graph output with some of fields.  Here the field means info on the left side of the colon (:) character.  By default it uses time only, but you can use other fields in any order like:
+
+    $ uftrace record tests/t-abc
+    $ uftrace graph -f total,self,addr
+    # Function Call Graph for 't-sort' (session: b007f4b7cf792878)
+    ========== FUNCTION CALL GRAPH ==========
+    # TOTAL TIME  SELF TIME      ADDRESS     FUNCTION
+       10.145 ms              561f652cd610 : (1) t-sort
+       10.145 ms   39.890 us  561f652cd610 : (1) main
+       16.773 us    0.734 us  561f652cd7ce :  +-(2) foo
+       16.039 us   16.039 us  561f652cd7a0 :  | (6) loop
+                                           :  |
+       10.088 ms   14.740 us  561f652cd802 :  +-(1) bar
+       10.073 ms   10.073 ms  561f652cd608 :    (1) usleep
+
+Each field has following meaning:
+
+ * total: function execution time in total
+ * self : function execution time excluding its children's
+ * addr : address of the function
+
+The default value is 'total'.  If given field name starts with "+", then it'll be appended to the default fields.  So "-f +addr" is as same as "-f total,addr".  And it also accepts a special field name of 'none' which disables the field display and shows function output only.
+
+    $ uftrace graph -f none
+    # Function Call Graph for 't-sort' (session: b007f4b7cf792878)
+    ========== FUNCTION CALL GRAPH ==========
+    (1) t-sort
+    (1) main
+     +-(2) foo
+     | (6) loop
+     |
+     +-(1) bar
+       (1) usleep
+
+This output can be useful when comparing two different call graph outputs using diff tool.
+
+
 SEE ALSO
 ========
-`uftrace`(1), `uftrace-record`(1), `uftrace-replay`(1)
+`uftrace`(1), `uftrace-record`(1), `uftrace-replay`(1), `uftrace-tui`(1)

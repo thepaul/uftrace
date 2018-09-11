@@ -11,7 +11,6 @@
 #include <unistd.h>
 #include <errno.h>
 #include <assert.h>
-#include <limits.h>
 #include <inttypes.h>
 
 #include "utils/utils.h"
@@ -19,13 +18,13 @@
 #define TERM_COLOR_NORMAL	""
 #define TERM_COLOR_RESET	"\033[0m"
 #define TERM_COLOR_BOLD		"\033[1m"
-#define TERM_COLOR_RED		"\033[1;31m"  /* bright red */
+#define TERM_COLOR_RED		"\033[91m"    /* bright red */
 #define TERM_COLOR_GREEN	"\033[32m"
 #define TERM_COLOR_YELLOW	"\033[33m"
-#define TERM_COLOR_BLUE		"\033[1;34m"  /* bright blue */
+#define TERM_COLOR_BLUE		"\033[94m"    /* bright blue */
 #define TERM_COLOR_MAGENTA	"\033[35m"
 #define TERM_COLOR_CYAN		"\033[36m"
-#define TERM_COLOR_GRAY		"\033[37m"
+#define TERM_COLOR_GRAY		"\033[90m"    /* bright black */
 
 int debug;
 FILE *logfp;
@@ -71,8 +70,16 @@ static void color(const char *code, FILE *fp)
 void setup_color(enum color_setting color)
 {
 	if (likely(color == COLOR_AUTO)) {
-		log_color = isatty(fileno(logfp)) ? COLOR_ON : COLOR_OFF;
-		out_color = isatty(fileno(outfp)) ? COLOR_ON : COLOR_OFF;
+		char *term = getenv("TERM");
+		bool dumb = term && !strcmp(term, "dumb");
+
+		out_color = COLOR_ON;
+		log_color = COLOR_ON;
+
+		if (!isatty(fileno(outfp)) || dumb)
+			out_color = COLOR_OFF;
+		if (!isatty(fileno(logfp)) || dumb)
+			log_color = COLOR_OFF;
 	}
 	else {
 		log_color = color;

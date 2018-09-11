@@ -23,9 +23,9 @@ class TestCase(TestBase):
     def build(self, name, cflags='', ldflags=''):
         old_cc = TestBase.supported_lang['C']['cc']
         TestBase.supported_lang['C']['cc'] = 'clang'
-        r = TestBase.build(self, name, '-fxray-instrument -fxray-instruction-threshold=1', ldflags)
+        r = TestBase.build(self, name, '-fxray-instrument -fxray-instruction-threshold=1', '-lstdc++')
         TestBase.supported_lang['C']['cc'] = old_cc
         return r
 
     def runcmd(self):
-        return '%s -P %s %s' % (TestBase.ftrace, 'a.?', 't-' + self.name)
+        return '%s -P %s %s' % (TestBase.uftrace_cmd, 'a.?', 't-' + self.name)

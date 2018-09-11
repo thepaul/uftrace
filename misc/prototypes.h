@@ -22,6 +22,10 @@ void free(void* ptr);
 void* calloc(size_t nmemb, size_t size);
 void* realloc(void* ptr, size_t size);
 
+void qsort(void *base, size_t nmemb, size_t size, funcptr_t compar);
+void qsort_r(void *base, size_t nmemb, size_t size, funcptr_t compar, void *arg);
+void *bsearch(const void *key, const void *base, size_t nmemb, size_t size, funcptr_t compar);
+
 #include <sys/mman.h>
 enum uft_mmap_prot { PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC = 4, };
 enum uft_mmap_flag {
@@ -40,8 +44,48 @@ enum uft_mmap_flag {
 	MAP_HUGETLB     = 0x40000,
 };
 void *mmap(void *addr, size_t length, enum uft_mmap_prot prot, enum uft_mmap_flag flags, int fd, off_t offset);
+void *mmap64(void *addr, size_t length, enum uft_mmap_prot prot, enum uft_mmap_flag flags, int fd, off64_t offset);
 int munmap(void *addr, size_t length);
 int mprotect(void *addr, size_t len, enum uft_mmap_prot prot);
+
+enum uft_madvise {
+    MADV_NORMAL      = 0,
+    MADV_RANDOM      = 1,
+    MADV_SEQUENTIAL  = 2,
+    MADV_WILLNEED    = 3,
+    MADV_DONTNEED    = 4,
+    MADV_FREE        = 8,
+    MADV_REMOVE      = 9,
+    MADV_DONTFORK    = 10,
+    MADV_DOFORK      = 11,
+    MADV_MERGEABLE   = 12,
+    MADV_UNMERGEABLE = 13,
+    MADV_HUGEPAGE    = 14,
+    MADV_NOHUGEPAGE  = 15,
+    MADV_DONTDUMP    = 16,
+    MADV_DODUMP      = 17,
+    MADV_HWPOISON    = 100,
+};
+int madvise(void *addr, size_t length, enum uft_madvise advice);
+
+enum uft_posix_madvise {
+    POSIX_MADV_NORMAL     = 0,
+    POSIX_MADV_RANDOM     = 1,
+    POSIX_MADV_SEQUENTIAL = 2,
+    POSIX_MADV_WILLNEED   = 3,
+    POSIX_MADV_DONTNEED   = 4,
+};
+int posix_madvise(void *addr, size_t len, enum uft_posix_madvise advice);
+
+enum uft_posix_fadvise {
+    POSIX_FADV_NORMAL     = 0,
+    POSIX_FADV_RANDOM     = 1,
+    POSIX_FADV_SEQUENTIAL = 2,
+    POSIX_FADV_WILLNEED   = 3,
+    POSIX_FADV_DONTNEED   = 4,
+    POSIX_FADV_NOREUSE    = 5,
+};
+int posix_fadvise(int fd, off_t offset, off_t len, enum uft_posix_fadvise advice);
 
 int brk(void *addr);
 void *sbrk(intptr_t increment);
@@ -155,6 +199,7 @@ enum uft_open_flag {
 	O_PATH      = 010000000,
 };
 int open(const char* pathname, enum uft_open_flag flags);
+int open64(const char* pathname, enum uft_open_flag flags);
 int close(int fd);
 
 enum uft_seek_whence { SEEK_SET, SEEK_CUR, SEEK_END, SEEK_DATA, SEEK_HOLE, };
@@ -172,6 +217,11 @@ ssize_t read(int fd, void *buf, size_t count);
 ssize_t write(int fd, const void *buf, size_t count);
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
+
+enum uft_access_flag {
+	F_OK = 0, X_OK = 1, W_OK = 2, R_OK = 4,
+};
+int access(const char *pathname, enum uft_access_flag mode);
 ////////////////////////////////////////////////////////////////////////////////
 
 
@@ -211,6 +261,11 @@ enum uft_dlopen_flag {
 	RTLD_NODELETE = 0x1000,
 };
 void *dlopen(const char *filename, enum uft_dlopen_flag flags);
+void *dlmopen (Lmid_t lmid, const char *filename, int flags);
+void *dlsym(void *handle, const char *symbol);
+void *dlvsym(void *handle, char *symbol, char *version);
+int dlclose(void *handle);
+char *dlerror(void);
 ////////////////////////////////////////////////////////////////////////////////
 
 
@@ -275,7 +330,7 @@ void freeaddrinfo(struct addrinfo *res);
 #include <signal.h>
 // linux signal number
 enum uft_signal {
-	SIGHUP = 1, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE,
+	SIGNULL = 0, SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE,
 	SIGKILL = 9, SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGSTKFLT,
 	SIGCHLD = 17, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGXCPU,
 	SIGXFSZ = 25, SIGVTALRM, SIGPROF, SIGWINCH, SIGPOLL, SIGPWR, SIGSYS,

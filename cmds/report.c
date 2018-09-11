@@ -91,9 +91,8 @@ static void insert_entry(struct rb_root *root, struct trace_entry *te, bool thre
 
 			if (entry->sym == NULL && te->sym) {
 				entry->sym = te->sym;
-
-				if (entry->sym)
-					len = strlen(entry->sym->name);
+				len = strlen(entry->sym->name);
+				
 				if (maxlen < len)
 					maxlen = len;
 			}
@@ -167,21 +166,7 @@ static bool fill_entry(struct trace_entry *te, struct ftrace_task_handle *task,
 		       uint64_t time, uint64_t addr, struct opts *opts)
 {
 	struct uftrace_session_link *sessions = &task->h->sessions;
-	struct uftrace_session *sess;
 	struct sym *sym;
-
-	sess = sessions->first;
-
-	/* skip user functions if --kernel-only is set */
-	if (opts->kernel_only && !is_kernel_address(&sess->symtabs, addr))
-		return false;
-
-	if (opts->kernel_skip_out) {
-		/* skip kernel functions outside user functions */
-		if (task->user_stack_count == 0 &&
-		    is_kernel_address(&sess->symtabs, addr))
-			return false;
-	}
 
 	sym = task_find_sym_addr(sessions, task, time, addr);
 
@@ -204,6 +189,9 @@ static void build_function_tree(struct ftrace_file_handle *handle,
 		if (rstack->type != UFTRACE_LOST)
 			task->timestamp_last = rstack->time;
 
+		if (!fstack_check_opts(task, opts))
+			continue;
+
 		if (!fstack_check_filter(task))
 			continue;
 
@@ -211,19 +199,9 @@ static void build_function_tree(struct ftrace_file_handle *handle,
 			continue;
 
 		if (rstack->type == UFTRACE_EVENT) {
-			if (!task->user_stack_count && opts->event_skip_out)
-				continue;
-
 			if (rstack->addr == EVENT_ID_PERF_SCHED_IN) {
-				static struct sym sched_sym = {
-					.addr = EVENT_ID_PERF_SCHED_IN,
-					.size = 1,
-					.type = ST_LOCAL,
-					.name = "linux:schedule",
-				};
-
 				fill_entry_sym(&te, task, &sched_sym,
-					       sched_sym.addr);
+					       rstack->addr);
 				insert_entry(root, &te, false);
 			}
 			continue;
@@ -570,7 +548,7 @@ static int cmp_diff_entry(struct trace_entry *a, struct trace_entry *b,
 		entry_b = b;
 		break;
 	default:
-		/* this should not happend */
+		/* this should not happen */
 		assert(0);
 		break;
 	}
@@ -626,11 +604,14 @@ static void sort_diff_entries(struct rb_root *root, struct trace_entry *te,
 
 static void setup_sort(char *sort_keys)
 {
-	char *keys = xstrdup(sort_keys);
-	char *k, *p = keys;
+	struct strv keys = STRV_INIT;
+	char *k;
 	unsigned i;
+	int j;
 
-	while ((k = strtok(p, ",")) != NULL) {
+	strv_split(&keys, sort_keys, ",");
+
+	strv_for_each(&keys, k, j) {
 		for (i = 0; i < ARRAY_SIZE(all_sort_items); i++) {
 			if (strcmp(k, all_sort_items[i]->name))
 				continue;
@@ -657,9 +638,8 @@ static void setup_sort(char *sort_keys)
 			pr_out("\n");
 			exit(1);
 		}
-		p = NULL;
 	}
-	free(keys);
+	strv_free(&keys);
 }
 
 static void print_and_delete(struct rb_root *root,
@@ -1197,10 +1177,13 @@ out:
 
 static void apply_diff_policy(char *policy)
 {
-	char *str = xstrdup(policy);
-	char *p, *tmp = policy;
+	struct strv strv = STRV_INIT;
+	char *p;
+	int i;
 
-	while ((p = strtok(tmp, ",")) != NULL) {
+	strv_split(&strv, policy, ",");
+
+	strv_for_each(&strv, p, i) {
 		bool on = true;
 
 		if (!strncmp(p, "no-", 3)) {
@@ -1216,10 +1199,8 @@ static void apply_diff_policy(char *policy)
 			diff_full = true;
 		else if (!strncmp(p, "compact", 7))
 			diff_full = false;
-
-		tmp = NULL;
 	}
-	free(str);
+	strv_free(&strv);
 }
 
 int command_report(int argc, char *argv[], struct opts *opts)

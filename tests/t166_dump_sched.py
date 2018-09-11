@@ -9,6 +9,8 @@ class TestCase(TestBase):
     def __init__(self):
         TestBase.__init__(self, 'sleep', """
 {"traceEvents":[
+{"ts":0,"ph":"M","pid":306,"name":"process_name","args":{"name":"[306] t-sleep"}},
+{"ts":0,"ph":"M","pid":306,"name":"thread_name","args":{"name":"[306] t-sleep"}},
 {"ts":112150305218.363,"ph":"B","pid":306,"name":"__monstartup"},
 {"ts":112150305220.090,"ph":"E","pid":306,"name":"__monstartup"},
 {"ts":112150305224.313,"ph":"B","pid":306,"name":"__cxa_atexit"},
@@ -38,13 +40,18 @@ class TestCase(TestBase):
 """, sort='chrome')
 
     def pre(self):
+        if not TestBase.check_dependency(self, 'perf_context_switch'):
+            return TestBase.TEST_SKIP
+        if not TestBase.check_perf_paranoid(self):
+            return TestBase.TEST_SKIP
+
         options = '-d %s -E %s' % (TDIR, 'linux:schedule')
-        record_cmd = '%s record %s %s' % (TestBase.ftrace, options, 't-' + self.name)
+        record_cmd = '%s record %s %s' % (TestBase.uftrace_cmd, options, 't-' + self.name)
         sp.call(record_cmd.split())
         return TestBase.TEST_SUCCESS
 
     def runcmd(self):
-        return '%s dump -d %s -F main --chrome' % (TestBase.ftrace, TDIR)
+        return '%s dump -d %s -F main --chrome' % (TestBase.uftrace_cmd.split()[0], TDIR)
 
     def post(self, ret):
         sp.call(['rm', '-rf', TDIR])

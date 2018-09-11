@@ -1,11 +1,11 @@
 /*
  * Very simple (and incomplete by design) C++ name demangler.
  *
- * Copyright (C) 2015-2017, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
+ * Copyright (C) 2015-2018, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
  *
  * Released under the GPL v2.
  *
- * See http://mentorembedded.github.io/cxx-abi/abi.html#mangling
+ * See https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling
  */
 
 #include <stdlib.h>
@@ -151,10 +151,10 @@ static const struct {
 	char op[2];
 	char *name;
 } ops[] = {
-	{ { 'n','w' }, "new" },
-	{ { 'n','a' }, "new[]" },
-	{ { 'd','l' }, "delete" },
-	{ { 'd','a' }, "delete[]" },
+	{ { 'n','w' }, " new" },
+	{ { 'n','a' }, " new[]" },
+	{ { 'd','l' }, " delete" },
+	{ { 'd','a' }, " delete[]" },
 	{ { 'p','s' }, "+" }, /* unary */
 	{ { 'n','g' }, "-" }, /* unary */
 	{ { 'a','d' }, "&" }, /* unary */
@@ -923,6 +923,33 @@ static int dd_decltype(struct demangle_data *dd)
 	return 0;
 }
 
+static int dd_vector_type(struct demangle_data *dd)
+{
+	char c0 = dd_consume(dd);
+	char c1 = __dd_consume(dd, NULL);
+
+	if (dd_eof(dd))
+		return -1;
+
+	if (c0 != 'D' || c1 != 'v')
+		DD_DEBUG(dd, "Dv", -2);
+
+	dd->type++;
+
+	c0 = dd_curr(dd);
+	if (c0 == '_') {
+		__dd_consume(dd, NULL);
+		dd_expression(dd);
+	}
+	else if (dd_number(dd) < 0)
+		return -1;
+
+	__DD_DEBUG_CONSUME(dd, '_');
+
+	dd->type--;
+	return 0;
+}
+
 static int dd_type(struct demangle_data *dd)
 {
 	unsigned i;
@@ -985,6 +1012,10 @@ static int dd_type(struct demangle_data *dd)
 			else if (c == 'p') {
 				/* pack expansion */
 				dd_consume_n(dd, 2);
+				continue;
+			}
+			else if (c == 'v') {
+				dd_vector_type(dd);
 				continue;
 			}
 			else if (c == 't' || c == 'T')
@@ -1099,6 +1130,24 @@ static int dd_special_name(struct demangle_data *dd)
 				return -1;
 			return dd_encoding(dd);
 		}
+		if (c1 == 'C') {
+			/* construction vtable */
+			dd_consume_n(dd, 2);
+			if (dd_type(dd) < 0)
+				return -1;
+			if (dd_number(dd) < 0)
+				return -1;
+			return dd_type(dd);
+		}
+		if (c1 == 'H' || c1 == 'W') {
+			/* TLS init and wrapper */
+			dd_consume_n(dd, 2);
+			if (dd->newpos)
+				dd_append(dd, "::");
+			dd_append(dd, "TLS_");
+			dd_append(dd, c1 == 'H' ? "init" : "wrap");
+			return dd_name(dd);
+		}
 	}
 	if (c0 == 'G') {
 		if (c1 == 'V') {
@@ -1146,15 +1195,29 @@ static int dd_ctor_dtor_name(struct demangle_data *dd)
 	char c1 = __dd_consume(dd, NULL);
 	char *pos;
 	int len;
+	int ret = 0;
+	bool needs_type = false;
 
 	if (dd_eof(dd))
 		return -1;
 
-	if ((c0 != 'C' && c0 != 'D') || !isdigit(c1))
-		DD_DEBUG(dd, "C[0-3] or D[0-3]", -2);
+	if ((c0 != 'C' && c0 != 'D'))
+		DD_DEBUG(dd, "C[0-5] or D[0-5]", -2);
+
+	/* inheriting constructor */
+	if (c1 == 'I') {
+		c1 = __dd_consume(dd, NULL);
+		needs_type = true;
+	}
+
+	if (!isdigit(c1))
+		DD_DEBUG(dd, "C[0-5] or D[0-5]", -2 - (needs_type ? 1 : 0));
+
+	if (needs_type)
+		ret = dd_type(dd);
 
 	if (dd->type)
-		return 0;
+		return ret;
 
 	/* repeat last name after '::' */
 	pos = strrchr(dd->new, ':');
@@ -1174,7 +1237,7 @@ static int dd_ctor_dtor_name(struct demangle_data *dd)
 
 	dd_append_len(dd, pos, len);
 	free(pos);
-	return 0;
+	return ret;
 }
 
 static int dd_operator_name(struct demangle_data *dd)
@@ -1198,7 +1261,7 @@ static int dd_operator_name(struct demangle_data *dd)
 		if (c0 == ops[i].op[0] && c1 == ops[i].op[1]) {
 			if (dd->newpos)
 				dd_append(dd, "::");
-			dd_append(dd, "operator ");
+			dd_append(dd, "operator");
 			dd_append(dd, ops[i].name);
 
 			dd->type++;
@@ -1253,18 +1316,23 @@ static int dd_unqualified_name(struct demangle_data *dd)
 	if (dd_eof(dd))
 		return -1;
 
-	if ((c0 == 'C' || c0 == 'D') && isdigit(c1))
+	if (c0 == 'C' || c0 == 'D')
 		ret = dd_ctor_dtor_name(dd);
 	else if (c0 == 'U') {
-		dd->type++;
-
 		if (c1 == 't') {
 			/* unnamed type name */
+			dd->type++;
+
 			dd_consume_n(dd, 2);
 			dd_number(dd);
 			DD_DEBUG_CONSUME(dd, '_');
+
+			dd->type--;
 		}
-		else if (c1 == 'I' || c1 == 'l') {
+		else if (c1 == 'l') {
+			int n = -1;
+			char buf[32];
+
 			/* closure type name (or lambda) */
 			dd_consume_n(dd, 2);
 
@@ -1277,16 +1345,24 @@ static int dd_unqualified_name(struct demangle_data *dd)
 			dd->level--;
 
 			if (dd_curr(dd) != '_') {
-				if (dd_number(dd) < 0)
+				n = dd_number(dd);
+				if (n < 0)
 					return -1;
 			}
 			DD_DEBUG_CONSUME(dd, '_');
+
+			if (dd->type)
+				return 0;
+
+			if (dd->newpos)
+				dd_append(dd, "::");
+
+			snprintf(buf, sizeof(buf), "$_%d", n + 1);
+			dd_append(dd, buf);
 		}
 		else {
 			ret = -1;
 		}
-
-		dd->type--;
 	}
 	else if (islower(c0))
 		ret = dd_operator_name(dd);
@@ -1317,8 +1393,11 @@ static int dd_nested_name(struct demangle_data *dd)
 		char c0 = dd_curr(dd);
 		char c1 = dd_peek(dd, 1);
 
-		if (((c0 == 'C' || c0 == 'D') && isdigit(c1)) ||
-		    c0 == 'U' || islower(c0) || isdigit(c0))
+		if (c0 == 'D' && (c1 == 'T' || c1 == 't'))
+			ret = dd_decltype(dd);
+		else if (c0 == 'C' || c0 == 'D')
+			ret = dd_ctor_dtor_name(dd);
+		else if (c0 == 'U' || islower(c0) || isdigit(c0))
 			ret = dd_unqualified_name(dd);
 		else if (c0 == 'T')
 			ret = dd_template_param(dd);
@@ -1326,8 +1405,6 @@ static int dd_nested_name(struct demangle_data *dd)
 			ret = dd_template_args(dd);
 		else if (c0 == 'S')
 			ret = dd_substitution(dd);
-		else if (c0 == 'D' && (c1 == 'T' || c1 == 't'))
-			ret = dd_decltype(dd);
 		else if (c0 == 'M')
 			dd_consume(dd);  /* assumed data-member-prefix */
 		else if (c0 == 'L')
@@ -1446,8 +1523,15 @@ static char *demangle_simple(char *str)
 		.old = str,
 		.len = strlen(str),
 	};
+	bool has_prefix = false;
 
-	if (str[0] != '_' || str[1] != 'Z')
+	if (!strncmp(str, "_GLOBAL__sub_I_", 15)) {
+		has_prefix = true;
+		dd.old += 15;
+		dd.len -= 15;
+	}
+
+	if (dd.old[0] != '_' || dd.old[1] != 'Z')
 		return xstrdup(str);
 
 	dd.pos = 2;
@@ -1457,6 +1541,14 @@ static char *demangle_simple(char *str)
 		dd_debug_print(&dd);
 		free(dd.new);
 		return xstrdup(str);
+	}
+
+	if (has_prefix) {
+		char *p = NULL;
+
+		xasprintf(&p, "_GLOBAL__sub_I_%s", dd.new);
+		free(dd.new);
+		dd.new = p;
 	}
 
 	/* caller should free it */
@@ -1494,6 +1586,9 @@ static char *demangle_full(char *str)
  */
 char *demangle(char *str)
 {
+	if (str == NULL)
+		return NULL;
+
 	switch (demangler) {
 	case DEMANGLE_SIMPLE:
 		return demangle_simple(str);
@@ -1577,7 +1672,7 @@ TEST_CASE(demangle_simple3)
 
 	name = demangle_simple("_ZSteqIPN2v88internal8compiler4NodeERKS4_PS5_E"
 			       "bRKSt15_Deque_iteratorIT_T0_T1_ESE_");
-	TEST_STREQ("std::operator ==", name);
+	TEST_STREQ("std::operator==", name);
 	free(name);
 
 	name = demangle_simple("_ZN2v84base8internalmlIiiEENS1_14CheckedNumeric"
@@ -1587,7 +1682,7 @@ TEST_CASE(demangle_simple3)
 			       "27ArithmeticPromotionCategoryE0ELSB_2E"
 			       "qugtsrS9_5valueL_ZNSA_5valueEELSB_1ELSB_2EEE"
 			       "4typeEEERKNS3_IS5_EES6_");
-	TEST_STREQ("v8::base::internal::operator *", name);
+	TEST_STREQ("v8::base::internal::operator*", name);
 	free(name);
 
 	name = demangle_simple("_ZSt3powIidEN9__gnu_cxx11__promote_2IT_T0_NS0_"
@@ -1678,6 +1773,31 @@ TEST_CASE(demangle_simple5)
 			       "25CorrectDelayedTyposInExprES4_PNS1_7VarDeclE"
 			       "S7_Ed_NUlS4_E_EEES5_lS4_");
 	TEST_STREQ("llvm::function_ref::callback_fn", name);
+	free(name);
+
+	return TEST_OK;
+}
+
+TEST_CASE(demangle_simple6)
+{
+	char *name;
+
+	dbg_domain[DBG_DEMANGLE] = 2;
+
+	name = demangle_simple("_ZN4base8internal15OptionalStorageImLb1ELb1EE"
+			       "CI2NS0_19OptionalStorageBaseImLb1EEEIJRKmEEE"
+			       "NS_10in_place_tEDpOT_");
+	TEST_STREQ("base::internal::OptionalStorage::OptionalStorage", name);
+	free(name);
+
+	name = demangle_simple("_ZL18color_lookup_tableILi3EEv"
+			       "PK28SkJumper_ColorLookupTableCtx"
+			       "RDv4_fS4_S4_S3_Dv4_jS5_");
+	TEST_STREQ("color_lookup_table", name);
+	free(name);
+
+	name = demangle_simple("_ZTWN6__xray19__xray_fdr_internal7RunningE");
+	TEST_STREQ("TLS_wrap::__xray::__xray_fdr_internal::Running", name);
 	free(name);
 
 	return TEST_OK;

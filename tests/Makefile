@@ -1,8 +1,8 @@
-TEST_CFLAGS  := -D_GNU_SOURCE -DUNIT_TEST -I$(srcdir) -I$(objdir) -I$(srcdir)/arch/$(ARCH) -g
-TEST_CFLAGS  += -include $(srcdir)/tests/unittest.h
-TEST_LDFLAGS := -L$(objdir)/libtraceevent -ltraceevent -lelf -pthread -lrt -ldl
+TEST_CFLAGS  += -include $(srcdir)/tests/unittest.h -Wno-sign-compare
 
-UNIT_TEST_SRC := $(wildcard $(srcdir)/*.c $(srcdir)/utils/*.c)
+UNIT_TEST_SRC := $(srcdir)/uftrace.c
+UNIT_TEST_SRC += $(wildcard $(srcdir)/cmds/*.c)
+UNIT_TEST_SRC += $(wildcard $(srcdir)/utils/*.c)
 UNIT_TEST_SRC += $(wildcard $(srcdir)/arch/$(ARCH)/*.c)
 UNIT_TEST_SRC += $(wildcard $(srcdir)/libmcount/*.c)
 UNIT_TEST_OBJ := $(patsubst %.c,%.ot,$(UNIT_TEST_SRC))
@@ -21,8 +21,8 @@ test_unit: unittest
 unittest: unittest.c unittest.h $(UNIT_TEST_OBJ)
 	$(QUIET_LINK)$(CC) -o $@ $(TEST_CFLAGS) $< $(UNIT_TEST_OBJ) $(TEST_LDFLAGS)
 
-$(UNIT_TEST_OBJ): %.ot: %.c
-	$(QUIET_CC)$(CC) -o $@ -c $(TEST_CFLAGS) $^
+$(UNIT_TEST_OBJ): %.ot: %.c $(srcdir)/version.h
+	$(QUIET_CC)$(CC) -o $@ -c $(TEST_CFLAGS) $<
 
 clean:
 	$(call QUIET_CLEAN, test)

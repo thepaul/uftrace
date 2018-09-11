@@ -3,6 +3,13 @@
 
 #define compiler_barrier()	asm volatile("" :::"memory")
 
+#if defined(__i386__)
+# define cpu_relax()		asm volatile("rep; nop" ::: "memory")
+# define full_memory_barrier()	asm volatile("mfence" ::: "memory")
+# define read_memory_barrier()  asm volatile("lfence" ::: "memory")
+# define write_memory_barrier()	asm volatile("sfence" ::: "memory")
+#endif
+
 #if defined(__x86_64__)
 # define cpu_relax()		asm volatile("rep; nop" ::: "memory")
 # define full_memory_barrier()	asm volatile("mfence" ::: "memory")
@@ -40,5 +47,6 @@
 #define __alias(func)  __attribute__((alias(#func)))
 #define __maybe_unused  __attribute__((unused))
 #define __noreturn  __attribute__((noreturn))
+#define __align(n)  __attribute__((aligned(n)))
 
 #endif /* UFTRACE_COMPILER_H */

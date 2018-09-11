@@ -2,7 +2,7 @@
 
 from runtest import TestBase
 import subprocess as sp
-import os
+import os, re
 
 TDIR='xxx'
 
@@ -10,6 +10,8 @@ class TestCase(TestBase):
     def __init__(self):
         TestBase.__init__(self, 'getids', """
 {"traceEvents":[
+{"ts":14510734170,"ph":"M","pid":32687,"name":"process_name","args":"{'name': 't-getids'}"},
+{"ts":14510734170,"ph":"M","pid":32687,"name":"thread_name","args":"{'name': 't-getids'}"},
 {"ts":14510734172,"ph":"B","pid":32687,"name":"main"},
 {"ts":14510734172,"ph":"B","pid":32687,"name":"getpid"},
 {"ts":14510734173,"ph":"E","pid":32687,"name":"getpid"},
@@ -55,21 +57,34 @@ class TestCase(TestBase):
             return TestBase.TEST_SKIP
 
         record_cmd = '%s record -k -N %s@kernel -d %s %s' % \
-                     (TestBase.ftrace, 'smp_irq_work_interrupt', TDIR, 't-' + self.name)
+                     (TestBase.uftrace_cmd, 'smp_irq_work_interrupt', TDIR, 't-' + self.name)
         sp.call(record_cmd.split())
         return TestBase.TEST_SUCCESS
 
     def runcmd(self):
-        return '%s dump -k --chrome -d %s' % (TestBase.ftrace, TDIR)
+        return '%s dump -k --chrome -d %s' % (TestBase.uftrace_cmd, TDIR)
 
     def post(self, ret):
         sp.call(['rm', '-rf', TDIR])
         return ret
 
     def fixup(self, cflags, result):
-        return result.replace("""{"ts":14510734172,"ph":"B","pid":32687,"name":"getpid"},
-{"ts":14510734173,"ph":"E","pid":32687,"name":"getpid"},""",
-"""{"ts":14510734172,"ph":"B","pid":32687,"name":"getpid"},
+        result = result.replace("""\
+{"ts":14510734172,"ph":"B","pid":32687,"name":"getpid"},
+{"ts":14510734173,"ph":"E","pid":32687,"name":"getpid"},\
+""",
+"""\
+{"ts":14510734172,"ph":"B","pid":32687,"name":"getpid"},
 {"ts":14510734172,"ph":"B","pid":32687,"name":"sys_getpid"},
 {"ts":14510734172,"ph":"E","pid":32687,"name":"sys_getpid"},
-{"ts":14510734173,"ph":"E","pid":32687,"name":"getpid"},""")
+{"ts":14510734173,"ph":"E","pid":32687,"name":"getpid"},\
+""")
+        uname = os.uname()
+
+        # Linux v4.17 (x86_64) changed syscall routines
+        major, minor, release = uname[2].split('.')
+        if uname[0] == 'Linux' and uname[4] == 'x86_64' and \
+           int(major) >= 4 and int(minor) >= 17:
+            result = re.sub('sys_[a-zA-Z0-9_]+', 'do_syscall_64', result)
+
+        return result

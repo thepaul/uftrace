@@ -13,8 +13,8 @@ uftrace file header: version       = 4
 uftrace file header: header size   = 40
 uftrace file header: endian        = 1 (little)
 uftrace file header: class         = 2 (64 bit)
-uftrace file header: features      = 0x263 (PLTHOOK | TASK_SESSION | SYM_REL_ADDR | MAX_STACK | AUTO_ARGS)
-uftrace file header: info          = 0xbff
+uftrace file header: features      = 0x363 (PLTHOOK | TASK_SESSION | SYM_REL_ADDR | MAX_STACK | PERF_EVENT | AUTO_ARGS)
+uftrace file header: info          = 0x3bff
 
 reading 5186.dat
 58071.916834908   5186: [entry] main(400590) depth: 0
@@ -35,7 +35,7 @@ reading 5188.dat
 """, sort='dump')
 
     def pre(self):
-        record_cmd = '%s record -d %s %s' % (TestBase.ftrace, TDIR, 't-' + self.name)
+        record_cmd = '%s record -d %s %s' % (TestBase.uftrace_cmd, TDIR, 't-' + self.name)
         sp.call(record_cmd.split())
         return TestBase.TEST_SUCCESS
 
@@ -51,7 +51,7 @@ reading 5188.dat
                 pass
         if t == 0:
             return 'FAILED TO FIND TID'
-        return '%s dump -d %s --tid %d' % (TestBase.ftrace, TDIR, t)
+        return '%s dump -d %s --tid %d' % (TestBase.uftrace_cmd, TDIR, t)
 
     def post(self, ret):
         sp.call(['rm', '-rf', TDIR])
@@ -64,5 +64,5 @@ reading 5188.dat
             result = result.replace("2 (64 bit)", "1 (32 bit)")
         p = sp.Popen(['file', 't-' + self.name], stdout=sp.PIPE)
         if 'BuildID' not in p.communicate()[0].decode(errors='ignore'):
-            result = result.replace("0x3ff", "0x3fd")
+            result = result.replace("0xbff", "0xbfd")
         return result

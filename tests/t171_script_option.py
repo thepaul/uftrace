@@ -21,19 +21,28 @@ class TestCase(TestBase):
         TestBase.__init__(self, 'openclose', 'fopen(/dev/null)')
 
     def pre(self):
+        script_cmd = '%s script' % (TestBase.uftrace_cmd)
+        p = sp.Popen(script_cmd.split(), stdout=sp.PIPE, stderr=sp.PIPE)
+        if p.communicate()[1].decode(errors='ignore').startswith('WARN:'):
+            return TestBase.TEST_SKIP
+
         f = open(FILE, 'w')
         f.write(script)
         f.close()
         return TestBase.TEST_SUCCESS
 
     def runcmd(self):
-        uftrace = TestBase.ftrace
+        uftrace = TestBase.uftrace_cmd
         options = '-S ' + FILE
         program = 't-' + self.name
         return '%s %s %s' % (uftrace, options, program)
 
     def sort(self, output):
-        return output.strip().split('\n')[0]
+        i = 0
+        # skip warning for '-finstrument-functions'
+        if output.startswith('uftrace: -A or -R might not work'):
+            i = 1
+        return output.strip().split('\n')[i]
 
     def post(self, ret):
         sp.call(['rm', '-f', FILE])

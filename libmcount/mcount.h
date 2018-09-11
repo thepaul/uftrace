@@ -1,7 +1,7 @@
 /*
  * data structures for handling mcount records
  *
- * Copyright (C) 2014-2017, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
+ * Copyright (C) 2014-2018, LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
  *
  * Released under the GPL v2.
  */
@@ -12,7 +12,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
-#include <limits.h>
 
 #define UFTRACE_DIR_NAME   "uftrace.data"
 
@@ -20,7 +19,7 @@
 #define MCOUNT_DEFAULT_DEPTH   OPT_DEPTH_DEFAULT
 
 #define MCOUNT_NOTRACE_IDX     0x10000
-#define MCOUNT_INVALID_DYNIDX  0xffff
+#define MCOUNT_INVALID_DYNIDX  0xefefefef
 
 enum mcount_rstack_flag {
 	MCOUNT_FL_SETJMP	= (1U << 0),
@@ -35,6 +34,7 @@ enum mcount_rstack_flag {
 	MCOUNT_FL_RETVAL	= (1U << 9),
 	MCOUNT_FL_TRACE		= (1U << 10),
 	MCOUNT_FL_ARGUMENT	= (1U << 11),
+	MCOUNT_FL_READ		= (1U << 12),
 };
 
 struct plthook_data;
@@ -49,10 +49,12 @@ struct mcount_ret_stack {
 	uint64_t start_time;
 	uint64_t end_time;
 	int tid;
-	int filter_depth;
+	unsigned dyn_idx;
 	uint64_t filter_time;
 	unsigned short depth;
-	unsigned short dyn_idx;
+	unsigned short filter_depth;
+	unsigned short nr_events;
+	unsigned short event_idx;
 	struct plthook_data *pd;
 	/* set arg_spec at function entry and use it at exit */
 	struct list_head *pargs;
@@ -79,6 +81,6 @@ struct mcount_shmem_buffer {
 };
 
 /* must be in sync with enum debug_domain (bits) */
-#define DBG_DOMAIN_STR  "TSDFfsKMPER"
+#define DBG_DOMAIN_STR  "TSDFfsKMPERW"
 
 #endif /* UFTRACE_MCOUNT_H */

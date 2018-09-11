@@ -29,7 +29,7 @@ void read_session_map(char *dirname, struct symtabs *symtabs, char *sid)
 {
 	FILE *fp;
 	char buf[PATH_MAX];
-	char *last_libname = NULL;
+	const char *last_libname = symtabs->filename;
 	struct uftrace_mmap **maps = &symtabs->maps;
 
 	snprintf(buf, sizeof(buf), "%s/sid-%.16s.map", dirname, sid);
@@ -38,38 +38,43 @@ void read_session_map(char *dirname, struct symtabs *symtabs, char *sid)
 		pr_err("cannot open maps file: %s", buf);
 
 	while (fgets(buf, sizeof(buf), fp) != NULL) {
-		unsigned long start, end;
+		uint64_t start, end;
 		char prot[5];
 		char path[PATH_MAX];
 		size_t namelen;
 		struct uftrace_mmap *map;
 
 		/* skip anon mappings */
-		if (sscanf(buf, "%lx-%lx %s %*x %*x:%*x %*d %s\n",
+		if (sscanf(buf, "%"PRIx64"-%"PRIx64" %s %*x %*x:%*x %*d %s\n",
 			   &start, &end, prot, path) != 4)
 			continue;
 
-		/* skip non-executable mappings */
-		if (prot[2] != 'x')
+		/* skip the [stack] mapping */
+		if (path[0] == '[') {
+			if (strncmp(path, "[stack", 6) == 0)
+				symtabs->kernel_base = get_kernel_base(buf);
 			continue;
+		}
 
-		/* use first mapping only */
-		if (last_libname && !strcmp(last_libname, path))
+		/* use first mapping only (even if it's non-exec) */
+		if (last_libname && !strcmp(last_libname, path)) {
+			if (symtabs->filename && !strcmp(path, symtabs->filename)) {
+				/* update it only once */
+				if (symtabs->exec_base == 0)
+					symtabs->exec_base = start;
+			}
 			continue;
+		}
 
 		namelen = ALIGN(strlen(path) + 1, 4);
 
-		map = xmalloc(sizeof(*map) + namelen);
+		map = xzalloc(sizeof(*map) + namelen);
 
 		map->start = start;
 		map->end = end;
 		map->len = namelen;
-		map->next = NULL;
+
 		memcpy(map->prot, prot, 4);
-		map->symtab.sym = NULL;
-		map->symtab.sym_names = NULL;
-		map->symtab.nr_sym = 0;
-		map->symtab.nr_alloc = 0;
 		memcpy(map->libname, path, namelen);
 		map->libname[strlen(path)] = '\0';
 		last_libname = map->libname;
@@ -80,23 +85,33 @@ void read_session_map(char *dirname, struct symtabs *symtabs, char *sid)
 	fclose(fp);
 }
 
-static void delete_session_map(struct symtabs *symtabs)
+/**
+ * delete_session_map - free memory mappings in a symtabs
+ * @symtabs: symbol table has the memory mapping
+ *
+ * This function releases mapping data in a symbol table which
+ * was read by read_session_map().
+ */
+void delete_session_map(struct symtabs *symtabs)
 {
 	struct uftrace_mmap *map, *tmp;
 
 	map = symtabs->maps;
 	while (map) {
 		tmp = map->next;
+		unload_symtab(&map->symtab);
 		free(map);
 		map = tmp;
 	}
+
+	symtabs->maps = NULL;
 }
 
 /**
  * create_session - create a new task session from session message
  * @sessions: session link to manage sessions and tasks
- * @msg: ftrace session message read from task file
- * @dirname: ftrace data directory name
+ * @msg: uftrace session message read from task file
+ * @dirname: uftrace data directory name
  * @exename: executable name started this session
  *
  * This function allocates a new session started by a task.  The new
@@ -107,6 +122,7 @@ void create_session(struct uftrace_session_link *sessions,
 		    bool sym_rel_addr)
 {
 	struct uftrace_session *s;
+	struct uftrace_task *t;
 	struct rb_node *parent = NULL;
 	struct rb_node **p = &sessions->root.rb_node;
 
@@ -139,18 +155,25 @@ void create_session(struct uftrace_session_link *sessions,
 	pr_dbg2("new session: pid = %d, session = %.16s\n",
 		s->pid, s->sid);
 
+	s->symtabs.filename = s->exename;
 	s->symtabs.flags = SYMTAB_FL_USE_SYMFILE | SYMTAB_FL_DEMANGLE;
 	if (sym_rel_addr)
 		s->symtabs.flags |= SYMTAB_FL_ADJ_OFFSET;
 
 	read_session_map(dirname, &s->symtabs, s->sid);
 	load_symtabs(&s->symtabs, dirname, s->exename);
-	set_kernel_base(&s->symtabs, s->sid);
 
 	load_module_symtabs(&s->symtabs);
+	load_debug_info(&s->symtabs);
 
 	if (sessions->first == NULL)
 		sessions->first = s;
+
+	t = find_task(sessions, s->tid);
+	if (t) {
+		strncpy(t->comm, basename(exename), sizeof(t->comm));
+		t->comm[sizeof(t->comm) - 1] = '\0';
+	}
 
 	rb_link_node(&s->node, parent, p);
 	rb_insert_color(&s->node, &sessions->root);
@@ -235,7 +258,7 @@ get_session_from_sid(struct uftrace_session_link *sessions, char sid[])
 	while (n) {
 		s = rb_entry(n, struct uftrace_session, node);
 
-		if (!memcmp(s->sid, sid, sizeof(s->sid)) != 0)
+		if (memcmp(s->sid, sid, sizeof(s->sid)) == 0)
 			return s;
 
 		n = rb_next(n);
@@ -291,19 +314,19 @@ void session_add_dlopen(struct uftrace_session *sess, uint64_t timestamp,
 struct sym * session_find_dlsym(struct uftrace_session *sess, uint64_t timestamp,
 				unsigned long addr)
 {
-	struct uftrace_dlopen_list *pos, *udl = NULL;
-	struct sym *sym = NULL;
+	struct uftrace_dlopen_list *pos;
+	struct sym *sym;
 
-	list_for_each_entry(pos, &sess->dlopen_libs, list) {
+	list_for_each_entry_reverse(pos, &sess->dlopen_libs, list) {
 		if (pos->time > timestamp)
-			break;
+			continue;
 
-		udl = pos;
+		sym = find_symtabs(&pos->symtabs, addr);
+		if (sym)
+			return sym;
 	}
-	if (udl)
-		sym = find_symtabs(&udl->symtabs, addr);
 
-	return sym;
+	return NULL;
 }
 
 void delete_session(struct uftrace_session *sess)
@@ -316,8 +339,11 @@ void delete_session(struct uftrace_session *sess)
 		free(udl);
 	}
 
+	finish_debug_info(&sess->symtabs);
 	unload_symtabs(&sess->symtabs);
 	delete_session_map(&sess->symtabs);
+	uftrace_cleanup_filter(&sess->filters);
+	uftrace_cleanup_filter(&sess->fixups);
 	free(sess);
 }
 
@@ -449,16 +475,24 @@ void create_task(struct uftrace_session_link *sessions,
 	t->tid = msg->tid;
 	t->ppid = fork ? msg->pid : 0;
 	t->sref_last = NULL;
+	t->comm[0] = '\0';
 
 	if (needs_session) {
 		s = find_task_session(sessions, msg->pid, msg->time);
 		add_session_ref(t, s, msg->time);
+		if (s) {
+			strncpy(t->comm, basename(s->exename), sizeof(t->comm));
+			t->comm[sizeof(t->comm) - 1] = '\0';
+		}
 
-		pr_dbg2("new task: tid = %d, session = %-.16s\n",
-			t->tid, s ? s->sid : "unknown");
+		pr_dbg2("new task: tid = %d (%.*s), session = %-.16s\n",
+			t->tid, sizeof(t->comm), s ? t->comm : "unknown",
+			s ? s->sid : "unknown");
 	}
-	else
+	else {
+		memset(&t->sref, 0, sizeof(t->sref));
 		pr_dbg2("new task: tid = %d\n", t->tid);
+	}
 
 	rb_link_node(&t->node, parent, p);
 	rb_insert_color(&t->node, &sessions->tasks);
@@ -563,6 +597,8 @@ struct sym * task_find_sym(struct uftrace_session_link *sessions,
 
 	if (sess == NULL)
 		sess = find_task_session(sessions, task->t->pid, rec->time);
+	if (sess == NULL)
+		sess = find_task_session(sessions, task->t->ppid, rec->time);
 
 	if (sess == NULL && is_kernel_record(task, rec))
 		sess = sessions->first;
@@ -599,6 +635,8 @@ struct sym * task_find_sym_addr(struct uftrace_session_link *sessions,
 
 	if (sess == NULL)
 		sess = find_task_session(sessions, task->t->pid, time);
+	if (sess == NULL)
+		sess = find_task_session(sessions, task->t->ppid, time);
 
 	if (sess == NULL) {
 		struct uftrace_session *fsess = sessions->first;
@@ -619,7 +657,9 @@ struct sym * task_find_sym_addr(struct uftrace_session_link *sessions,
 #ifdef UNIT_TEST
 
 static struct uftrace_session_link test_sessions;
-static const char session_map[] = "00400000-00401000 r-xp 00000000 08:03 4096 unittest\n";
+static const char session_map[] =
+	"00400000-00401000 r-xp 00000000 08:03 4096 unittest\n"
+	"bfff0000-bffff000 rw-p 00000000 08:03 4096 [stack]\n";
 
 TEST_CASE(session_search)
 {
@@ -641,7 +681,7 @@ TEST_CASE(session_search)
 		int fd;
 
 		fd = creat("sid-test.map", 0400);
-		write(fd, session_map, sizeof(session_map)-1);
+		write_all(fd, session_map, sizeof(session_map)-1);
 		close(fd);
 		create_session(&test_sessions, &msg, ".", "unittest", false);
 		remove("sid-test.map");
@@ -694,7 +734,7 @@ TEST_CASE(task_search)
 		};
 
 		fd = creat("sid-initial.map", 0400);
-		write(fd, session_map, sizeof(session_map)-1);
+		write_all(fd, session_map, sizeof(session_map)-1);
 		close(fd);
 		create_session(&test_sessions, &smsg, ".", "unittest", false);
 		create_task(&test_sessions, &tmsg, false, true);
@@ -798,7 +838,7 @@ TEST_CASE(task_search)
 		};
 
 		fd = creat("sid-after_exec.map", 0400);
-		write(fd, session_map, sizeof(session_map)-1);
+		write_all(fd, session_map, sizeof(session_map)-1);
 		close(fd);
 		create_session(&test_sessions, &smsg, ".", "unittest", false);
 		create_task(&test_sessions, &tmsg, false, true);
@@ -912,7 +952,7 @@ TEST_CASE(task_symbol)
 
 	fp = fopen("sid-test.map", "w");
 	TEST_NE(fp, NULL);
-	fprintf(fp, "00400000-00401000 r-xp 00000000 08:03 4096 unittest\n");
+	fprintf(fp, "%s", session_map);
 	fclose(fp);
 
 	fp = fopen("unittest.sym", "w");
@@ -954,15 +994,11 @@ TEST_CASE(task_symbol_dlopen)
 		.sid = "test",
 		.namelen = 8,  /* = strlen("unittest") */
 	};
-	struct ftrace_task_handle task = {
-		.tid = 1,
-	};
 	FILE *fp;
-	struct uftrace_dlopen_list *udl;
 
 	fp = fopen("sid-test.map", "w");
 	TEST_NE(fp, NULL);
-	fprintf(fp, "00400000-00401000 r-xp 00000000 08:03 4096 unittest\n");
+	fprintf(fp, "%s", session_map);
 	fclose(fp);
 
 	fp = fopen("libuftrace-test.so.0.sym", "w");

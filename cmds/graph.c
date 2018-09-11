@@ -10,7 +10,10 @@
 #include "utils/symbol.h"
 #include "utils/filter.h"
 #include "utils/fstack.h"
+#include "utils/field.h"
+#include "utils/graph.h"
 
+static LIST_HEAD(output_fields);
 
 struct graph_backtrace {
 	struct list_head list;
@@ -20,69 +23,122 @@ struct graph_backtrace {
 	uint64_t addr[];
 };
 
-struct graph_node {
-	uint64_t addr;
-	int nr_edges;
-	int nr_calls;
-	uint64_t time;
-	uint64_t child_time;
-	struct list_head head;
-	struct list_head list;
-	struct graph_node *parent;
-};
-
-enum node_type {
-	NODE_T_NORMAL,
-	NODE_T_FORK,
-	NODE_T_EXEC,
-};
-
-struct special_node {
-	struct list_head list;
-	struct graph_node *node;
-	enum node_type type;
-	int pid;
-};
-
-struct uftrace_graph {
-	char *func;
-	bool kernel_only;
-	struct uftrace_session *sess;
-	struct uftrace_graph *next;
+struct session_graph {
+	struct uftrace_graph ug;
 	struct graph_backtrace *bt_curr;
 	struct list_head bt_list;
-	struct list_head special_nodes;
-	struct graph_node root;
+	struct session_graph *next;
+	char *func;
 };
 
 struct task_graph {
-	int enabled;
-	bool lost;
-	bool new_sess;
-	struct ftrace_task_handle *task;
-	struct uftrace_graph *graph_last;
-	struct uftrace_graph *graph;
-	struct graph_node *node;
+	struct uftrace_task_graph utg;
 	struct graph_backtrace *bt_curr;
-	struct rb_node link;
+	int enabled;
 };
 
 static bool full_graph = false;
-static struct rb_root tasks = RB_ROOT;
-static struct uftrace_graph *graph_list = NULL;
+static struct session_graph *graph_list = NULL;
+
+static void print_total_time(struct field_data *fd)
+{
+	struct uftrace_graph_node *node = fd->arg;
+	uint64_t d;
+
+	d = node->time;
+
+	print_time_unit(d);
+}
+
+static void print_self_time(struct field_data *fd)
+{
+	struct uftrace_graph_node *node = fd->arg;
+	uint64_t d;
+
+	d = node->time - node->child_time;
+
+	print_time_unit(d);
+}
+
+static void print_addr(struct field_data *fd)
+{
+	struct uftrace_graph_node *node = fd->arg;
+
+	/* uftrace records (truncated) 48-bit addresses */
+	int width = sizeof(long) == 4 ? 8 : 12;
+
+	pr_out("%*lx", width, node->addr);
+}
+
+static struct display_field field_total_time= {
+	.id      = GRAPH_F_TOTAL_TIME,
+	.name    = "total-time",
+	.alias   = "total",
+	.header  = "TOTAL TIME",
+	.length  = 10,
+	.print   = print_total_time,
+	.list    = LIST_HEAD_INIT(field_total_time.list),
+};
+
+static struct display_field field_self_time= {
+	.id      = GRAPH_F_SELF_TIME,
+	.name    = "self-time",
+	.alias   = "self",
+	.header  = " SELF TIME",
+	.length  = 10,
+	.print   = print_self_time,
+	.list    = LIST_HEAD_INIT(field_self_time.list),
+};
+
+static struct display_field field_addr = {
+	.id      = GRAPH_F_ADDR,
+	.name    = "address",
+	.alias   = "addr",
+#if __SIZEOF_LONG == 4
+	.header  = "  ADDR  ",
+	.length  = 8,
+#else
+	.header  = "   ADDRESS  ",
+	.length  = 12,
+#endif
+	.print   = print_addr,
+	.list    = LIST_HEAD_INIT(field_addr.list),
+};
+
+/* index of this table should be matched to display_field_id */
+static struct display_field *field_table[] = {
+	&field_total_time,
+	&field_self_time,
+	&field_addr,
+};
+
+static void setup_default_field(struct list_head *fields, struct opts *opts)
+{
+	add_field(fields, field_table[GRAPH_F_TOTAL_TIME]);
+}
+
+static void print_field(struct uftrace_graph_node *node)
+{
+	struct field_data fd = {
+		.arg = node,
+	};
+
+	if (print_field_data(&output_fields, &fd, 2))
+		pr_out(" : ");
+}
 
 static int create_graph(struct uftrace_session *sess, void *func)
 {
-	struct uftrace_graph *graph = xcalloc(1, sizeof(*graph));
+	struct session_graph *graph = xzalloc(sizeof(*graph));
 
 	pr_dbg("create graph for session %.*s (%s)\n",
 	       SESSION_ID_LEN, sess->sid, sess->exename);
 
-	graph->sess = sess;
 	graph->func = xstrdup(full_graph ? basename(sess->exename) : func);
-	INIT_LIST_HEAD(&graph->root.head);
 	INIT_LIST_HEAD(&graph->bt_list);
-	INIT_LIST_HEAD(&graph->special_nodes);
+
+	graph_init(&graph->ug, sess);
+	graph->ug.root.name = graph->func;
 
 	graph->next = graph_list;
 	graph_list = graph;
@@ -93,13 +149,13 @@ static int create_graph(struct uftrace_session *sess, void *func)
 static void setup_graph_list(struct ftrace_file_handle *handle, struct opts *opts,
 			     char *func)
 {
-	struct uftrace_graph *graph;
+	struct session_graph *graph;
 
 	walk_sessions(&handle->sessions, create_graph, func);
 
 	graph = graph_list;
 	while (graph) {
-		graph->kernel_only = opts->kernel_only;
+		graph->ug.kernel_only = opts->kernel_only;
 		graph = graph->next;
 	}
 }
@@ -107,13 +163,15 @@ static void setup_graph_list(struct ftrace_file_handle *handle, struct opts *opt
 static struct uftrace_graph * get_graph(struct ftrace_task_handle *task,
 					uint64_t time, uint64_t addr)
 {
-	struct uftrace_graph *graph;
+	struct session_graph *graph;
 	struct uftrace_session_link *sessions = &task->h->sessions;
 	struct uftrace_session *sess;
 
 	sess = find_task_session(sessions, task->tid, time);
 	if (sess == NULL)
 		sess = find_task_session(sessions, task->t->pid, time);
+	if (sess == NULL)
+		sess = find_task_session(sessions, task->t->ppid, time);
 
 	if (sess == NULL) {
 		struct uftrace_session *fsess = sessions->first;
@@ -126,8 +184,8 @@ static struct uftrace_graph * get_graph(struct ftrace_task_handle *task,
 
 	graph = graph_list;
 	while (graph) {
-		if (graph->sess == sess)
-			return graph;
+		if (graph->ug.sess == sess)
+			return &graph->ug;
 
 		graph = graph->next;
 	}
@@ -139,43 +197,21 @@ static int start_graph(struct task_graph *tg);
 static struct task_graph * get_task_graph(struct ftrace_task_handle *task,
 					  uint64_t time, uint64_t addr)
 {
-	struct rb_node *parent = NULL;
-	struct rb_node **p = &tasks.rb_node;
 	struct task_graph *tg;
-	bool new_graph = false;
+	struct uftrace_graph *graph;
 
-	while (*p) {
-		parent = *p;
-		tg = rb_entry(parent, struct task_graph, link);
+	tg = (struct task_graph *)graph_get_task(task, sizeof(*tg));
 
-		if (tg->task->tid == task->tid)
-			goto out;
+	graph = get_graph(task, time, addr);
 
-		if (tg->task->tid > task->tid)
-			p = &parent->rb_left;
-		else
-			p = &parent->rb_right;
-	}
-
-	tg = xzalloc(sizeof(*tg));
-	tg->task = task;
-
-	new_graph = true;
-
-	rb_link_node(&tg->link, parent, p);
-	rb_insert_color(&tg->link, &tasks);
-
-out:
-	tg->graph = get_graph(task, time, addr);
-
-	if (tg->graph_last && tg->graph != tg->graph_last) {
+	if (tg->utg.graph && tg->utg.graph != graph) {
 		pr_dbg("detect new session: %.*s\n",
-		       SESSION_ID_LEN, tg->graph->sess->sid);
-		tg->new_sess = true;
+		       SESSION_ID_LEN, graph->sess->sid);
+		tg->utg.new_sess = true;
 	}
-	tg->graph_last = tg->graph;
+	tg->utg.graph = graph;
 
-	if (full_graph && new_graph)
+	if (full_graph && tg->utg.node == NULL)
 		start_graph(tg);
 
 	return tg;
@@ -185,12 +221,14 @@ static int save_backtrace_addr(struct task_graph *tg)
 {
 	int i;
 	int skip = 0;
-	int len = tg->task->stack_count;
-	uint64_t addrs[len];
 	struct graph_backtrace *bt;
+	struct ftrace_task_handle *task = tg->utg.task;
+	struct session_graph *graph = (struct session_graph *)tg->utg.graph;
+	int len = task->stack_count;
+	uint64_t addrs[len];
 
-	if (tg->graph->kernel_only) {
-		skip = tg->task->user_stack_count;
+	if (graph->ug.kernel_only) {
+		skip = task->user_stack_count;
 		len -= skip;
 	}
 
@@ -198,9 +236,9 @@ static int save_backtrace_addr(struct task_graph *tg)
 		return 0;
 
 	for (i = len - 1; i >= 0; i--)
-		addrs[i] = tg->task->func_stack[i + skip].addr;
+		addrs[i] = task->func_stack[i + skip].addr;
 
-	list_for_each_entry(bt, &tg->graph->bt_list, list) {
+	list_for_each_entry(bt, &graph->bt_list, list) {
 		if (len == bt->len &&
 		    !memcmp(addrs, bt->addr, len * sizeof(*addrs)))
 			goto found;
@@ -213,7 +251,7 @@ static int save_backtrace_addr(struct task_graph *tg)
 	bt->time = 0;
 	memcpy(bt->addr, addrs, len * sizeof(*addrs));
 
-	list_add(&bt->list, &tg->graph->bt_list);
+	list_add(&bt->list, &graph->bt_list);
 
 found:
 	bt->hit++;
@@ -224,7 +262,8 @@ found:
 
 static void save_backtrace_time(struct task_graph *tg)
 {
-	struct fstack *fstack = &tg->task->func_stack[tg->task->stack_count];
+	struct ftrace_task_handle *task = tg->utg.task;
+	struct fstack *fstack = &task->func_stack[task->stack_count];
 
 	if (tg->bt_curr)
 		tg->bt_curr->time += fstack->total_time;
@@ -232,7 +271,7 @@ static void save_backtrace_time(struct task_graph *tg)
 	tg->bt_curr = NULL;
 }
 
-static int print_backtrace(struct uftrace_graph *graph)
+static int print_backtrace(struct session_graph *graph)
 {
 	int i = 0, k;
 	struct graph_backtrace *bt;
@@ -245,9 +284,9 @@ static int print_backtrace(struct uftrace_graph *graph)
 		pr_out("\n");
 
 		for (k = 0; k < bt->len; k++) {
-			sym = find_symtabs(&graph->sess->symtabs, bt->addr[k]);
+			sym = find_symtabs(&graph->ug.sess->symtabs, bt->addr[k]);
 			if (sym == NULL)
-				sym = session_find_dlsym(graph->sess,
+				sym = session_find_dlsym(graph->ug.sess,
 							 bt->time, bt->addr[k]);
 
 			symname = symbol_getname(sym, bt->addr[k]);
@@ -265,11 +304,11 @@ static int start_graph(struct task_graph *tg)
 	if (!tg->enabled++) {
 		save_backtrace_addr(tg);
 
-		pr_dbg("start graph for task %d\n", tg->task->tid);
+		pr_dbg("start graph for task %d\n", tg->utg.task->tid);
 
-		tg->node = &tg->graph->root;
-		tg->node->addr = tg->task->rstack->addr;
-		tg->node->nr_calls++;
+		tg->utg.node = &tg->utg.graph->root;
+		tg->utg.node->addr = tg->utg.task->rstack->addr;
+		tg->utg.node->nr_calls++;
 	}
 
 	return 0;
@@ -282,159 +321,12 @@ static int end_graph(struct task_graph *tg)
 
 	if (!--tg->enabled) {
 		save_backtrace_time(tg);
-		tg->lost = false;
+		tg->utg.lost = false;
 
-		pr_dbg("end graph for task %d\n", tg->task->tid);
+		pr_dbg("end graph for task %d\n", tg->utg.task->tid);
 	}
 
 	return 0;
-}
-
-static int add_graph_entry(struct task_graph *tg)
-{
-	struct graph_node *node = NULL;
-	struct graph_node *curr = tg->node;
-	struct uftrace_record *rstack = tg->task->rstack;
-
-	if (tg->lost)
-		return 1;  /* ignore kernel functions after LOST */
-
-	if (tg->new_sess) {
-		curr = &tg->graph->root;
-		tg->new_sess = false;
-	}
-
-	if (curr == NULL)
-		return -1;
-
-	list_for_each_entry(node, &curr->head, list) {
-		if (node->addr == rstack->addr)
-			break;
-	}
-
-	if (list_no_entry(node, &curr->head, list)) {
-		struct uftrace_trigger tr;
-		struct uftrace_session *sess = tg->graph->sess;
-
-		node = xcalloc(1, sizeof(*node));
-
-		node->addr = rstack->addr;
-		INIT_LIST_HEAD(&node->head);
-
-		node->parent = curr;
-		list_add_tail(&node->list, &node->parent->head);
-		node->parent->nr_edges++;
-
-		if (uftrace_match_filter(node->addr, &sess->fixups, &tr)) {
-			struct sym *sym;
-			struct special_node *snode;
-			enum node_type type = NODE_T_NORMAL;
-
-			sym = find_symtabs(&sess->symtabs, node->addr);
-			if (sym == NULL)
-				goto out;
-
-			if (!strcmp(sym->name, "fork") ||
-			    !strcmp(sym->name, "vfork") ||
-			    !strcmp(sym->name, "daemon"))
-				type = NODE_T_FORK;
-			else if (!strncmp(sym->name, "exec", 4))
-				type = NODE_T_EXEC;
-			else
-				goto out;
-
-			snode = xmalloc(sizeof(*snode));
-			snode->node = node;
-			snode->type = type;
-			snode->pid  = tg->task->t->pid;
-
-			/* find recent one first */
-			list_add(&snode->list, &tg->graph->special_nodes);
-		}
-	}
-
-out:
-	node->nr_calls++;
-	tg->node = node;
-
-	return 0;
-}
-
-static int add_graph_exit(struct task_graph *tg)
-{
-	struct fstack *fstack = &tg->task->func_stack[tg->task->stack_count];
-	struct graph_node *node = tg->node;
-
-	if (node == NULL)
-		return -1;
-
-	if (tg->lost) {
-		if (is_kernel_address(&tg->task->h->sessions.first->symtabs,
-				      fstack->addr))
-			return 1;
-
-		/*
-		 * LOST only occures in kernel, so clear tg->lost
-		 * when return to userspace
-		 */
-		tg->lost = false;
-	}
-
-	if (node->addr != fstack->addr) {
-		struct special_node *snode, *tmp;
-
-		list_for_each_entry_safe(snode, tmp, &tg->graph->special_nodes, list) {
-			if (snode->node->addr == tg->task->rstack->addr &&
-			    snode->type == NODE_T_FORK &&
-			    snode->pid == tg->task->t->ppid) {
-				node = snode->node;
-				list_del(&snode->list);
-				pr_dbg("recover from fork\n");
-				goto out;
-			}
-		}
-		pr_dbg("broken graph - addresses not match\n");
-	}
-
-out:
-	node->time       += fstack->total_time;
-	node->child_time += fstack->child_time;
-
-	tg->node = node->parent;
-
-	return 0;
-}
-
-static int add_graph_event(struct task_graph *tg)
-{
-	struct uftrace_record *rec = tg->task->rstack;
-
-	if (rec->addr == EVENT_ID_PERF_SCHED_OUT) {
-		/* to match addr with sched-in */
-		rec->addr = EVENT_ID_PERF_SCHED_IN;
-		return add_graph_entry(tg);
-	}
-	else if (rec->addr == EVENT_ID_PERF_SCHED_IN) {
-		return add_graph_exit(tg);
-	}
-
-	return -1;
-}
-
-static int add_graph(struct task_graph *tg, int type)
-{
-	pr_dbg2("add graph (enabled: %d) %s\n", tg->enabled,
-		type == UFTRACE_ENTRY ? "ENTRY" :
-		type == UFTRACE_EXIT  ? "EXIT"  : "EVENT");
-
-	if (type == UFTRACE_ENTRY)
-		return add_graph_entry(tg);
-	else if (type == UFTRACE_EXIT)
-		return add_graph_exit(tg);
-	else if (type == UFTRACE_EVENT)
-		return add_graph_event(tg);
-	else
-		return 0;
 }
 
 static void pr_indent(bool *indent_mask, int indent, bool line)
@@ -464,33 +356,25 @@ static void pr_indent(bool *indent_mask, int indent, bool line)
 }
 
 static void print_graph_node(struct uftrace_graph *graph,
-			     struct graph_node *node, bool *indent_mask,
+			     struct uftrace_graph_node *node,
+			     bool *indent_mask,
 			     int indent, bool needs_line)
 {
-	struct sym *sym;
-	char *symname;
-	struct graph_node *parent = node->parent;
-	struct graph_node *child;
+	char *symname = node->name;
+	struct uftrace_graph_node *parent = node->parent;
+	struct uftrace_graph_node *child;
 	int orig_indent = indent;
-	static struct sym sched_sym = {
-		.name = "linux:schedule",
-	};
 
 	/* XXX: what if it clashes with existing function address */
 	if (node->addr == EVENT_ID_PERF_SCHED_IN)
-		sym = &sched_sym;
-	else
-		sym = find_symtabs(&graph->sess->symtabs, node->addr);
+		symname = "linux:schedule";
 
-	symname = symbol_getname(sym, node->addr);
-
-	pr_out(" ");
-	print_time_unit(node->time);
-	pr_out(" : ");
+	print_field(node);
 	pr_indent(indent_mask, indent, needs_line);
 
+	/* FIXME: it should count fork+exec properly */
 	if (full_graph && node == &graph->root)
-		pr_out("(%d) %s\n", 1, graph->func);
+		pr_out("(%d) %s\n", 1, symname);
 	else
 		pr_out("(%d) %s\n", node->nr_calls, symname);
 
@@ -510,7 +394,8 @@ static void print_graph_node(struct uftrace_graph *graph,
 
 		if (&child->list != node->head.prev) {
 			/* print blank line between siblings */
-			pr_out("%*s: ", 12, "");
+			if (print_empty_field(&output_fields, 2))
+				pr_out(" : ");
 			pr_indent(indent_mask, indent, false);
 			pr_out("\n");
 		}
@@ -518,32 +403,33 @@ static void print_graph_node(struct uftrace_graph *graph,
 
 	indent_mask[orig_indent] = false;
 	pr_dbg2("del mask (%d) for %s\n", orig_indent, symname);
-
-	symbol_putname(sym, symname);
 }
 
-static int print_graph(struct uftrace_graph *graph, struct opts *opts)
+static int print_graph(struct session_graph *graph, struct opts *opts)
 {
 	bool *indent_mask;
 
 	/* skip empty graph */
-	if (list_empty(&graph->bt_list) && graph->root.time == 0 &&
-	    graph->root.nr_edges == 0)
+	if (list_empty(&graph->bt_list) && graph->ug.root.time == 0 &&
+	    graph->ug.root.nr_edges == 0)
 		return 0;
 
 	pr_out("# Function Call Graph for '%s' (session: %.16s)\n",
-	       graph->func, graph->sess->sid);
+	       graph->func, graph->ug.sess->sid);
 
 	if (!full_graph && !list_empty(&graph->bt_list)) {
 		pr_out("=============== BACKTRACE ===============\n");
 		print_backtrace(graph);
 	}
 
-	if (graph->root.time || graph->root.nr_edges) {
+	setup_field(&output_fields, opts, &setup_default_field, field_table, ARRAY_SIZE(field_table));
+
+	if (graph->ug.root.time || graph->ug.root.nr_edges) {
 		pr_out("========== FUNCTION CALL GRAPH ==========\n");
+		print_header(&output_fields, "# ", 2);
 		indent_mask = xcalloc(opts->max_stack, sizeof(*indent_mask));
-		print_graph_node(graph, &graph->root, indent_mask, 0,
-				 graph->root.nr_edges > 1);
+		print_graph_node(&graph->ug, &graph->ug.root, indent_mask, 0,
+				 graph->ug.root.nr_edges > 1);
 		free(indent_mask);
 		pr_out("\n");
 	}
@@ -558,19 +444,25 @@ static void build_graph_node(struct ftrace_task_handle *task, uint64_t time,
 	char *name;
 
 	tg = get_task_graph(task, time, addr);
-	if (tg->enabled)
-		add_graph(tg, type);
+
+	sym = find_symtabs(&tg->utg.graph->sess->symtabs, addr);
+	if (sym == NULL)
+		sym = session_find_dlsym(tg->utg.graph->sess, time, addr);
+
+	name = symbol_getname(sym, addr);
+
+	if (tg->enabled) {
+		graph_add_node(&tg->utg, type, name,
+			       sizeof(struct uftrace_graph_node));
+	}
 
 	/* cannot find a session for this record */
-	if (tg->graph == NULL)
-		return;
+	if (tg->utg.graph == NULL)
+		goto out;
 	if (type == UFTRACE_EVENT)
-		return;
+		goto out;
 	if (full_graph)
-		return;
-
-	sym = find_symtabs(&tg->graph->sess->symtabs, addr);
-	name = symbol_getname(sym, addr);
+		goto out;
 
 	if (!strcmp(name, func)) {
 		if (type == UFTRACE_ENTRY)
@@ -579,6 +471,7 @@ static void build_graph_node(struct ftrace_task_handle *task, uint64_t time,
 			end_graph(tg);
 	}
 
+out:
 	symbol_putname(sym, name);
 }
 
@@ -586,7 +479,7 @@ static void build_graph(struct opts *opts, struct ftrace_file_handle *handle,
 		       char *func)
 {
 	struct ftrace_task_handle *task;
-	struct uftrace_graph *graph;
+	struct session_graph *graph;
 	uint64_t prev_time = 0;
 	int i;
 
@@ -595,24 +488,13 @@ static void build_graph(struct opts *opts, struct ftrace_file_handle *handle,
 	while (!read_rstack(handle, &task) && !uftrace_done) {
 		struct uftrace_record *frs = task->rstack;
 
-		/* skip user functions if --kernel-only is set */
-		if (opts->kernel_only && !is_kernel_record(task, frs))
+		if (!fstack_check_opts(task, opts))
 			continue;
-
-		if (opts->kernel_skip_out) {
-			/* skip kernel functions outside user functions */
-			if (!task->user_stack_count &&
-			    is_kernel_record(task, frs))
-				continue;
-		}
 
 		if (!fstack_check_filter(task))
 			continue;
 
 		if (frs->type == UFTRACE_EVENT) {
-			if (!task->user_stack_count && opts->event_skip_out)
-				continue;
-
 			if (frs->addr != EVENT_ID_PERF_SCHED_IN &&
 			    frs->addr != EVENT_ID_PERF_SCHED_OUT)
 				continue;
@@ -648,10 +530,10 @@ static void build_graph(struct opts *opts, struct ftrace_file_handle *handle,
 			fsess = task->h->sessions.first;
 			tg = get_task_graph(task, prev_time,
 					    fsess->symtabs.kernel_base + 1);
-			tg->lost = true;
+			tg->utg.lost = true;
 
 			if (tg->enabled && is_kernel_address(&fsess->symtabs,
-							     tg->node->addr))
+							     tg->utg.node->addr))
 				pr_dbg("not returning to user after LOST\n");
 
 			continue;
@@ -711,11 +593,11 @@ static void build_graph(struct opts *opts, struct ftrace_file_handle *handle,
 	/* account execution time of each graph */
 	graph = graph_list;
 	while (graph) {
-		struct graph_node *node;
+		struct uftrace_graph_node *node;
 
-		list_for_each_entry(node, &graph->root.head, list) {
-			graph->root.time += node->time;
-			graph->root.child_time += node->time;
+		list_for_each_entry(node, &graph->ug.root.head, list) {
+			graph->ug.root.time += node->time;
+			graph->ug.root.child_time += node->time;
 		}
 
 		graph = graph->next;
@@ -762,14 +644,15 @@ int command_graph(int argc, char *argv[], struct opts *opts)
 {
 	int ret;
 	struct ftrace_file_handle handle;
-	struct uftrace_graph *graph;
+	struct session_graph *graph;
 	char *func;
+	struct graph_backtrace *bt, *btmp;
 
 	__fsetlocking(outfp, FSETLOCKING_BYCALLER);
 	__fsetlocking(logfp, FSETLOCKING_BYCALLER);
 
-	if (opts->idx)
-		func = argv[opts->idx];
+	if (argc > 0)
+		func = argv[0];
 	else {
 		func = "_start";
 		full_graph = true;
@@ -805,6 +688,20 @@ int command_graph(int argc, char *argv[], struct opts *opts)
 		if (opts_has_filter(opts))
 			pr_out("\t please check your filter settings.\n");
 	}
+
+	while (graph_list) {
+		graph = graph_list;
+		graph_list = graph->next;
+
+		free(graph->func);
+		list_for_each_entry_safe(bt, btmp, &graph->bt_list, list) {
+			list_del(&bt->list);
+			free(bt);
+		}
+		graph_destroy(&graph->ug);
+		free(graph);
+	}
+	graph_remove_task();
 
 	close_data_file(opts, &handle);
 

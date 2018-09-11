@@ -17,16 +17,23 @@ usage() {
   --mandir=<DIR>        set manual doc install dir as <DIR>  (default: \${prefix}/share/man)
   --objdir=<DIR>        set build dir as <DIR>               (default: \${PWD})
   --sysconfdir=<DIR>    override the etc dir as <DIR>
+
   --with-elfutils=<DIR> search for elfutils in <DIR>/include and <DIR>/lib
+
+  --without-libelf      build without libelf (and libdw)     (even if found on the system)
+  --without-libdw       build without libdw                  (even if found on the system)
+  --without-libstdc++   build without libstdc++              (even if found on the system)
+  --without-libpython   build without libpython2.7           (even if found on the system)
+  --without-libncurses  build without libncursesw            (even if found on the system)
 
   -p                    preserve old setting
 
   Some influential environment variables:
-    ARCH           Target architecture    e.g. arm, aarch64, or x86_64
-    CROSS_COMPILE  Specify the compiler prefix during compilation
-                   e.g. CC is overridden by \$(CROSS_COMPILE)gcc
-    CFLAGS         C compiler flags
-    LDFLAGS        linker flags
+    ARCH                Target architecture    e.g. arm, aarch64, or x86_64
+    CROSS_COMPILE       Specify the compiler prefix during compilation
+                        e.g. CC is overridden by \$(CROSS_COMPILE)gcc
+    CFLAGS              C compiler flags
+    LDFLAGS             linker flags
 "
     exit 1
 }
@@ -47,15 +54,18 @@ preserve() {
     fi
 }
 
+IGNORE=
 while getopts ":ho:-:p" opt; do
     case "$opt" in
         -)
 	    # process --long-options
 	    case "$OPTARG" in
-                help)  usage ;;
-                *=*)   opt=${OPTARG%%=*}; val=${OPTARG#*=}
-                       eval "${opt/-/_}='$val'" ;;
-                *)     ;;
+                help)            usage ;;
+                without-libelf)  IGNORE="${IGNORE} libelf libdw" ;;
+                without-*)       IGNORE="${IGNORE} ${OPTARG#*-}" ;;
+                *=*)             opt=${OPTARG%%=*}; val=${OPTARG#*=}
+                                 eval "${opt/-/_}='$val'" ;;
+                *)               ;;
             esac
 	    ;;
         o)       output=$OPTARG ;;
@@ -113,11 +123,56 @@ export CC CFLAGS LD LDFLAGS
 make -siC ${srcdir}/check-deps check-clean
 make -siC ${srcdir}/check-deps check-build
 
-if [ ! -e ${srcdir}/check-deps/have_libelf ] && [ ! -f ${with_elfutils}/lib/libelf.so ]; then
-    echo "Error: cannot find 'libelf' (from elfutils): Please install it first."
-    echo "Otherwise, please install it using \"misc/install-elfutils.sh\" script."
-    exit 1
-fi
+for dep in $IGNORE; do
+    TARGET=
+    case "$dep" in
+        libelf)      TARGET=have_libelf        ;;
+        libdw)       TARGET=have_libdw         ;;
+        libpython*)  TARGET=have_libpython2.7  ;;
+        libncurse*)  TARGET=have_libncurses    ;;
+        libstdc++)   TARGET=cxa_demangle       ;;
+        perf*)       TARGET=perf_clockid       ;;
+        sched*)      TARGET=perf_context_switch;;
+        *)           ;;
+    esac
+    if [ ! -z "$TARGET" ]; then
+        rm -f ${srcdir}/check-deps/$TARGET
+    fi
+done
+
+echo "uftrace detected system features:"
+
+print_feature()
+{
+    item=$1
+    file=$2
+    description=$3
+
+    if [ -t 1 ]; then
+        # use colored output only when stdout is tty
+        if [ -f ${srcdir}/check-deps/${file} ]; then
+            onoff="\033[32mon \033[0m"
+        else
+            onoff="\033[91mOFF\033[0m"
+        fi
+    else
+        if [ -f ${srcdir}/check-deps/${file} ]; then
+            onoff="on "
+        else
+            onoff="OFF"
+        fi
+    fi
+    printf "...%15s: [ ${onoff} ] - %s\n" "${item}" "${description}"
+}
+
+printf "...%15s: %s\n" "prefix" "${prefix}"
+print_feature "libelf" "have_libelf" "more flexible ELF data handling"
+print_feature "libdw" "have_libdw" "DWARF debug info support"
+print_feature "libpython2.7" "have_libpython2.7" "python scripting support"
+print_feature "libncursesw" "have_libncurses" "TUI support"
+print_feature "cxa_demangle" "cxa_demangle" "full demangler support with libstdc++"
+print_feature "perf_event" "perf_clockid" "perf (PMU) event support"
+print_feature "schedule" "perf_context_switch" "scheduler event support"
 
 cat >$output <<EOF
 # this file is generated automatically
@@ -163,11 +218,11 @@ all: prepare
 	@\$(MAKE) -C \$(srcdir)
 
 clean:
-	@rm -rf arch libmcount libtraceevent utils
+	@rm -rf cmds arch libmcount libtraceevent utils misc
 	@rm -f uftrace version.h *.o *.op
 
 prepare:
-	@mkdir -p arch/\$(ARCH) libmcount libtraceevent utils
+	@mkdir -p cmds arch/\$(ARCH) libmcount libtraceevent utils misc
 
 install:
 	@\$(MAKE) -C \$(srcdir) install

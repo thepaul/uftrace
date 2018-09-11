@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <signal.h>
+#include <glob.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -17,7 +18,7 @@
 #include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/epoll.h>
-#include <fnmatch.h>
+#include <sys/personality.h>
 
 #include "uftrace.h"
 #include "libmcount/mcount.h"
@@ -56,6 +57,7 @@ static bool buf_done;
 static int thread_ctl[2];
 
 static bool has_perf_event;
+static bool has_sched_event;
 
 
 static bool can_use_fast_libmcount(struct opts *opts)
@@ -88,35 +90,79 @@ static char *build_debug_domain_string(void)
 	return domain;
 }
 
-static void setup_child_environ(struct opts *opts, int pfd)
+char * get_libmcount_path(struct opts *opts)
 {
-	char buf[4096];
-	char *old_preload, *old_libpath;
+	char *libmcount, *lib = xmalloc(PATH_MAX);
 	bool must_use_multi_thread = check_libpthread(opts->exename);
 
+	if (opts->nop) {
+		libmcount = "libmcount-nop.so";
+	}
+	else if (opts->libmcount_single && !must_use_multi_thread) {
+		if (can_use_fast_libmcount(opts))
+			libmcount = "libmcount-fast-single.so";
+		else
+			libmcount = "libmcount-single.so";
+	}
+	else {
+		if (must_use_multi_thread && opts->libmcount_single)
+			pr_dbg("--libmcount-single is off because it uses pthread\n");
+		if (can_use_fast_libmcount(opts))
+			libmcount = "libmcount-fast.so";
+		else
+			libmcount = "libmcount.so";
+	}
+
 	if (opts->lib_path) {
-		strcpy(buf, opts->lib_path);
-		strcat(buf, "/libmcount:");
-	} else {
-		/* to make strcat() work */
-		buf[0] = '\0';
+		snprintf(lib, PATH_MAX, "%s/libmcount/%s", opts->lib_path, libmcount);
+
+		if (access(lib, F_OK) == 0) {
+			return lib;
+		}
+		else if (errno == ENOENT) {
+			snprintf(lib, PATH_MAX, "%s/%s", opts->lib_path, libmcount);
+			if (access(lib, F_OK) == 0)
+				return lib;
+		}
+		free(lib);
+		return NULL;
 	}
 
 #ifdef INSTALL_LIB_PATH
-	strcat(buf, INSTALL_LIB_PATH);
+	snprintf(lib, PATH_MAX, "%s/%s", INSTALL_LIB_PATH, libmcount);
+	if (access(lib, F_OK) != 0 && errno == ENOENT)
+		pr_warn("Didn't you run 'make install' ?\n");
 #endif
+	strcpy(lib, libmcount);
+	return lib;
+}
 
-	old_libpath = getenv("LD_LIBRARY_PATH");
-	if (old_libpath) {
-		size_t len = strlen(buf) + strlen(old_libpath) + 2;
-		char *libpath = xmalloc(len);
+void put_libmcount_path(char *libpath)
+{
+	free(libpath);
+}
 
-		snprintf(libpath, len, "%s:%s", buf, old_libpath);
-		setenv("LD_LIBRARY_PATH", libpath, 1);
-		free(libpath);
+static void setup_child_environ(struct opts *opts, int pfd,
+				int argc, char *argv[])
+{
+	char buf[PATH_MAX];
+	char *old_preload, *libpath;
+
+#ifdef INSTALL_LIB_PATH
+	if (!opts->lib_path) {
+		char *envbuf = getenv("LD_LIBRARY_PATH");
+
+		if (envbuf) {
+			envbuf = xstrdup(envbuf);
+			libpath = strjoin(envbuf, INSTALL_LIB_PATH, ":");
+			setenv("LD_LIBRARY_PATH", libpath, 1);
+			free(libpath);
+		}
+		else {
+			setenv("LD_LIBRARY_PATH", INSTALL_LIB_PATH, 1);
+		}
 	}
-	else
-		setenv("LD_LIBRARY_PATH", buf, 1);
+#endif
 
 	if (opts->filter) {
 		char *filter_str = uftrace_clear_kernel(opts->filter);
@@ -243,48 +289,47 @@ static void setup_child_environ(struct opts *opts, int pfd)
 	if (opts->script_file)
 		setenv("UFTRACE_SCRIPT", opts->script_file, 1);
 
-	if (opts->lib_path)
-		snprintf(buf, sizeof(buf), "%s/libmcount/", opts->lib_path);
-	else
-		buf[0] = '\0';  /* to make strcat() work */
+	if (opts->patt_type != PATT_REGEX)
+		setenv("UFTRACE_PATTERN", get_filter_pattern(opts->patt_type), 1);
 
-	if (opts->nop) {
-		strcat(buf, "libmcount-nop.so");
+	if (argc > 0) {
+		char *args = NULL;
+		int i;
+
+		for (i = 0; i < argc; i++)
+			args = strjoin(args, argv[i], "\n");
+
+		setenv("UFTRACE_ARGS", args, 1);
+		free(args);
 	}
-	else if (opts->libmcount_single && !must_use_multi_thread) {
-		if (can_use_fast_libmcount(opts))
-			strcat(buf, "libmcount-fast-single.so");
-		else
-			strcat(buf, "libmcount-single.so");
-	}
-	else {
-		if (must_use_multi_thread && opts->libmcount_single)
-			pr_dbg("--libmcount-single is off because it calls pthread_create()\n");
-		if (can_use_fast_libmcount(opts))
-			strcat(buf, "libmcount-fast.so");
-		else
-			strcat(buf, "libmcount.so");
-	}
-	pr_dbg("using %s library for tracing\n", buf);
+
+	libpath = get_libmcount_path(opts);
+	if (libpath == NULL)
+		pr_err_ns("cannot found libmcount.so\n");
+
+	pr_dbg("using %s library for tracing\n", libpath);
 
 	old_preload = getenv("LD_PRELOAD");
 	if (old_preload) {
-		size_t len = strlen(buf) + strlen(old_preload) + 2;
+		size_t len = strlen(libpath) + strlen(old_preload) + 2;
 		char *preload = xmalloc(len);
 
-		snprintf(preload, len, "%s:%s", buf, old_preload);
+		snprintf(preload, len, "%s:%s", libpath, old_preload);
 		setenv("LD_PRELOAD", preload, 1);
 		free(preload);
 	}
 	else
-		setenv("LD_PRELOAD", buf, 1);
+		setenv("LD_PRELOAD", libpath, 1);
 
+	put_libmcount_path(libpath);
 	setenv("XRAY_OPTIONS", "patch_premain=false", 1);
 }
 
 static uint64_t calc_feat_mask(struct opts *opts)
 {
 	uint64_t features = 0;
+	char *buf = NULL;
+	glob_t g;
 
 	/* mcount code creates task and sid-XXX.map files */
 	features |= TASK_SESSION;
@@ -297,6 +342,9 @@ static uint64_t calc_feat_mask(struct opts *opts)
 
 	/* provide automatic argument/return value spec */
 	features |= AUTO_ARGS;
+
+	if (has_perf_event)
+		features |= PERF_EVENT;
 
 	if (opts->libcall)
 		features |= PLTHOOK;
@@ -313,8 +361,12 @@ static uint64_t calc_feat_mask(struct opts *opts)
 	if (opts->event)
 		features |= EVENT;
 
-	if (has_perf_event)
-		features |= PERF_EVENT;
+	xasprintf(&buf, "%s/*.dbg", opts->dirname);
+	if (glob(buf, GLOB_NOSORT, NULL, &g) != GLOB_NOMATCH)
+		features |= DEBUG_INFO;
+
+	globfree(&g);
+	free(buf);
 
 	return features;
 }
@@ -882,6 +934,23 @@ struct tid_list {
 
 static LIST_HEAD(tid_list_head);
 
+static bool child_exited;
+
+static void sigchld_handler(int sig, siginfo_t *sainfo, void *context)
+{
+	int tid = sainfo->si_pid;
+	struct tid_list *tl;
+
+	list_for_each_entry(tl, &tid_list_head, list) {
+		if (tl->tid == tid) {
+			tl->exited = true;
+			break;
+		}
+	}
+
+	child_exited = true;
+}
+
 static void add_tid_list(int pid, int tid)
 {
 	struct tid_list *tl;
@@ -914,7 +983,7 @@ static bool check_tid_list(void)
 	list_for_each_entry(tl, &tid_list_head, list) {
 		int fd, len;
 		char state;
-		char line[4096];
+		char line[PATH_MAX];
 
 		if (tl->exited || tl->tid < 0)
 			continue;
@@ -949,6 +1018,7 @@ static bool check_tid_list(void)
 	}
 
 	pr_dbg2("all process/thread exited\n");
+	child_exited = true;
 	return true;
 }
 
@@ -1007,7 +1077,7 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 
 		/* remove from shmem_list */
 		list_for_each_entry_safe(sl, tmp, &shmem_list_head, list) {
-			if (!memcmp(sl->id, buf, SHMEM_NAME_SIZE)) {
+			if (!memcmp(sl->id, buf, msg.len)) {
 				list_del(&sl->list);
 				free(sl);
 				break;
@@ -1282,60 +1352,33 @@ static void save_session_symbols(struct opts *opts)
 	int i, maps;
 
 	maps = scandir(opts->dirname, &map_list, filter_map, alphasort);
-	if (maps <= 0)
+	if (maps <= 0) {
+		if (maps == 0)
+			errno = ENOENT;
 		pr_err("cannot find map files");
+	}
 
 	for (i = 0; i < maps; i++) {
 		struct symtabs symtabs = {
-			.loaded = false,
+			.dirname  = opts->dirname,
+			.flags    = SYMTAB_FL_ADJ_OFFSET,
 		};
-		struct uftrace_mmap *map, *tmp;
-		char sid[20] = { 0, };
+		char sid[20];
 
-		if (sid[0] == '\0')
-			sscanf(map_list[i]->d_name, "sid-%[^.].map", sid);
+		sscanf(map_list[i]->d_name, "sid-%[^.].map", sid);
 		free(map_list[i]);
 
 		pr_dbg2("reading symbols for session %s\n", sid);
 		read_session_map(opts->dirname, &symtabs, sid);
 
-		/* main executable */
-		load_symtabs(&symtabs, opts->dirname, symtabs.maps->libname);
-		save_symbol_file(&symtabs, opts->dirname, symtabs.filename);
-
-		/* shared libraries */
 		load_module_symtabs(&symtabs);
 		save_module_symtabs(&symtabs);
 
-		map = symtabs.maps;
-		while (map) {
-			tmp = map;
-			map = map->next;
-
-			free(tmp);
-		}
-		symtabs.maps = NULL;
-
+		delete_session_map(&symtabs);
 		unload_symtabs(&symtabs);
 	}
+
 	free(map_list);
-}
-
-static bool child_exited;
-
-static void sigchld_handler(int sig, siginfo_t *sainfo, void *context)
-{
-	int tid = sainfo->si_pid;
-	struct tid_list *tl;
-
-	list_for_each_entry(tl, &tid_list_head, list) {
-		if (tl->tid == tid) {
-			tl->exited = true;
-			break;
-		}
-	}
-
-	child_exited = true;
 }
 
 static char *get_child_time(struct timespec *ts1, struct timespec *ts2)
@@ -1404,7 +1447,7 @@ static void check_binary(struct opts *opts)
 	uint16_t e_type;
 	uint16_t e_machine;
 	uint16_t supported_machines[] = {
-		EM_X86_64, EM_ARM, EM_AARCH64,
+		EM_X86_64, EM_ARM, EM_AARCH64, EM_386
 	};
 
 	pr_dbg3("checking binary %s\n", opts->exename);
@@ -1451,17 +1494,19 @@ static void check_binary(struct opts *opts)
 	}
 
 	if (!opts->force) {
-		chk = check_trace_functions(opts->exename);
+		enum uftrace_trace_type chk_type;
 
-		if (chk == 0 && !opts->patch) {
+		chk_type = check_trace_functions(opts->exename);
+
+		if (chk_type == TRACE_NONE && !opts->patch) {
 			/* there's no function to trace */
 			pr_err_ns(MCOUNT_MSG, "mcount", opts->exename);
 		}
-		else if (chk == 2 && (opts->args || opts->retval)) {
+		else if (chk_type == TRACE_CYGPROF && (opts->args || opts->retval)) {
 			/* arg/retval doesn't support -finstrument-functions */
 			pr_out(ARGUMENT_MSG);
 		}
-		else if (chk < 0) {
+		else if (chk_type == TRACE_ERROR) {
 			pr_err_ns("Cannot check '%s'\n", opts->exename);
 		}
 	}
@@ -1469,27 +1514,46 @@ static void check_binary(struct opts *opts)
 	close(fd);
 }
 
-static bool check_linux_perf_event(char *events)
+static void check_perf_event(struct opts *opts)
 {
-	char *str, *tmp, *evt;
+	struct strv strv = STRV_INIT;
+	char *evt;
+	int i;
 	bool found = false;
+	enum uftrace_pattern_type ptype = opts->patt_type;
 
-	if (events == NULL)
-		return false;
+	has_perf_event = has_sched_event = !opts->no_event;
 
-	str = tmp = xstrdup(events);
+	if (opts->event == NULL)
+		return;
 
-	evt = strtok(tmp, ";");
-	while (evt) {
-		if (fnmatch(evt, "linux:schedule", 0) == 0) {
+	strv_split(&strv, opts->event, ";");
+
+	strv_for_each(&strv, evt, i) {
+		struct uftrace_pattern patt;
+
+		init_filter_pattern(ptype, &patt, evt);
+
+		if (match_filter_pattern(&patt, "linux:task-new") ||
+		    match_filter_pattern(&patt, "linux:task-exit") ||
+		    match_filter_pattern(&patt, "linux:task-name"))
 			found = true;
-			break;
+
+		if (match_filter_pattern(&patt, "linux:sched-in") ||
+		    match_filter_pattern(&patt, "linux:sched-out") ||
+		    match_filter_pattern(&patt, "linux:schedule")) {
+			has_sched_event = true;
+			found = true;
 		}
-		evt = strtok(NULL, ";");
+
+		free_filter_pattern(&patt);
+
+		if (found && has_sched_event)
+			break;
 	}
 
-	free(str);
-	return found;
+	strv_free(&strv);
+	has_perf_event = found;
 }
 
 struct writer_data {
@@ -1512,6 +1576,15 @@ static void setup_writers(struct writer_data *wd, struct opts *opts)
 	struct sigaction sa = {
 		.sa_flags = 0,
 	};
+
+	if (opts->nop) {
+		opts->nr_thread = 0;
+		opts->kernel = false;
+		has_perf_event = false;
+		wd->nr_cpu = 0;
+
+		goto out;
+	}
 
 	sigfillset(&sa.sa_mask);
 	sa.sa_handler = NULL;
@@ -1545,7 +1618,7 @@ static void setup_writers(struct writer_data *wd, struct opts *opts)
 
 		if (!opts->kernel_bufsize) {
 			if (opts->kernel_depth >= 8)
-				kernel->bufsize = 4096 * 1024;
+				kernel->bufsize = PATH_MAX * 1024;
 			else if (opts->kernel_depth >= 4)
 				kernel->bufsize = 3072 * 1024;
 			else if (opts->kernel_depth >= 2)
@@ -1558,7 +1631,7 @@ static void setup_writers(struct writer_data *wd, struct opts *opts)
 				pr_warn("kernel tracing requires root privilege\n");
 			else
 				pr_warn("kernel tracing disabled due to an error\n"
-				        "does CONFIG_FTRACE enable in kernel?\n");
+				        "is CONFIG_FUNCTION_GRAPH_TRACER enabled in the kernel?\n");
 
 
 			opts->kernel = false;
@@ -1572,10 +1645,11 @@ static void setup_writers(struct writer_data *wd, struct opts *opts)
 
 	if (has_perf_event) {
 		if (setup_perf_record(perf, wd->nr_cpu, wd->pid,
-				      opts->dirname) < 0)
+				      opts->dirname, has_sched_event) < 0)
 			has_perf_event = false;
 	}
 
+out:
 	pr_dbg("creating %d thread(s) for recording\n", opts->nr_thread);
 	wd->writers = xmalloc(opts->nr_thread * sizeof(*wd->writers));
 
@@ -1662,7 +1736,7 @@ static int stop_tracing(struct writer_data *wd, struct opts *opts)
 	}
 
 	if (child_exited) {
-		wait4(wd->pid, &status, WNOHANG, &wd->usage);
+		wait4(wd->pid, &status, 0, &wd->usage);
 		if (WIFEXITED(status)) {
 			pr_dbg("child terminated with exit code: %d\n",
 			       WEXITSTATUS(status));
@@ -1672,10 +1746,16 @@ static int stop_tracing(struct writer_data *wd, struct opts *opts)
 			else
 				ret = UFTRACE_EXIT_SUCCESS;
 		}
-		else {
+		else if (WIFSIGNALED(status)) {
 			pr_yellow("child terminated by signal: %d: %s\n",
 				  WTERMSIG(status), strsignal(WTERMSIG(status)));
 			ret = UFTRACE_EXIT_SIGNALED;
+		}
+		else {
+			pr_yellow("child terminated with unknown reason: %d\n",
+				  status);
+			memset(&wd->usage, 0, sizeof(wd->usage));
+			ret = UFTRACE_EXIT_UNKNOWN;
 		}
 	}
 	else if (opts->keep_pid)
@@ -1698,13 +1778,18 @@ static void finish_writers(struct writer_data *wd, struct opts *opts)
 	int i;
 	char *elapsed_time = get_child_time(&wd->ts1, &wd->ts2);
 
-	if (fill_file_header(opts, wd->status, &wd->usage, elapsed_time) < 0)
-		pr_err("cannot generate data file");
-
 	if (opts->time) {
 		print_child_time(elapsed_time);
 		print_child_usage(&wd->usage);
 	}
+
+	if (opts->nop) {
+		free(elapsed_time);
+		return;
+	}
+
+	if (fill_file_header(opts, wd->status, &wd->usage, elapsed_time) < 0)
+		pr_err("cannot generate data file");
 
 	free(elapsed_time);
 
@@ -1730,6 +1815,9 @@ static void finish_writers(struct writer_data *wd, struct opts *opts)
 static void write_symbol_files(struct writer_data *wd, struct opts *opts)
 {
 	struct dlopen_list *dlib, *tmp;
+
+	if (opts->nop)
+		return;
 
 	/* main executable and shared libraries */
 	save_session_symbols(opts);
@@ -1810,13 +1898,20 @@ int do_main_loop(int pfd[2], int ready, struct opts *opts, int pid)
 	return ret;
 }
 
-int do_child_exec(int pfd[2], int ready, struct opts *opts, char *argv[])
+int do_child_exec(int pfd[2], int ready, struct opts *opts,
+		  int argc, char *argv[])
 {
 	uint64_t dummy;
 
+	if (opts->no_randomize_addr) {
+		/* disable ASLR (Address Space Layout Randomization) */
+		if (personality(ADDR_NO_RANDOMIZE) < 0)
+			pr_dbg("disabling ASLR failed\n");
+	}
+
 	close(pfd[0]);
 
-	setup_child_environ(opts, pfd[1]);
+	setup_child_environ(opts, pfd[1], argc, argv);
 
 	/* wait for parent ready */
 	if (read(ready, &dummy, sizeof(dummy)) != (ssize_t)sizeof(dummy))
@@ -1826,7 +1921,7 @@ int do_child_exec(int pfd[2], int ready, struct opts *opts, char *argv[])
 	 * I don't think the traced binary is in PATH.
 	 * So use plain 'execv' rather than 'execvp'.
 	 */
-	execv(opts->exename, &argv[opts->idx]);
+	execv(opts->exename, argv);
 	abort();
 }
 
@@ -1840,7 +1935,7 @@ int command_record(int argc, char *argv[], struct opts *opts)
 	if (pipe(pfd) < 0)
 		pr_err("cannot setup internal pipe");
 
-	if (create_directory(opts->dirname) < 0)
+	if (!opts->nop && create_directory(opts->dirname) < 0)
 		return -1;
 
 	/* apply script-provided options */
@@ -1848,8 +1943,7 @@ int command_record(int argc, char *argv[], struct opts *opts)
 		parse_script_opt(opts);
 
 	check_binary(opts);
-
-	has_perf_event = check_linux_perf_event(opts->event);
+	check_perf_event(opts);
 
 	fflush(stdout);
 
@@ -1865,12 +1959,12 @@ int command_record(int argc, char *argv[], struct opts *opts)
 		if (opts->keep_pid)
 			ret = do_main_loop(pfd, efd, opts, getppid());
 		else
-			do_child_exec(pfd, efd, opts, argv);
+			do_child_exec(pfd, efd, opts, argc, argv);
 		return ret;
 	}
 
 	if (opts->keep_pid)
-		do_child_exec(pfd, efd, opts, argv);
+		do_child_exec(pfd, efd, opts, argc, argv);
 	else
 		ret = do_main_loop(pfd, efd, opts, pid);
 	return ret;

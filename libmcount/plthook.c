@@ -1,11 +1,11 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <signal.h>
-#include <gelf.h>
 #include <link.h>
 #include <sys/mman.h>
 #include <pthread.h>
 #include <assert.h>
+#include <dlfcn.h>
 
 /* This should be defined before #include "utils.h" */
 #define PR_FMT     "mcount"
@@ -17,49 +17,28 @@
 #include "utils/utils.h"
 #include "utils/filter.h"
 #include "utils/script.h"
+#include "utils/symbol.h"
 
+#ifndef  PT_GNU_RELRO
+# define PT_GNU_RELRO  0x6474e552  /* Read-only after relocation */
+#endif
+
+/* global symbol tables for libmcount */
 extern struct symtabs symtabs;
 
+/* address of dynamic linker's resolver routine (copied from GOT[2]) */
 unsigned long plthook_resolver_addr;
 
+/* list of plthook_data for each library (module) */
 static LIST_HEAD(plthook_modules);
 
+/* check getenv("LD_BIND_NOT") */
 static bool plthook_no_pltbind;
-
-static unsigned long got_addr;
-static volatile bool segv_handled;
-
-#define PAGE_SIZE  4096
-#define PAGE_ADDR(addr)  ((void *)((addr) & ~(PAGE_SIZE - 1)))
-
-static void segv_handler(int sig, siginfo_t *si, void *ctx)
-{
-	if (segv_handled)
-		pr_err_ns("stuck in a loop at segfault handler\n");
-
-	if (si->si_code == SEGV_ACCERR) {
-		if (mprotect(PAGE_ADDR(got_addr), PAGE_SIZE, PROT_WRITE) < 0)
-			pr_err("mprotect failed");
-		segv_handled = true;
-	} else {
-		pr_err_ns("invalid memory access: %lx: exiting.\n", got_addr);
-	}
-}
 
 static void overwrite_pltgot(struct plthook_data *pd, int idx, void *data)
 {
-	/* save got_addr for segv_handler */
-	got_addr = (unsigned long)(&pd->pltgot_ptr[idx]);
-
-	segv_handled = false;
-
-	compiler_barrier();
-
 	/* overwrite it - might be write-protected */
 	pd->pltgot_ptr[idx] = (unsigned long)data;
-
-	if (segv_handled)
-		mprotect(PAGE_ADDR(got_addr), PAGE_SIZE, PROT_READ);
 }
 
 unsigned long setup_pltgot(struct plthook_data *pd, int got_idx, int sym_idx,
@@ -121,6 +100,10 @@ static void restore_plt_functions(struct plthook_data *pd)
 
 #undef SKIP_FUNC
 
+	const char *const resolve_list[] = {
+		"execl", "execle", "execlp", "posix_spawn",
+		"execv", "execve", "execvp", "execvpe", "fexecve",
+	};
 	struct symtab *dsymtab = &pd->dsymtab;
 
 	for (i = 0; i < dsymtab->nr_sym; i++) {
@@ -141,6 +124,32 @@ static void restore_plt_functions(struct plthook_data *pd)
 			skipped = true;
 		}
 
+		for (k = 0; !skipped && k < ARRAY_SIZE(resolve_list); k++) {
+			struct sym *sym = dsymtab->sym_names[i];
+
+			if (strcmp(sym->name, resolve_list[k]))
+				continue;
+
+			resolved_addr = (unsigned long)dlsym(RTLD_DEFAULT, sym->name);
+			plthook_addr = mcount_arch_plthook_addr(pd, i);
+
+			/* On ARM dlsym(DEFAULT) returns the address of PLT */
+			if (unlikely(pd->base_addr <= resolved_addr &&
+				     resolved_addr < sym->addr + sym->size)) {
+				void *real_addr = dlsym(RTLD_NEXT, sym->name);
+
+				if (real_addr)
+					resolved_addr = (unsigned long)real_addr;
+			}
+
+			pd->resolved_addr[i] = resolved_addr;
+			overwrite_pltgot(pd, 3 + i, (void *)plthook_addr);
+			pr_dbg2("resolve [%u] %s: %p (PLT: %#lx)\n",
+				i, resolve_list[k], resolved_addr, plthook_addr);
+
+			skipped = true;
+		}
+
 		if (skipped)
 			continue;
 
@@ -150,8 +159,8 @@ static void restore_plt_functions(struct plthook_data *pd)
 			/* save already resolved address and hook it */
 			pd->resolved_addr[i] = resolved_addr;
 			overwrite_pltgot(pd, 3 + i, (void *)plthook_addr);
-			pr_dbg2("restore [%u] %s: %p\n",
-				i, dsymtab->sym[i].name, resolved_addr);
+			pr_dbg2("restore [%u] %s: %p (PLT: %#lx)\n",
+				i, dsymtab->sym[i].name, resolved_addr, plthook_addr);
 		}
 	}
 }
@@ -159,52 +168,46 @@ static void restore_plt_functions(struct plthook_data *pd)
 extern void __weak plt_hooker(void);
 extern unsigned long plthook_return(void);
 
-__weak int mcount_arch_undo_bindnow(Elf *elf, struct plthook_data *pd)
+__weak int mcount_arch_undo_bindnow(struct uftrace_elf_data *elf,
+				    struct plthook_data *pd)
 {
 	return -1;
 }
 
-static int find_got(Elf *elf, const char *modname,
-		    Elf_Data *dyn_data, size_t nr_dyn, unsigned long offset)
+static int find_got(struct uftrace_elf_data *elf,
+		    struct uftrace_elf_iter *iter,
+		    const char *modname,
+		    unsigned long offset)
 {
-	size_t i;
 	bool plt_found = false;
 	bool bind_now = false;
 	unsigned long pltgot_addr = 0;
-	struct sigaction sa, old_sa;
-	struct plthook_data *pd;
-	Elf_Scn *sec = NULL;
-	size_t shstr_idx;
 	unsigned long plt_addr = 0;
+	struct plthook_data *pd;
 
-	/*
-	 * The GOT region is write-protected on some systems.
-	 * In that case, we need to use mprotect() to overwrite
-	 * the address of resolver function.  So install signal
-	 * handler to catch such cases.
-	 */
-	sa.sa_sigaction = segv_handler;
-	sa.sa_flags = SA_SIGINFO;
-	sigfillset(&sa.sa_mask);
-	if (sigaction(SIGSEGV, &sa, &old_sa) < 0) {
-		pr_dbg("error during install sig handler\n");
-		return -1;
+	elf_for_each_shdr(elf, iter) {
+		if (iter->shdr.sh_type == SHT_DYNAMIC)
+			break;
 	}
 
-	for (i = 0; i < nr_dyn; i++) {
-		GElf_Dyn dyn;
-
-		if (gelf_getdyn(dyn_data, i, &dyn) == NULL)
-			return -1;
-
-		if (dyn.d_tag == DT_PLTGOT)
-			pltgot_addr = (unsigned long)dyn.d_un.d_val + offset;
-		else if (dyn.d_tag == DT_JMPREL)
+	elf_for_each_dynamic(elf, iter) {
+		switch (iter->dyn.d_tag) {
+		case DT_PLTGOT:
+			pltgot_addr = (unsigned long)iter->dyn.d_un.d_val + offset;
+			break;
+		case DT_JMPREL:
 			plt_found = true;
-		else if (dyn.d_tag == DT_BIND_NOW)
+			break;
+		case DT_BIND_NOW:
 			bind_now = true;
-		else if (dyn.d_tag == DT_FLAGS_1 && (dyn.d_un.d_val & DF_1_NOW))
-			bind_now = true;
+			break;
+		case DT_FLAGS_1:
+			if (iter->dyn.d_un.d_val & DF_1_NOW)
+				bind_now = true;
+			break;
+		default:
+			break;
+		}
 	}
 
 	if (!pltgot_addr || (!plt_found && !bind_now)) {
@@ -212,22 +215,11 @@ static int find_got(Elf *elf, const char *modname,
 		return 0;
 	}
 
-	if (elf_getshdrstrndx(elf, &shstr_idx) < 0) {
-		pr_dbg("failed to get section header string index\n");
-		return 0;
-	}
-
-	while ((sec = elf_nextscn(elf, sec)) != NULL) {
-		char *shstr;
-		GElf_Shdr shdr;
-
-		if (gelf_getshdr(sec, &shdr) == NULL)
-			break;
-
-		shstr = elf_strptr(elf, shstr_idx, shdr.sh_name);
+	elf_for_each_shdr(elf, iter) {
+		char *shstr = elf_get_name(elf, iter, iter->shdr.sh_name);
 
 		if (strcmp(shstr, ".plt") == 0) {
-			plt_addr = shdr.sh_addr + offset;
+			plt_addr = iter->shdr.sh_addr + offset;
 			break;
 		}
 	}
@@ -281,77 +273,55 @@ static int find_got(Elf *elf, const char *modname,
 	if (getenv("LD_BIND_NOT"))
 		plthook_no_pltbind = true;
 
-	/* restore the original signal handler */
-	if (sigaction(SIGSEGV, &old_sa, NULL) < 0) {
-		pr_dbg("error during recover sig handler\n");
-		return -1;
-	}
-
 	return 0;
 }
 
 static int hook_pltgot(const char *modname, unsigned long offset)
 {
-	int fd;
 	int ret = -1;
-	Elf *elf;
-	GElf_Ehdr ehdr;
-	Elf_Scn *sec;
-	GElf_Shdr shdr;
-	Elf_Data *data;
-	size_t shstr_idx;
-	size_t i;
+	bool relro = false;
+	unsigned long relro_start = 0;
+	unsigned long relro_size = 0;
+	unsigned long page_size;
+	struct uftrace_elf_data elf;
+	struct uftrace_elf_iter iter;
+	bool found_dynamic = false;
 
 	pr_dbg2("opening executable image: %s\n", modname);
 
-	fd = open(modname, O_RDONLY);
-	if (fd < 0)
+	if (elf_init(modname, &elf) < 0)
 		return -1;
 
-	elf_version(EV_CURRENT);
+	elf_for_each_phdr(&elf, &iter) {
+		if (iter.phdr.p_type == PT_DYNAMIC)
+			found_dynamic = true;
 
-	elf = elf_begin(fd, ELF_C_READ_MMAP, NULL);
+		if (iter.phdr.p_type == PT_GNU_RELRO) {
+			relro_start = iter.phdr.p_vaddr + offset;
+			relro_size  = iter.phdr.p_memsz;
 
-	if (gelf_getehdr(elf, &ehdr) == NULL)
-		goto elf_error;
+			page_size = getpagesize();
 
-	if (elf_getshdrstrndx(elf, &shstr_idx) < 0)
-		goto elf_error;
-
-	for (i = 0; i < ehdr.e_phnum; i++) {
-		GElf_Phdr phdr;
-
-		if (gelf_getphdr(elf, i, &phdr) == NULL)
-			goto elf_error;
-
-		if (phdr.p_type != PT_DYNAMIC)
-			continue;
-
-		sec = gelf_offscn(elf, phdr.p_offset);
-
-		if (!sec || gelf_getshdr(sec, &shdr) == NULL)
-			continue;
-
-		data = elf_getdata(sec, NULL);
-		if (data == NULL)
-			goto elf_error;
-
-		if (find_got(elf, modname, data, shdr.sh_size / shdr.sh_entsize,
-			     offset) < 0)
-			goto elf_error;
+			relro_start &= ~(page_size - 1);
+			relro_size   = ALIGN(relro_size, page_size);
+			relro = true;
+		}
 	}
-	ret = 0;
 
-out:
-	elf_end(elf);
-	close(fd);
+	if (found_dynamic) {
+		if (relro) {
+			mprotect((void *)relro_start, relro_size,
+				 PROT_READ | PROT_WRITE);
+		}
 
+		ret = find_got(&elf, &iter, modname, offset);
+
+		if (relro)
+			mprotect((void *)relro_start, relro_size, PROT_READ);
+	}
+
+	elf_finish(&elf);
 	return ret;
-
-elf_error:
-	pr_dbg("%s\n", elf_errmsg(elf_errno()));
-
-	goto out;
 }
 
 /* functions should skip PLT hooking */
@@ -361,6 +331,7 @@ static const char *skip_syms[] = {
 	"_mcleanup",
 	"__libc_start_main",
 	"__cxa_throw",
+	"__cxa_rethrow",
 	"__cxa_begin_catch",
 	"__cxa_end_catch",
 	"__cxa_finalize",
@@ -723,11 +694,15 @@ static void update_pltgot(struct mcount_thread_data *mtdp,
 	}
 }
 
+__weak unsigned long mcount_arch_child_idx(unsigned long child_idx)
+{
+	return child_idx;
+}
+
 unsigned long plthook_entry(unsigned long *ret_addr, unsigned long child_idx,
 			    unsigned long module_id, struct mcount_regs *regs)
 {
 	struct sym *sym;
-	unsigned long child_ip;
 	struct mcount_thread_data *mtdp = NULL;
 	struct mcount_ret_stack *rstack;
 	struct uftrace_trigger tr = {
@@ -741,6 +716,8 @@ unsigned long plthook_entry(unsigned long *ret_addr, unsigned long child_idx,
 	unsigned long special_flag = 0;
 	unsigned long real_addr = 0;
 
+	// if necessary, implement it by architecture.
+	child_idx = mcount_arch_child_idx(child_idx);
 	list_for_each_entry(pd, &plthook_modules, list) {
 		if (module_id == pd->module_id)
 			break;
@@ -752,9 +729,6 @@ unsigned long plthook_entry(unsigned long *ret_addr, unsigned long child_idx,
 		goto out;
 	}
 
-	if (unlikely(mcount_should_stop()))
-		goto out;
-
 	mtdp = get_thread_data();
 	if (unlikely(check_thread_data(mtdp))) {
 		mtdp = mcount_prepare();
@@ -762,10 +736,8 @@ unsigned long plthook_entry(unsigned long *ret_addr, unsigned long child_idx,
 			goto out;
 	}
 	else {
-		if (unlikely(mtdp->recursion_guard))
+		if (!mcount_guard_recursion(mtdp, false))
 			goto out;
-
-		mtdp->recursion_guard = true;
 	}
 
 	recursion = false;
@@ -778,13 +750,15 @@ unsigned long plthook_entry(unsigned long *ret_addr, unsigned long child_idx,
 	if (unlikely(special_flag & PLT_FL_SKIP))
 		goto out;
 
-	sym = &pd->dsymtab.sym[child_idx];
-	pr_dbg3("[mod: %lx, idx: %d] enter %lx: %s\n", module_id, child_idx, sym->addr, sym->name);
-
-	child_ip = sym ? sym->addr : 0;
-	if (child_ip == 0) {
-		pr_err_ns("invalid function idx found! (module: %s, idx: %d, %#lx)\n",
-			  pd->mod_name, (int) child_idx, child_idx);
+	if (pd->dsymtab.nr_sym && child_idx < pd->dsymtab.nr_sym) {
+		sym = &pd->dsymtab.sym[child_idx];
+		pr_dbg2("[mod: %lx, idx: %d] enter %lx: %s\n",
+			module_id, child_idx, sym->addr, sym->name);
+	}
+	else {
+		sym = NULL;
+		pr_err_ns("invalid function idx found! (idx: %lu/%zu, module: %s)\n",
+			  child_idx, pd->dsymtab.nr_sym, pd->mod_name);
 	}
 
 	filtered = mcount_entry_filter_check(mtdp, sym->addr, &tr);
@@ -808,14 +782,21 @@ unsigned long plthook_entry(unsigned long *ret_addr, unsigned long child_idx,
 	rstack->dyn_idx    = child_idx;
 	rstack->parent_loc = ret_addr;
 	rstack->parent_ip  = *ret_addr;
-	rstack->child_ip   = child_ip;
+	rstack->child_ip   = sym->addr;
 	rstack->start_time = skip ? 0 : mcount_gettime();
 	rstack->end_time   = 0;
 	rstack->flags      = skip ? MCOUNT_FL_NORECORD : 0;
+	rstack->nr_events  = 0;
+	rstack->event_idx  = ARGBUF_SIZE;
+
+	/* hijack the return address of child */
+	*ret_addr = (unsigned long)plthook_return;
+
+	/* restore return address of parent */
+	if (mcount_auto_recover)
+		mcount_auto_restore(mtdp);
 
 	mcount_entry_filter_record(mtdp, rstack, &tr, regs);
-
-	*ret_addr = (unsigned long)plthook_return;
 
 	if (unlikely(special_flag)) {
 		/* force flush rstack on some special functions */
@@ -851,26 +832,24 @@ out:
 		real_addr = pd->resolved_addr[child_idx];
 
 	if (!recursion)
-		mtdp->recursion_guard = false;
+		mcount_unguard_recursion(mtdp);
 	return real_addr;
 }
 
 unsigned long plthook_exit(long *retval)
 {
-	int dyn_idx;
+	unsigned dyn_idx;
 	struct mcount_thread_data *mtdp;
 	struct mcount_ret_stack *rstack;
 
 	mtdp = get_thread_data();
-	if (unlikely(check_thread_data(mtdp))) {
-		/* mcount_finish() called in the middle */
-		if (mcount_should_stop())
-			return mtd.rstack[--mtd.idx].parent_ip;
+	assert(mtdp != NULL);
 
-		assert(mtdp);
-	}
-
-	mtdp->recursion_guard = true;
+	/*
+	 * there's a race with mcount_finish(), but it still needs to get
+	 * the original return address so defer freeing rstack to the end.
+	 */
+	mcount_guard_recursion(mtdp, true);
 
 again:
 	if (likely(mtdp->idx > 0))
@@ -907,10 +886,14 @@ again:
 	mcount_exit_filter_record(mtdp, rstack, retval);
 	update_pltgot(mtdp, rstack->pd, dyn_idx);
 
+	/* re-hijack return address of parent */
+	if (mcount_auto_recover)
+		mcount_auto_reset(mtdp);
+
 	compiler_barrier();
 
 	mtdp->idx--;
-	mtdp->recursion_guard = false;
+	mcount_unguard_recursion(mtdp);
 
 	return rstack->parent_ip;
 }

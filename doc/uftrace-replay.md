@@ -41,7 +41,7 @@ OPTIONS
 :   Set trace limit in nesting level.
 
 -f *FIELD*, \--output-fields=*FIELD*
-:   Customize field in the output.  Possible values are: duration, tid, time, delta, elapsed and addr.  Multiple fields can be set by using comma.  Special field of 'none' can be used (solely) to hide all fields.  Default is 'duration,tid'.  See *FIELDS*.
+:   Customize field in the output.  Possible values are: duration, tid, addr, time, delta, elapsed, task and module.  Multiple fields can be set by using comma.  Special field of 'none' can be used (solely) to hide all fields.  Default is 'duration,tid'.  See *FIELDS*.
 
 -r *RANGE*, \--time-range=*RANGE*
 :   Only show functions executed within the time RANGE.  The RANGE can be \<start\>~\<stop\> (separated by "~") and one of \<start\> and \<stop\> can be omitted.  The \<start\> and \<stop\> are timestamp or elapsed time if they have \<time_unit\> postfix, for example '100us'.  The timestamp or elapsed time can be shown with `-f time` or `-f elapsed` option respectively.
@@ -65,7 +65,7 @@ OPTIONS
 :   Do not show comments of returned functions.
 
 -k, \--kernel
-:   Trace kernel functions (and events) as well as user functions (and events).  This options has no meaning and so is deprecated now.  It will always show kernel functions and events if exists.  If you want to hide kernel functions, please use `-N .@kernel` to filter out all kernel functions.
+:   Trace kernel functions (and events) as well as user functions (and events).  This options has no meaning and so is deprecated now.  It will always show kernel functions and events if exists.  If you want to hide kernel functions, please use `-N .@kernel` to filter out all kernel functions (for the regex match).
 
 \--kernel-full
 :   Show all kernel functions and events occurred outside of user functions.  This option is the inverse of `--kernel-skip-out`.
@@ -78,6 +78,15 @@ OPTIONS
 
 \--event-full
 :   Show all (user) events outside of user functions.
+
+\--no-event
+:   Do not show any events.
+
+\--libname
+:   Show libname name along with function name.
+
+--match=*TYPE*
+:   Use pattern match using TYPE.  Possible types are `regex` and `glob`.  Default is `regex`.
 
 
 FILTERS
@@ -264,6 +273,8 @@ Each field has following meaning:
  * delta: difference between two timestamp in a task
  * elapsed: elapsed time from the first timestamp
  * addr: address of the function
+ * task: task name (comm)
+ * module: library or executable name of the function
 
 The default value is 'duration,tid'.  If given field name starts with "+", then it'll be appended to the default fields.  So "-f +time" is as same as "-f duration,tid,time".  And it also accepts a special field name of 'none' which disables the field display and shows function output only.
 

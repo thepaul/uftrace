@@ -73,8 +73,14 @@ OPTIONS
 \--event-full
 :   Show all (user) events outside of user functions.
 
+\--no-event
+:   Do not show any events.
+
 \--demangle=*TYPE*
 :   Use demangled C++ symbol names for filters, triggers, arguments and/or return values.  Possible values are "full", "simple" and "no".  Default is "simple" which ignores function arguments and template parameters.
+
+--match=*TYPE*
+:   Use pattern match using TYPE.  Possible types are `regex` and `glob`.  Default is `regex`.
 
 
 EXAMPLE
@@ -176,4 +182,4 @@ The example below will sort output by total time of the base data.
 
 SEE ALSO
 ========
-`uftrace`(1), `uftrace-record`(1), `uftrace-replay`(1)
+`uftrace`(1), `uftrace-record`(1), `uftrace-replay`(1), `uftrace-tui`(1)

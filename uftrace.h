@@ -4,14 +4,13 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <libelf.h>
 #include <fcntl.h>
 
 #include "utils/rbtree.h"
 #include "utils/list.h"
 #include "utils/symbol.h"
 #include "utils/perf.h"
-
+#include "utils/filter.h"
 
 #define UFTRACE_MAGIC_LEN  8
 #define UFTRACE_MAGIC_STR  "Ftrace!"
@@ -55,6 +54,7 @@ enum uftrace_feat_bits {
 	EVENT_BIT,
 	PERF_EVENT_BIT,
 	AUTO_ARGS_BIT,
+	DEBUG_INFO_BIT,
 
 	FEAT_BIT_MAX,
 
@@ -69,6 +69,7 @@ enum uftrace_feat_bits {
 	EVENT			= (1U << EVENT_BIT),
 	PERF_EVENT		= (1U << PERF_EVENT_BIT),
 	AUTO_ARGS		= (1U << AUTO_ARGS_BIT),
+	DEBUG_INFO		= (1U << DEBUG_INFO_BIT),
 };
 
 enum uftrace_info_bits {
@@ -84,6 +85,8 @@ enum uftrace_info_bits {
 	LOADINFO,
 	ARG_SPEC,
 	RECORD_DATE,
+	PATTERN_TYPE,
+	VERSION,
 };
 
 struct uftrace_info {
@@ -120,6 +123,8 @@ struct uftrace_info {
 	float load1;
 	float load5;
 	float load15;
+	enum uftrace_pattern_type patt_type;
+	char *uftrace_version;
 };
 
 enum {
@@ -159,6 +164,7 @@ struct ftrace_file_handle {
 	int depth;
 	bool needs_byte_swap;
 	bool needs_bit_swap;
+	bool perf_event_processed;
 	uint64_t time_filter;
 	struct uftrace_time_range time_range;
 	struct list_head events;
@@ -174,6 +180,7 @@ struct ftrace_file_handle {
 #define UFTRACE_MODE_DUMP    7
 #define UFTRACE_MODE_GRAPH   8
 #define UFTRACE_MODE_SCRIPT  9
+#define UFTRACE_MODE_TUI     10
 
 #define UFTRACE_MODE_DEFAULT  UFTRACE_MODE_LIVE
 
@@ -236,13 +243,17 @@ struct opts {
 	bool kernel;
 	bool kernel_skip_out;  /* also affects VDSO filter */
 	bool kernel_only;
-	bool list_event;
 	bool keep_pid;
+	bool list_event;
 	bool event_skip_out;
+	bool no_event;
 	bool nest_libcall;
 	bool record;
 	bool auto_args;
+	bool libname;
+	bool no_randomize_addr;
 	struct uftrace_time_range range;
+	enum uftrace_pattern_type patt_type;
 };
 
 static inline bool opts_has_filter(struct opts *opts)
@@ -262,6 +273,7 @@ int command_recv(int argc, char *argv[], struct opts *opts);
 int command_dump(int argc, char *argv[], struct opts *opts);
 int command_graph(int argc, char *argv[], struct opts *opts);
 int command_script(int argc, char *argv[], struct opts *opts);
+int command_tui(int argc, char *argv[], struct opts *opts);
 
 extern volatile bool uftrace_done;
 
@@ -271,6 +283,9 @@ int read_task_file(struct uftrace_session_link *sess, char *dirname,
 		   bool needs_session, bool sym_rel_addr);
 int read_task_txt_file(struct uftrace_session_link *sess, char *dirname,
 		       bool needs_session, bool sym_rel_addr);
+
+char * get_libmcount_path(struct opts *opts);
+void put_libmcount_path(char *libpath);
 
 #define SESSION_ID_LEN  16
 
@@ -303,6 +318,7 @@ struct uftrace_dlopen_list {
 
 struct uftrace_task {
 	int			 pid, tid, ppid;
+	char			 comm[16];
 	struct rb_node		 node;
 	struct uftrace_sess_ref	 sref;
 	struct uftrace_sess_ref	*sref_last;
@@ -375,6 +391,7 @@ void create_task(struct uftrace_session_link *sess, struct uftrace_msg_task *msg
 		 bool fork, bool needs_session);
 struct uftrace_task *find_task(struct uftrace_session_link *sess, int tid);
 void read_session_map(char *dirname, struct symtabs *symtabs, char *sid);
+void delete_session_map(struct symtabs *symtabs);
 struct uftrace_session * get_session_from_sid(struct uftrace_session_link *sess,
 					      char sid[]);
 void session_add_dlopen(struct uftrace_session *sess, uint64_t timestamp,
@@ -478,11 +495,19 @@ static inline bool has_perf_data(struct ftrace_file_handle *handle)
 	return handle->perf != NULL;
 }
 
+static inline bool has_event_data(struct ftrace_file_handle *handle)
+{
+	return handle->perf_event_processed;
+}
+
 struct rusage;
 
 void fill_uftrace_info(uint64_t *info_mask, int fd, struct opts *opts, int status,
 		      struct rusage *rusage, char *elapsed_time);
 int read_uftrace_info(uint64_t info_mask, struct ftrace_file_handle *handle);
+void process_uftrace_info(struct ftrace_file_handle *handle, struct opts *opts,
+			  void (*process)(void *data, const char *fmt, ...),
+			  void *data);
 void clear_uftrace_info(struct uftrace_info *info);
 
 int arch_fill_cpuinfo_model(int fd);
@@ -493,14 +518,25 @@ enum uftrace_event_id {
 	/* kernel IDs are read from tracefs */
 
 	EVENT_ID_BUILTIN = 100000U,
-	EVENT_ID_PROC_STATM,
-	EVENT_ID_PAGE_FAULT,
+	EVENT_ID_READ_PROC_STATM,
+	EVENT_ID_READ_PAGE_FAULT,
+	EVENT_ID_DIFF_PROC_STATM,
+	EVENT_ID_DIFF_PAGE_FAULT,
+	EVENT_ID_READ_PMU_CYCLE,
+	EVENT_ID_DIFF_PMU_CYCLE,
+	EVENT_ID_READ_PMU_CACHE,
+	EVENT_ID_DIFF_PMU_CACHE,
+	EVENT_ID_READ_PMU_BRANCH,
+	EVENT_ID_DIFF_PMU_BRANCH,
 
 	/* supported perf events */
 	EVENT_ID_PERF		= 200000U,
 	EVENT_ID_PERF_SCHED_IN,
 	EVENT_ID_PERF_SCHED_OUT,
 	EVENT_ID_PERF_SCHED_BOTH,
+	EVENT_ID_PERF_TASK,
+	EVENT_ID_PERF_EXIT,
+	EVENT_ID_PERF_COMM,
 
 	EVENT_ID_USER	= 1000000U,
 };

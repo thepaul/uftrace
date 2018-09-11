@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 
-import re
 from runtest import TestBase
 
 class TestCase(TestBase):
@@ -13,4 +12,4 @@ class TestCase(TestBase):
 """)
 
     def runcmd(self):
-        return '%s -t 1ms -T "mem_alloc@trace-off" -T "mem_free@trace-on" %s' % (TestBase.ftrace, 't-' + self.name)
+        return '%s -t 1ms -T "mem_alloc@trace-off" -T "mem_free@trace-on" %s' % (TestBase.uftrace_cmd, 't-' + self.name)

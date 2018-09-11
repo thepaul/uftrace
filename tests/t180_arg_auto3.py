@@ -19,13 +19,16 @@ class TestCase(TestBase):
     # override calloc() to save 2nd argument only
     def runcmd(self):
         return '%s -F main -A calloc@arg2 --auto-args %s hello' % \
-            (TestBase.ftrace, 't-' + self.name)
+            (TestBase.uftrace_cmd, 't-' + self.name)
 
     def sort(self, output):
         result = []
         for ln in output.split('\n'):
             # ignore blank lines and comments
             if ln.strip() == '' or ln.startswith('#'):
+                continue
+            # ignore uftrace message on -finstrument-functions
+            if ln.startswith('uftrace:'):
                 continue
             line = ln.split('|', 1)[-1]
             func = re.sub(r'0x[0-9a-f]+', '0xADDR', line)

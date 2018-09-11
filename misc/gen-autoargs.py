@@ -9,7 +9,6 @@
 #
 
 from __future__ import print_function
-import os
 import sys
 import re
 
@@ -29,10 +28,11 @@ struct_or_union_specifier = ["struct", "union"]
 enum_specifier = ["enum"]
 
 typedef_name = [
-        "size_t", "ssize_t", "pid_t", "off_t", "FILE",
+        "size_t", "ssize_t", "pid_t", "off_t", "off64_t", "FILE",
         "sigset_t", "socklen_t", "intptr_t", "nfds_t",
         "pthread_t", "pthread_once_t", "pthread_attr_t",
         "pthread_mutex_t", "pthread_mutexattr_t",
+        "Lmid_t",
     ]
 
 artifitial_type = [ "funcptr_t" ]
@@ -62,7 +62,6 @@ def parse_return_type(words):
     global type_qualifier
     global struct_or_union_specifier
     global enum_specifier
-    global typedef_specifier
     global pointer
 
     i = 0
@@ -182,6 +181,10 @@ def make_uftrace_retval_format(ctype, funcname):
         retval_format += "retval/u"
     elif ctype == "funcptr_t":
         retval_format += "retval/p"
+    elif ctype == "off64_t":
+        retval_format += "retval/d64"
+    elif ctype.startswith('enum'):
+        retval_format += "retval/e:%s" % ctype[5:]
     else:
         retval_format += "retval"
 
@@ -211,6 +214,8 @@ def make_uftrace_args_format(args, funcname):
             args_format += "arg%d/u" % i
         elif arg == "funcptr_t":
             args_format += "arg%d/p" % i
+        elif arg == "off64_t":
+            args_format += "arg%d/d64" % i
         elif arg.startswith('enum'):
             args_format += "arg%d/e:%s" % (i, arg[5:])
         else:
@@ -254,6 +259,16 @@ if __name__ == "__main__":
     enum_list = ""
     args_list = ""
     retvals_list = ""
+
+    # operator new and delete and their variations
+    args_list     = '\t\"_Znwm@arg1/u;\"\n'   \
+                  + '\t\"_Znam@arg1/u;\"\n'   \
+                  + '\t\"_ZdlPv@arg1/x;\"\n'  \
+                  + '\t\"_ZdaPv@arg1/x;\"\n'
+
+    # operator new and its variations
+    retvals_list  = '\t\"_Znwm@retval/x;\"\n' \
+                  + '\t\"_Znam@retval/x;\"\n'
 
     t = DECL_TYPE_NONE
     with open(prototype_file) as fin:

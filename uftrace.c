@@ -1,7 +1,7 @@
 /*
  * uftrace - Function (Graph) Tracer for Userspace
  *
- * Copyright (C) 2014-2017  LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
+ * Copyright (C) 2014-2018  LG Electronics, Namhyung Kim <namhyung.kim@lge.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -94,6 +94,10 @@ enum options {
 	OPT_nest_libcall,
 	OPT_record,
 	OPT_auto_args,
+	OPT_libname,
+	OPT_match_type,
+	OPT_no_randomize_addr,
+	OPT_no_event,
 };
 
 static struct argp_option uftrace_options[] = {
@@ -150,7 +154,7 @@ static struct argp_option uftrace_options[] = {
 	{ "kernel-only", OPT_kernel_only, 0, 0, "Dump kernel data only" },
 	{ "flame-graph", OPT_flame_graph, 0, 0, "Dump recorded data in FlameGraph format" },
 	{ "sample-time", OPT_sample_time, "TIME", 0, "Show flame graph with this sampling time" },
-	{ "output-fields", 'f', "FIELD", 0, "Show FIELDs in the replay output (default: 'duration,tid')" },
+	{ "output-fields", 'f', "FIELD", 0, "Show FIELDs in the replay or graph output" },
 	{ "time-range", 'r', "TIME~TIME", 0, "Show output within the TIME(timestamp or elapsed time) range only" },
 	{ "patch", 'P', "FUNC", 0, "Apply dynamic patching for FUNCs" },
 	{ "event", 'E', "EVENT", 0, "Enable EVENT to save more information" },
@@ -163,7 +167,12 @@ static struct argp_option uftrace_options[] = {
 	{ "event-full", OPT_event_full, 0, 0, "Show all events outside of function" },
 	{ "nest-libcall", OPT_nest_libcall, 0, 0, "Show nested library calls" },
 	{ "record", OPT_record, 0, 0, "Record a new trace data before running command" },
-	{ "auto-args", OPT_auto_args, 0, 0, "Show arguments and return value of known functions" },
+	{ "auto-args", 'a', 0, 0, "Show arguments and return value of known functions" },
+	{ "libname", OPT_libname, 0, 0, "Show libname name with symbol name" },
+	{ "match", OPT_match_type, "TYPE", 0, "Support pattern match: regex, glob (default: regex)" },
+	{ "no-randomize-addr", OPT_no_randomize_addr, 0, 0, "Disable ASLR (Address Space Layout Randomization)" },
+	{ "no-event", OPT_no_event, 0, 0, "Disable (default) events" },
+	{ "help", 'h', 0, 0, "Give this help list" },
 	{ 0 }
 };
 
@@ -267,11 +276,13 @@ static int parse_demangle(char *arg)
 
 static void parse_debug_domain(char *arg)
 {
-	char *str, *saved_str;
-	char *tok, *pos, *tmp;
+	struct strv strv = STRV_INIT;
+	char *tok, *tmp;
+	int i;
 
-	saved_str = str = xstrdup(arg);
-	while ((tok = strtok_r(str, ",", &pos)) != NULL) {
+	strv_split(&strv, arg, ",");
+
+	strv_for_each(&strv, tok, i) {
 		int level = -1;
 
 		tmp = strchr(tok, ':');
@@ -302,12 +313,14 @@ static void parse_debug_domain(char *arg)
 			dbg_domain[DBG_DYNAMIC] = level;
 		else if (!strcmp(tok, "event"))
 			dbg_domain[DBG_EVENT] = level;
-
-		str = NULL;
+		else if (!strcmp(tok, "script"))
+			dbg_domain[DBG_SCRIPT] = level;
+		else if (!strcmp(tok, "dwarf"))
+			dbg_domain[DBG_DWARF] = level;
 	}
 
 	dbg_domain_set = true;
-	free(saved_str);
+	strv_free(&strv);
 }
 
 static bool has_time_unit(const char *str)
@@ -445,6 +458,10 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		opts->retval = opt_add_string(opts->retval, arg);
 		break;
 
+	case 'a':
+		opts->auto_args = true;
+		break;
+
 	case 'f':
 		opts->fields = arg;
 		break;
@@ -469,6 +486,10 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		}
 		else
 			opts->event = opt_add_string(opts->event, arg);
+		break;
+
+	case 'h':
+		argp_state_help (state, state->out_stream, ARGP_HELP_STD_HELP);
 		break;
 
 	case OPT_flat:
@@ -496,7 +517,10 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		break;
 
 	case OPT_tid_filter:
-		opts->tid = opt_add_string(opts->tid, arg);
+		if (strtol(arg, NULL, 0) <= 0)
+			pr_use("invalid thread id: %s\n", arg);
+		else
+			opts->tid = opt_add_string(opts->tid, arg);
 		break;
 
 	case OPT_no_merge:
@@ -698,8 +722,24 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		opts->record = true;
 		break;
 
-	case OPT_auto_args:
-		opts->auto_args = true;
+	case OPT_libname:
+		opts->libname = true;
+		break;
+
+	case OPT_match_type:
+		opts->patt_type = parse_filter_pattern(arg);
+		if (opts->patt_type == PATT_NONE) {
+			pr_use("invalid match pattern: %s (ignoring...)\n", arg);
+			opts->patt_type = PATT_REGEX;
+		}
+		break;
+
+	case OPT_no_randomize_addr:
+		opts->no_randomize_addr = true;
+		break;
+
+	case OPT_no_event:
+		opts->no_event = true;
 		break;
 
 	case ARGP_KEY_ARG:
@@ -729,6 +769,8 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 			opts->mode = UFTRACE_MODE_GRAPH;
 		else if (!strcmp("script", arg))
 			opts->mode = UFTRACE_MODE_SCRIPT;
+		else if (!strcmp("tui", arg))
+			opts->mode = UFTRACE_MODE_TUI;
 		else
 			return ARGP_ERR_UNKNOWN; /* almost same as fall through */
 		break;
@@ -781,7 +823,7 @@ static void parse_opt_file(int *argc, char ***argv, char *filename, struct opts 
 	struct argp file_argp = {
 		.options = uftrace_options,
 		.parser = parse_option,
-		.args_doc = "[record|replay|live|report|info|dump|recv|graph|script] [<program>]",
+		.args_doc = "[record|replay|live|report|info|dump|recv|graph|script|tui] [<program>]",
 		.doc = "uftrace -- function (graph) tracer for userspace",
 	};
 	char *orig_exename = NULL;
@@ -854,7 +896,7 @@ void parse_script_opt(struct opts *opts)
 	struct argp opt_argp = {
 		.options = uftrace_options,
 		.parser = parse_option,
-		.args_doc = "[record|replay|live|report|info|dump|recv|graph|script] [<program>]",
+		.args_doc = "[record|replay|live|report|info|dump|recv|graph|script|tui] [<program>]",
 		.doc = "uftrace -- function (graph) tracer for userspace",
 	};
 
@@ -931,11 +973,12 @@ int main(int argc, char *argv[])
 		.fields         = NULL,
 		.sort_column	= 2,
 		.event_skip_out = true,
+		.patt_type      = PATT_REGEX,
 	};
 	struct argp argp = {
 		.options = uftrace_options,
 		.parser = parse_option,
-		.args_doc = "[record|replay|live|report|info|dump|recv|graph|script] [<program>]",
+		.args_doc = "[record|replay|live|report|info|dump|recv|graph|script|tui] [<program>]",
 		.doc = "uftrace -- function (graph) tracer for userspace",
 	};
 	int ret = -1;
@@ -953,7 +996,7 @@ int main(int argc, char *argv[])
 		debug = 1;
 
 	if (opts.logfile) {
-		logfp = fopen(opts.logfile, "w");
+		logfp = fopen(opts.logfile, "a");
 		if (logfp == NULL)
 			pr_err("cannot open log file");
 
@@ -974,16 +1017,27 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	opts.range.kernel_skip_out = opts.kernel_skip_out;
+	opts.range.event_skip_out  = opts.event_skip_out;
+
 	setup_color(opts.color);
 	setup_signal();
 
-	if (opts.mode == UFTRACE_MODE_RECORD || opts.mode == UFTRACE_MODE_RECV)
+	if (opts.mode == UFTRACE_MODE_RECORD ||
+	    opts.mode == UFTRACE_MODE_RECV ||
+	    opts.mode == UFTRACE_MODE_TUI)
 		opts.use_pager = false;
 	if (opts.nop)
 		opts.use_pager = false;
 
 	if (opts.use_pager)
 		start_pager();
+
+	if (opts.idx == 0)
+		opts.idx = argc;
+
+	argc -= opts.idx;
+	argv += opts.idx;
 
 	switch (opts.mode) {
 	case UFTRACE_MODE_RECORD:
@@ -1013,6 +1067,9 @@ int main(int argc, char *argv[])
 	case UFTRACE_MODE_SCRIPT:
 		ret = command_script(argc, argv, &opts);
 		break;
+	case UFTRACE_MODE_TUI:
+		ret = command_tui(argc, argv, &opts);
+		break;
 	case UFTRACE_MODE_INVALID:
 		ret = 1;
 		break;
@@ -1030,6 +1087,9 @@ int main(int argc, char *argv[])
 	return ret;
 }
 #else
+
+#define OPT_FILE  "opt"
+
 TEST_CASE(option_parsing1)
 {
 	char *stropt = NULL;
@@ -1136,7 +1196,7 @@ TEST_CASE(option_parsing3)
 		.args_doc = "argument description",
 		.doc = "uftrace option parsing test",
 	};
-	char *argv[] = { "uftrace", "-v", "--opt-file", "xxx", };
+	char *argv[] = { "uftrace", "-v", "--opt-file", OPT_FILE, };
 	int argc = ARRAY_SIZE(argv);
 	char opt_file[] = "-K 2\n" "-b4m\n" "--column-view\n" "--depth=3\n" "t-abc";
 	int file_argc;
@@ -1145,18 +1205,18 @@ TEST_CASE(option_parsing3)
 	int saved_debug = debug;
 
 	/* create opt-file */
-	fp = fopen("xxx", "w");
+	fp = fopen(OPT_FILE, "w");
 	TEST_NE(fp, NULL);
 	fwrite(opt_file, strlen(opt_file), 1, fp);
 	fclose(fp);
 
 	argp_parse(&argp, argc, argv, ARGP_IN_ORDER, NULL, &opts);
-	TEST_STREQ(opts.opt_file, "xxx");
+	TEST_STREQ(opts.opt_file, OPT_FILE);
 
 	parse_opt_file(&file_argc, &file_argv, opts.opt_file, &opts);
 	TEST_EQ(file_argc, 6);
 
-	unlink("xxx");
+	unlink(OPT_FILE);
 
 	TEST_EQ(opts.mode, UFTRACE_MODE_LIVE);
 	TEST_EQ(debug, saved_debug + 1);
@@ -1183,7 +1243,7 @@ TEST_CASE(option_parsing4)
 		.args_doc = "argument description",
 		.doc = "uftrace option parsing test",
 	};
-	char *argv[] = { "uftrace", "-v", "--opt-file", "xxx", };
+	char *argv[] = { "uftrace", "-v", "--opt-file", OPT_FILE, };
 	int argc = ARRAY_SIZE(argv);
 	char opt_file[] = "-K 2\n"
 		"# buffer size: 4 MB\n"
@@ -1205,18 +1265,18 @@ TEST_CASE(option_parsing4)
 	int saved_debug = debug;
 
 	/* create opt-file */
-	fp = fopen("xxx", "w");
+	fp = fopen(OPT_FILE, "w");
 	TEST_NE(fp, NULL);
 	fwrite(opt_file, strlen(opt_file), 1, fp);
 	fclose(fp);
 
 	argp_parse(&argp, argc, argv, ARGP_IN_ORDER, NULL, &opts);
-	TEST_STREQ(opts.opt_file, "xxx");
+	TEST_STREQ(opts.opt_file, OPT_FILE);
 
 	parse_opt_file(&file_argc, &file_argv, opts.opt_file, &opts);
 	TEST_EQ(file_argc, 6);
 
-	unlink("xxx");
+	unlink(OPT_FILE);
 
 	TEST_EQ(opts.mode, UFTRACE_MODE_LIVE);
 	TEST_EQ(debug, saved_debug + 1);
@@ -1243,7 +1303,7 @@ TEST_CASE(option_parsing5)
 		.args_doc = "argument description",
 		.doc = "uftrace option parsing test",
 	};
-	char *argv[] = { "uftrace", "-v", "--opt-file", "xxx", "hello" };
+	char *argv[] = { "uftrace", "-v", "--opt-file", OPT_FILE, "hello" };
 	int argc = ARRAY_SIZE(argv);
 	char opt_file[] = "record\n" "-F main\n" "--time-filter 1us\n" "--depth=3\n" "t-abc";
 	int file_argc = argc;
@@ -1252,17 +1312,17 @@ TEST_CASE(option_parsing5)
 	int saved_debug = debug;
 
 	/* create opt-file */
-	fp = fopen("xxx", "w");
+	fp = fopen(OPT_FILE, "w");
 	TEST_NE(fp, NULL);
 	fwrite(opt_file, strlen(opt_file), 1, fp);
 	fclose(fp);
 
 	argp_parse(&argp, argc, argv, ARGP_IN_ORDER, NULL, &opts);
-	TEST_STREQ(opts.opt_file, "xxx");
+	TEST_STREQ(opts.opt_file, OPT_FILE);
 
 	parse_opt_file(&file_argc, &file_argv, opts.opt_file, &opts);
 
-	unlink("xxx");
+	unlink(OPT_FILE);
 
 	TEST_EQ(opts.mode, UFTRACE_MODE_RECORD);
 	TEST_EQ(debug, saved_debug + 1);

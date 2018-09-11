@@ -1,11 +1,12 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <assert.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
-#include <fcntl.h>
-#include <pthread.h>
 
 /* This should be defined before #include "utils.h" */
 #define PR_FMT     "mcount"
@@ -25,17 +26,20 @@ static struct mcount_shmem_buffer *allocate_shmem_buffer(char *buf, size_t size,
 							 int tid, int idx)
 {
 	int fd;
+	int saved_errno = 0;
 	struct mcount_shmem_buffer *buffer = NULL;
 
 	snprintf(buf, size, SHMEM_SESSION_FMT, mcount_session_name(), tid, idx);
 
 	fd = shm_open(buf, O_RDWR | O_CREAT | O_TRUNC, 0600);
 	if (fd < 0) {
+		saved_errno = errno;
 		pr_dbg("failed to open shmem buffer: %s\n", buf);
 		goto out;
 	}
 
 	if (ftruncate(fd, shmem_bufsize) < 0) {
+		saved_errno = errno;
 		pr_dbg("failed to resizing shmem buffer: %s\n", buf);
 		goto out;
 	}
@@ -43,6 +47,7 @@ static struct mcount_shmem_buffer *allocate_shmem_buffer(char *buf, size_t size,
 	buffer = mmap(NULL, shmem_bufsize, PROT_READ | PROT_WRITE,
 		      MAP_SHARED, fd, 0);
 	if (buffer == MAP_FAILED) {
+		saved_errno = errno;
 		pr_dbg("failed to mmap shmem buffer: %s\n", buf);
 		buffer = NULL;
 		goto out;
@@ -51,6 +56,7 @@ static struct mcount_shmem_buffer *allocate_shmem_buffer(char *buf, size_t size,
 	close(fd);
 
 out:
+	errno = saved_errno;
 	return buffer;
 }
 
@@ -61,7 +67,7 @@ void prepare_shmem_buffer(struct mcount_thread_data *mtdp)
 	int tid = mcount_gettid(mtdp);
 	struct mcount_shmem *shmem = &mtdp->shmem;
 
-	pr_dbg2("preparing shmem buffers\n");
+	pr_dbg2("preparing shmem buffers: tid = %d\n", tid);
 
 	shmem->nr_buf = 2;
 	shmem->max_buf = 2;
@@ -84,7 +90,7 @@ void prepare_shmem_buffer(struct mcount_thread_data *mtdp)
 	shmem->buffer[0]->flag = SHMEM_FL_RECORDING | SHMEM_FL_NEW;
 }
 
-void get_new_shmem_buffer(struct mcount_thread_data *mtdp)
+static void get_new_shmem_buffer(struct mcount_thread_data *mtdp)
 {
 	char buf[128];
 	struct mcount_shmem *shmem = &mtdp->shmem;
@@ -175,7 +181,7 @@ reuse:
 	}
 }
 
-void finish_shmem_buffer(struct mcount_thread_data *mtdp, int idx)
+static void finish_shmem_buffer(struct mcount_thread_data *mtdp, int idx)
 {
 	char buf[64];
 
@@ -223,6 +229,19 @@ void shmem_finish(struct mcount_thread_data *mtdp)
 	clear_shmem_buffer(mtdp);
 }
 
+static struct mcount_event * get_event_pointer(void *base, unsigned idx)
+{
+	size_t len = 0;
+	struct mcount_event *event = base;
+
+	while (idx--) {
+		len += EVTBUF_HDR + event->dsize;
+		event = base + len;
+	}
+
+	return event;
+}
+
 #ifndef DISABLE_MCOUNT_FILTER
 void *get_argbuf(struct mcount_thread_data *mtdp,
 		 struct mcount_ret_stack *rstack)
@@ -230,6 +249,156 @@ void *get_argbuf(struct mcount_thread_data *mtdp,
 	ptrdiff_t idx = rstack - mtdp->rstack;
 
 	return mtdp->argbuf + (idx * ARGBUF_SIZE);
+}
+
+#define   HEAP_REGION_UNIT  128*MB
+#define  STACK_REGION_UNIT    8*MB
+
+struct mem_region {
+	struct rb_node		node;
+	unsigned long		start;
+	unsigned long		end;
+};
+
+static void add_mem_region(struct rb_root *root, unsigned long start,
+			   unsigned long end, bool update_end)
+{
+	struct rb_node *parent = NULL;
+	struct rb_node **p = &root->rb_node;
+	struct mem_region *iter, *entry;
+
+	while (*p) {
+		parent = *p;
+		iter = rb_entry(parent, struct mem_region, node);
+
+		if (update_end) {
+			if (iter->start == start) {
+				if (iter->end != end)
+					iter->end = end;
+				return;
+			}
+		}
+		else {
+			if (iter->end == end) {
+				if (iter->start != start)
+					iter->start = start;
+				return;
+			}
+		}
+
+		if (iter->start > start)
+			p = &parent->rb_left;
+		else
+			p = &parent->rb_right;
+	}
+
+	entry = xmalloc(sizeof(*entry));
+	entry->start = start;
+	entry->end = end;
+
+	pr_dbg3("mem region: %lx - %lx\n", start, end);
+	rb_link_node(&entry->node, parent, p);
+	rb_insert_color(&entry->node, root);
+}
+
+static void update_mem_regions(struct mcount_mem_regions *regions)
+{
+	FILE *fp;
+	char buf[PATH_MAX];
+
+	fp = fopen("/proc/self/maps", "r");
+	if (fp == NULL)
+		return;
+
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		char *p = buf, *next;
+		unsigned long start, end;
+		bool is_stack = false;
+
+		/* XXX: cannot use *scanf() due to crash (SSE alignment?) */
+		start = strtoul(p, &next, 16);
+		if (*next != '-')
+			pr_warn("invalid /proc/map format\n");
+
+		p = next + 1;
+		end = strtoul(p, &next, 16);
+
+		if (strstr(next, "[heap]")) {
+			end = ROUND_UP(end, HEAP_REGION_UNIT);
+			if (end > regions->brk)
+				regions->brk = end;
+			regions->heap = start;
+		}
+		if (strstr(next, "[stack")) {
+			start = ROUND_DOWN(start, STACK_REGION_UNIT);
+			is_stack = true;
+		}
+
+		add_mem_region(&regions->root, start, end, !is_stack);
+	}
+	fclose(fp);
+}
+
+static bool find_mem_region(struct rb_root *root, unsigned long addr)
+{
+	struct rb_node *parent = NULL;
+	struct rb_node **p = &root->rb_node;
+	struct mem_region *iter;
+
+	while (*p) {
+		parent = *p;
+		iter = rb_entry(parent, struct mem_region, node);
+
+		if (iter->start <= addr && addr < iter->end)
+			return true;
+
+		if (iter->start > addr)
+			p = &parent->rb_left;
+		else
+			p = &parent->rb_right;
+	}
+
+	pr_dbg2("cannot find mem region: %lx\n");
+	return false;
+}
+
+static bool check_mem_region(struct mcount_arg_context *ctx,
+			     unsigned long addr)
+{
+	bool update = true;
+	struct mcount_mem_regions *regions = ctx->regions;
+
+retry:
+	if (regions->heap <= addr && addr < regions->brk)
+		return true;
+
+	if (find_mem_region(&regions->root, addr))
+		return true;
+
+	if (update) {
+		mcount_save_arch_context(ctx->arch);
+		update_mem_regions(regions);
+		mcount_restore_arch_context(ctx->arch);
+		update = false;
+		goto retry;
+	}
+
+	return false;
+}
+
+void finish_mem_region(struct mcount_mem_regions *regions)
+{
+	struct rb_root *root = &regions->root;
+	struct rb_node *node;
+	struct mem_region *mr;
+
+	while (!RB_EMPTY_ROOT(root)) {
+		node = rb_first(root);
+		mr = rb_entry(node, typeof(*mr), node);
+
+		rb_erase(node, root);
+		free(mr);
+	}
 }
 
 static unsigned save_to_argbuf(void *argbuf, struct list_head *args_spec,
@@ -271,6 +440,12 @@ static unsigned save_to_argbuf(void *argbuf, struct list_head *args_spec,
 			if (str) {
 				unsigned i;
 				char *dst = ptr + 2;
+				char buf[32];
+
+				if (!check_mem_region(ctx, ctx->val.i)) {
+					len = snprintf(buf, sizeof(buf), "<%p>", str);
+					str = buf;
+				}
 
 				/*
 				 * Calling strlen() might clobber floating-point
@@ -282,7 +457,7 @@ static unsigned save_to_argbuf(void *argbuf, struct list_head *args_spec,
 					dst[i] = str[i];
 
 					/* truncate long string */
-					if (i > ARG_STR_MAX) {
+					if (i == ARG_STR_MAX) {
 						dst[i-3] = '.';
 						dst[i-2] = '.';
 						dst[i-1] = '.';
@@ -328,6 +503,8 @@ void save_argument(struct mcount_thread_data *mtdp,
 	struct mcount_arg_context ctx = {
 		.regs = regs,
 		.stack_base = rstack->parent_loc,
+		.regions = &mtdp->mem_regions,
+		.arch = &mtdp->arch,
 	};
 
 	size = save_to_argbuf(argbuf, args_spec, &ctx);
@@ -348,6 +525,8 @@ void save_retval(struct mcount_thread_data *mtdp,
 	unsigned size;
 	struct mcount_arg_context ctx = {
 		.retval = retval,
+		.regions = &mtdp->mem_regions,
+		.arch = &mtdp->arch,
 	};
 
 	size = save_to_argbuf(argbuf, args_spec, &ctx);
@@ -357,10 +536,10 @@ void save_retval(struct mcount_thread_data *mtdp,
 		return;
 	}
 
-	*(unsigned *)argbuf = size;
+	*(uint32_t *)argbuf = size;
 }
 
-static void save_proc_statm(void *buf)
+static int save_proc_statm(void *buf)
 {
 	FILE *fp;
 	struct uftrace_proc_statm *statm = buf;
@@ -380,49 +559,163 @@ static void save_proc_statm(void *buf)
 	statm->shared *= page_size_in_kb;
 
 	fclose(fp);
+	return 0;
 }
 
-static void save_page_fault(void *buf)
+static void diff_proc_statm(void *dst, void *src)
+{
+	struct uftrace_proc_statm *dst_statm = dst;
+	struct uftrace_proc_statm *src_statm = src;
+
+	dst_statm->vmsize -= src_statm->vmsize;
+	dst_statm->vmrss  -= src_statm->vmrss;
+	dst_statm->shared -= src_statm->shared;
+}
+
+static int save_page_fault(void *buf)
 {
 	struct rusage ru;
 	struct uftrace_page_fault *page_fault = buf;
 
 	/* getrusage provides faults info in a single syscall */
-	getrusage(RUSAGE_SELF, &ru);
+	if (getrusage(RUSAGE_SELF, &ru) < 0)
+		return -1;
 
 	page_fault->major = ru.ru_majflt;
 	page_fault->minor = ru.ru_minflt;
+	return 0;
 }
+
+static void diff_page_fault(void *dst, void *src)
+{
+	struct uftrace_page_fault *dst_pgflt = dst;
+	struct uftrace_page_fault *src_pgflt = src;
+
+	dst_pgflt->major -= src_pgflt->major;
+	dst_pgflt->minor -= src_pgflt->minor;
+}
+
+static int save_pmu_cycle(void *buf)
+{
+	return read_pmu_event(EVENT_ID_READ_PMU_CYCLE, buf);
+}
+
+static void diff_pmu_cycle(void *dst, void *src)
+{
+	struct uftrace_pmu_cycle *dst_cycle = dst;
+	struct uftrace_pmu_cycle *src_cycle = src;
+
+	dst_cycle->cycles -= src_cycle->cycles;
+	dst_cycle->instrs -= src_cycle->instrs;
+}
+
+static int save_pmu_cache(void *buf)
+{
+	return read_pmu_event(EVENT_ID_READ_PMU_CACHE, buf);
+}
+
+static void diff_pmu_cache(void *dst, void *src)
+{
+	struct uftrace_pmu_cache *dst_cache = dst;
+	struct uftrace_pmu_cache *src_cache = src;
+
+	dst_cache->refers -= src_cache->refers;
+	dst_cache->misses -= src_cache->misses;
+}
+
+static int save_pmu_branch(void *buf)
+{
+	return read_pmu_event(EVENT_ID_READ_PMU_BRANCH, buf);
+}
+
+static void diff_pmu_branch(void *dst, void *src)
+{
+	struct uftrace_pmu_branch *dst_branch = dst;
+	struct uftrace_pmu_branch *src_branch = src;
+
+	dst_branch->branch -= src_branch->branch;
+	dst_branch->misses -= src_branch->misses;
+}
+
+/* above functions should follow the name convention to use below macro */
+#define TR_ID(_evt)  TRIGGER_READ_##_evt, EVENT_ID_READ_##_evt, EVENT_ID_DIFF_##_evt
+#define TR_DS(_evt)  sizeof(struct uftrace_##_evt)
+#define TR_FN(_evt)  save_##_evt, diff_##_evt
+
+static struct read_event_data {
+	enum trigger_read_type	type;
+	enum uftrace_event_id	id_read;
+	enum uftrace_event_id	id_diff;
+	size_t			size;
+	int (*save)(void *buf);
+	void (*diff)(void *dst, void *src);
+} read_events[] = {
+	{ TR_ID(PROC_STATM), TR_DS(proc_statm), TR_FN(proc_statm) },
+	{ TR_ID(PAGE_FAULT), TR_DS(page_fault), TR_FN(page_fault) },
+	{ TR_ID(PMU_CYCLE),  TR_DS(pmu_cycle),  TR_FN(pmu_cycle)  },
+	{ TR_ID(PMU_CACHE),  TR_DS(pmu_cache),  TR_FN(pmu_cache)  },
+	{ TR_ID(PMU_BRANCH), TR_DS(pmu_branch), TR_FN(pmu_branch) },
+};
+
+#undef TR_ID
+#undef TR_DS
+#undef TR_FN
 
 void save_trigger_read(struct mcount_thread_data *mtdp,
 		       struct mcount_ret_stack *rstack,
-		       enum trigger_read_type type)
+		       enum trigger_read_type type, bool diff)
 {
-	if (type & TRIGGER_READ_PROC_STATM) {
-		struct mcount_event *event;
+	void *ptr = get_argbuf(mtdp, rstack) + rstack->event_idx;
+	struct mcount_event *event;
+	unsigned short evsize;
+	void *arg_data = get_argbuf(mtdp, rstack);
+	size_t i;
 
-		if (mtdp->nr_events < MAX_EVENT) {
-			event = &mtdp->event[mtdp->nr_events++];
+	if (rstack->flags & (MCOUNT_FL_ARGUMENT | MCOUNT_FL_RETVAL))
+		arg_data += *(uint32_t *)ptr;
 
-			event->id    = EVENT_ID_PROC_STATM;
-			event->time  = rstack->start_time;
-			event->dsize = sizeof(struct uftrace_proc_statm);
-			event->idx   = mtdp->idx;
-			save_proc_statm(event->data);
+
+	for (i = 0; i < ARRAY_SIZE(read_events); i++) {
+		struct read_event_data *red = &read_events[i];
+
+		if (!(type & red->type))
+			continue;
+
+		evsize = EVTBUF_HDR + red->size;
+		event = ptr - evsize;
+
+		/* do not overwrite argument data */
+		if ((void *)event < arg_data)
+			continue;
+
+		event->id    = red->id_read;
+		event->time  = rstack->end_time ?: rstack->start_time;
+		event->dsize = red->size;
+		event->idx   = mtdp->idx;
+
+		if (red->save(event->data) < 0)
+			continue;
+
+		if (diff) {
+			struct mcount_event *old_event = NULL;
+			unsigned idx;
+
+			for (idx = 0; idx < rstack->nr_events; idx++) {
+				old_event = get_event_pointer(ptr, idx);
+				if (old_event->id == event->id)
+					break;
+			}
+
+			if (old_event) {
+				event->id = red->id_diff;
+				red->diff(event->data, old_event->data);
+			}
 		}
-	}
-	if (type & TRIGGER_READ_PAGE_FAULT) {
-		struct mcount_event *event;
 
-		if (mtdp->nr_events < MAX_EVENT) {
-			event = &mtdp->event[mtdp->nr_events++];
+		ptr = event;
 
-			event->id    = EVENT_ID_PAGE_FAULT;
-			event->time  = rstack->start_time;
-			event->dsize = sizeof(struct uftrace_page_fault);
-			event->idx   = mtdp->idx;
-			save_page_fault(event->data);
-		}
+		rstack->nr_events++;
+		rstack->event_idx -= evsize;
 	}
 }
 
@@ -445,12 +738,35 @@ void save_trigger_read(struct mcount_thread_data *mtdp,
 }
 #endif
 
-static int record_event(struct mcount_thread_data *mtdp)
+static struct mcount_shmem_buffer * get_shmem_buffer(struct mcount_thread_data *mtdp,
+						     size_t size)
 {
 	struct mcount_shmem *shmem = &mtdp->shmem;
-	struct mcount_event *event = &mtdp->event[0];
 	struct mcount_shmem_buffer *curr_buf = shmem->buffer[shmem->curr];
 	size_t maxsize = (size_t)shmem_bufsize - sizeof(**shmem->buffer);
+
+	if (unlikely(shmem->curr == -1 || curr_buf->size + size > maxsize)) {
+		if (shmem->done)
+			return NULL;
+		if (shmem->curr > -1)
+			finish_shmem_buffer(mtdp, shmem->curr);
+		get_new_shmem_buffer(mtdp);
+
+		if (shmem->curr == -1) {
+			shmem->losts++;
+			return NULL;
+		}
+
+		curr_buf = shmem->buffer[shmem->curr];
+	}
+
+	return curr_buf;
+}
+
+static int record_event(struct mcount_thread_data *mtdp,
+			struct mcount_event *event)
+{
+	struct mcount_shmem_buffer *curr_buf;
 	struct {
 		uint64_t time;
 		uint64_t data;
@@ -461,20 +777,9 @@ static int record_event(struct mcount_thread_data *mtdp)
 	if (data_size)
 		size += ALIGN(data_size + 2, 8);
 
-	if (unlikely(shmem->curr == -1 || curr_buf->size + size > maxsize)) {
-		if (shmem->done)
-			return 0;
-		if (shmem->curr > -1)
-			finish_shmem_buffer(mtdp, shmem->curr);
-		get_new_shmem_buffer(mtdp);
-
-		if (shmem->curr == -1) {
-			shmem->losts++;
-			return -1;
-		}
-
-		curr_buf = shmem->buffer[shmem->curr];
-	}
+	curr_buf = get_shmem_buffer(mtdp, size);
+	if (curr_buf == NULL)
+		return mtdp->shmem.done ? 0 : -1;
 
 	rec = (void *)(curr_buf->data + curr_buf->size);
 
@@ -497,9 +802,6 @@ static int record_event(struct mcount_thread_data *mtdp)
 
 	curr_buf->size += size;
 
-	/* clear event info */
-	mtdp->nr_events--;
-
 	return 0;
 }
 
@@ -509,9 +811,7 @@ static int record_ret_stack(struct mcount_thread_data *mtdp,
 {
 	struct uftrace_record *frstack;
 	uint64_t timestamp = mrstack->start_time;
-	struct mcount_shmem *shmem = &mtdp->shmem;
 	struct mcount_shmem_buffer *curr_buf;
-	size_t maxsize;
 	size_t size = sizeof(*frstack);
 	void *argbuf = NULL;
 	uint64_t *buf;
@@ -521,12 +821,36 @@ static int record_ret_stack(struct mcount_thread_data *mtdp,
 		timestamp = mrstack->end_time;
 
 	if (unlikely(mtdp->nr_events)) {
+		/* save async events first (if any) */
 		while (mtdp->nr_events && mtdp->event[0].time < timestamp) {
-			record_event(mtdp);
+			record_event(mtdp, &mtdp->event[0]);
+			mtdp->nr_events--;
 
 			mcount_memcpy4(&mtdp->event[0], &mtdp->event[1],
 				       sizeof(*mtdp->event) * mtdp->nr_events);
 		}
+	}
+
+	if (type == UFTRACE_EXIT && unlikely(mrstack->nr_events)) {
+		int i;
+		unsigned evidx;
+		struct mcount_event *event;
+
+		argbuf = get_argbuf(mtdp, mrstack) + mrstack->event_idx;
+
+		for (i = 0; i < mrstack->nr_events; i++) {
+			evidx = mrstack->nr_events - i - 1;
+			event = get_event_pointer(argbuf, evidx);
+
+			if (event->time != timestamp)
+				continue;
+
+			/* save read2 trigger before exit record */
+			record_event(mtdp, event);
+		}
+
+		mrstack->nr_events = 0;
+		argbuf = NULL;
 	}
 
 	if ((type == UFTRACE_ENTRY && mrstack->flags & MCOUNT_FL_ARGUMENT) ||
@@ -536,23 +860,9 @@ static int record_ret_stack(struct mcount_thread_data *mtdp,
 			size += *(unsigned *)argbuf;
 	}
 
-	maxsize = (size_t)shmem_bufsize - sizeof(**shmem->buffer);
-	curr_buf = shmem->buffer[shmem->curr];
-
-	if (unlikely(shmem->curr == -1 || curr_buf->size + size > maxsize)) {
-		if (shmem->done)
-			return 0;
-		if (shmem->curr > -1)
-			finish_shmem_buffer(mtdp, shmem->curr);
-		get_new_shmem_buffer(mtdp);
-
-		if (shmem->curr == -1) {
-			shmem->losts++;
-			return -1;
-		}
-
-		curr_buf = shmem->buffer[shmem->curr];
-	}
+	curr_buf = get_shmem_buffer(mtdp, size);
+	if (curr_buf == NULL)
+		return mtdp->shmem.done ? 0 : -1;
 
 #if 0
 	frstack = (void *)(curr_buf->data + curr_buf->size);
@@ -593,6 +903,26 @@ static int record_ret_stack(struct mcount_thread_data *mtdp,
 
 	pr_dbg3("rstack[%d] %s %lx\n", mrstack->depth,
 	       type == UFTRACE_ENTRY? "ENTRY" : "EXIT ", mrstack->child_ip);
+
+	if (unlikely(mrstack->nr_events) && type == UFTRACE_ENTRY) {
+		int i;
+		unsigned evidx;
+		struct mcount_event *event;
+
+		argbuf = get_argbuf(mtdp, mrstack) + mrstack->event_idx;
+
+		for (i = 0; i < mrstack->nr_events; i++) {
+			evidx = mrstack->nr_events - i - 1;
+			event = get_event_pointer(argbuf, evidx);
+
+			if (event->time != timestamp)
+				break;
+
+			/* save read trigger after entry record */
+			record_event(mtdp, event);
+		}
+	}
+
 	return 0;
 }
 
@@ -660,7 +990,7 @@ int record_trace_data(struct mcount_thread_data *mtdp,
 	}
 
 	if (!(mrstack->flags & (MCOUNT_FL_WRITTEN | SKIP_FLAGS))) {
-		if (record_ret_stack(mtdp, UFTRACE_ENTRY, non_written_mrstack))
+		if (record_ret_stack(mtdp, UFTRACE_ENTRY, mrstack))
 			return 0;
 
 		count--;
@@ -669,6 +999,8 @@ int record_trace_data(struct mcount_thread_data *mtdp,
 	if (mrstack->end_time) {
 		if (retval)
 			save_retval(mtdp, mrstack, retval);
+		else
+			mrstack->flags &= ~MCOUNT_FL_RETVAL;
 
 		if (record_ret_stack(mtdp, UFTRACE_EXIT, mrstack))
 			return 0;
@@ -684,9 +1016,10 @@ void record_proc_maps(char *dirname, const char *sess_id,
 		      struct symtabs *symtabs)
 {
 	FILE *ifp, *ofp;
-	char buf[4096];
+	char buf[PATH_MAX];
 	struct uftrace_mmap *prev_map = NULL;
 	char *last_libname = NULL;
+	bool last_prot_x = false;
 
 	ifp = fopen("/proc/self/maps", "r");
 	if (ifp == NULL)
@@ -698,6 +1031,8 @@ void record_proc_maps(char *dirname, const char *sess_id,
 	if (ofp == NULL)
 		pr_err("cannot open for writing maps file");
 
+	symtabs->kernel_base = -1ULL;
+
 	while (fgets(buf, sizeof(buf), ifp)) {
 		unsigned long start, end;
 		char prot[5];
@@ -708,29 +1043,55 @@ void record_proc_maps(char *dirname, const char *sess_id,
 		/* skip anon mappings */
 		if (sscanf(buf, "%lx-%lx %s %*x %*x:%*x %*d %s\n",
 			   &start, &end, prot, path) != 4)
-			goto next;
-
-		/* skip non-executable mappings */
-		if (prot[2] != 'x')
-			goto next;
-
-		/* use first mapping only */
-		if (last_libname && !strcmp(last_libname, path))
 			continue;
+
+		/*
+		 * skip special mappings like [heap], [vdso] etc.
+		 * but [stack] is still needed to get kernel base address.
+		 */
+		if (path[0] == '[') {
+			if (strncmp(path, "[stack", 6) == 0) {
+				symtabs->kernel_base = get_kernel_base(buf);
+				last_prot_x = true;
+				goto next;
+			}
+			else
+				continue;
+		}
+
+		/*
+		 * use first mapping only to calculate the offset correctly.
+		 * but if the first mapping is not executable, extends it
+		 * to span to the executable (probably the second) mapping.
+		 */
+		if (last_libname && !strcmp(last_libname, path)) {
+			if (!last_prot_x && (prot[2] == 'x')) {
+				prev_map->end = end;
+				last_prot_x = true;
+
+				snprintf(buf, sizeof(buf), "%"PRIx64"-%"PRIx64" %s",
+					 prev_map->start, prev_map->end,
+					 strchr(buf, ' ') + 1);
+				goto next;
+			}
+			continue;
+		}
+
+		last_prot_x = (prot[2] == 'x');
+
+		/* still need to write the map for executable */
+		if (!strcmp(path, symtabs->filename))
+			symtabs->exec_base = start;
 
 		/* save map for the executable */
 		namelen = ALIGN(strlen(path) + 1, 4);
 
-		map = xmalloc(sizeof(*map) + namelen);
+		map = xzalloc(sizeof(*map) + namelen);
 
 		map->start = start;
 		map->end = end;
 		map->len = namelen;
 		mcount_memcpy1(map->prot, prot, 4);
-		map->symtab.sym = NULL;
-		map->symtab.sym_names = NULL;
-		map->symtab.nr_sym = 0;
-		map->symtab.nr_alloc = 0;
 		mcount_memcpy1(map->libname, path, namelen);
 		map->libname[strlen(path)] = '\0';
 		last_libname = map->libname;
@@ -742,9 +1103,10 @@ void record_proc_maps(char *dirname, const char *sess_id,
 
 		map->next = NULL;
 		prev_map = map;
-
 next:
-		fprintf(ofp, "%s", buf);
+		/* defer write until it finds an exec-map */
+		if (last_prot_x)
+			fprintf(ofp, "%s", buf);
 	}
 
 	fclose(ifp);

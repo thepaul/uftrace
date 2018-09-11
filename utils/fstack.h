@@ -5,10 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#include "../uftrace.h"
+#include "uftrace.h"
+#include "utils/filter.h"
 
 struct sym;
-struct uftrace_trigger;
 
 enum fstack_flag {
 	FSTACK_FL_FILTERED	= (1U << 0),
@@ -45,8 +45,10 @@ struct ftrace_task_handle {
 	struct ftrace_file_handle *h;
 	struct uftrace_record ustack;
 	struct uftrace_record kstack;
+	struct uftrace_record estack;
 	struct uftrace_record *rstack;
 	struct uftrace_rstack_list rstack_list;
+	struct uftrace_rstack_list event_list;
 	int stack_count;
 	int lost_count;
 	int user_stack_count;
@@ -96,8 +98,6 @@ enum argspec_string_bits {
 extern bool fstack_enabled;
 extern bool live_disabled;
 
-void setup_task_handle(struct ftrace_file_handle *handle,
-		       struct ftrace_task_handle *task, int tid);
 struct ftrace_task_handle *get_task_handle(struct ftrace_file_handle *handle,
 					   int tid);
 void reset_task_handle(struct ftrace_file_handle *handle);
@@ -127,9 +127,15 @@ static inline bool is_kernel_record(struct ftrace_task_handle *task,
 	return rec == &task->kstack;
 }
 
-void setup_task_filter(char *tid_filter, struct ftrace_file_handle *handle);
+static inline bool is_event_record(struct ftrace_task_handle *task,
+				  struct uftrace_record *rec)
+{
+	return rec == &task->estack;
+}
+
 void setup_fstack_args(char *argspec, char *retspec,
-		       struct ftrace_file_handle *handle, bool auto_args);
+		       struct ftrace_file_handle *handle, bool auto_args,
+		       enum uftrace_pattern_type patt_type);
 int fstack_setup_filters(struct opts *opts, struct ftrace_file_handle *handle);
 
 int fstack_entry(struct ftrace_task_handle *task,
@@ -142,6 +148,8 @@ struct ftrace_task_handle *fstack_skip(struct ftrace_file_handle *handle,
 				       struct ftrace_task_handle *task,
 				       int curr_depth, bool event_skip_out);
 bool fstack_check_filter(struct ftrace_task_handle *task);
+bool fstack_check_opts(struct ftrace_task_handle *task, struct opts *opts);
+
 void get_argspec_string(struct ftrace_task_handle *task,
 		        char *args, size_t len,
 		        enum argspec_string_bits str_mode);

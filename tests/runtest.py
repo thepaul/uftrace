@@ -21,9 +21,10 @@ class TestBase:
     TEST_SUCCESS_FIXED = -8
 
     objdir = 'objdir' in os.environ and os.environ['objdir'] or '..'
-    ftrace = objdir + '/uftrace --no-pager -L' + objdir
+    uftrace_cmd = objdir + '/uftrace --no-pager --no-event -L' + objdir
 
-    default_cflags = ['-fno-inline', '-fno-builtin', '-fno-omit-frame-pointer']
+    default_cflags = ['-fno-inline', '-fno-builtin', '-fno-ipa-cp',
+                      '-fno-omit-frame-pointer', '-D_FORTIFY_SOURCE=0']
 
     def __init__(self, name, result, lang='C', cflags='', ldflags='', sort='task'):
         self.name = name
@@ -91,7 +92,6 @@ class TestBase:
         return self.build_it(build_cmd)
 
     def build_libfoo(self, name, cflags='', ldflags=''):
-        prog = 't-' + name
         lang = TestBase.supported_lang['C++']
 
         build_cflags  = ' '.join(TestBase.default_cflags + [self.cflags, cflags, \
@@ -130,7 +130,7 @@ class TestBase:
     def runcmd(self):
         """ This function returns (shell) command that runs the test.
             A test case can extend this to setup a complex configuration.  """
-        return '%s %s' % (TestBase.ftrace, 't-' + self.name)
+        return '%s %s' % (TestBase.uftrace_cmd, 't-' + self.name)
 
     def task_sort(self, output, ignore_children=False):
         """ This function post-processes output of the test to be compared .
@@ -202,8 +202,11 @@ class TestBase:
             # A report line consists of following data
             # [0]         [1]   [2]        [3]   [4]     [5]
             # total_time  unit  self_time  unit  called  function
-            if line[5].startswith('__'):
-                continue
+            try:
+                if line[5].startswith('__'):
+                    continue
+            except:
+                pass
             result.append('%s %s' % (line[4], line[5]))
 
         return '\n'.join(result)
@@ -229,14 +232,16 @@ class TestBase:
                 if ln.startswith('   ['):
                     result.append(ln.split('(')[0])  # remove '(addr)' part
             if mode == 2:
-                result.append(ln.split(':')[1])      # remove time part
+                if " : " in ln:
+                    result.append(ln.split(':')[1])  # remove time part
+                else:
+                    result.append(ln)
 
         return '\n'.join(result)
 
     def dump_sort(self, output, ignored):
         """ This function post-processes output of the test to be compared .
             It ignores blank and comment (#) lines and remaining functions.  """
-        import re
 
         # A (raw) dump result consists of following data
         # <timestamp> <tid>: [<type>] <func>(<addr>) depth: <N>
@@ -245,7 +250,8 @@ class TestBase:
         result = []
         for ln in output.split('\n'):
             if ln.startswith('uftrace'):
-                result.append(ln)
+                #result.append(ln)
+                pass
             else:
                 m = patt.match(ln)
                 if m is None:
@@ -272,7 +278,16 @@ class TestBase:
         for ln in o['traceEvents']:
             if ln['name'].startswith('__'):
                 continue
-            result.append("%s %s" % (ln['ph'], ln['name']))
+            if ln['ph'] == "M":
+                if ln['name'] == "process_name" or ln['name'] == "thread_name":
+                    args = ln['args']
+                    name = args['name']
+                    m = re.search(r'\[\d+\] (.*)', args['name'])
+                    if m:
+                        name = m.group(1)
+                    result.append("%s %s %s" % (ln['ph'], ln['name'], name))
+            else:
+                result.append("%s %s" % (ln['ph'], ln['name']))
         return '\n'.join(result)
 
     def sort(self, output, ignore_children=False):
@@ -299,7 +314,24 @@ class TestBase:
            apply it and re-test with the modified result."""
         return result
 
-    def run(self, name, cflags, diff):
+    def check_dependency(self, item):
+        import os.path
+        return os.path.exists('../check-deps/' + item)
+
+    def check_perf_paranoid(self):
+        try:
+            f = open('/proc/sys/kernel/perf_event_paranoid')
+            v = int(f.readline())
+            f.close()
+
+            if v == 3:
+                return False
+        except:
+            pass
+
+        return True
+
+    def run(self, name, cflags, diff, timeout):
         ret = TestBase.TEST_SUCCESS
 
         test_cmd = self.runcmd()
@@ -307,22 +339,29 @@ class TestBase:
 
         p = sp.Popen(test_cmd, shell=True, stdout=sp.PIPE, stderr=sp.PIPE)
 
-        timed_out = False
-        def timeout(sig, frame):
-            timed_out = True
+        class Timeout(Exception):
+            pass
+
+        def timeout_handler(sig, frame):
             try:
                 p.kill()
-            except:
-                pass
+            finally:
+                raise Timeout
 
         import signal
-        signal.signal(signal.SIGALRM, timeout)
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(timeout)
+
+        timed_out = False
+        try:
+            result_origin = p.communicate()[0].decode(errors='ignore')
+        except Timeout:
+            result_origin = ''
+            timed_out = True
+        signal.alarm(0)
 
         result_expect = self.sort(self.result)
-        signal.alarm(5)
-        result_origin = p.communicate()[0].decode(errors='ignore')
         result_tested = self.sort(result_origin)  # for python3
-        signal.alarm(0)
 
         ret = p.wait()
         if ret < 0:
@@ -354,8 +393,11 @@ class TestBase:
                 f = open('result', 'w')
                 f.write(result_tested + '\n')
                 f.close()
-                p = sp.Popen(['diff', '-U1', 'expect', 'result'], stdout=sp.PIPE)
                 print("%s: diff result of %s" % (name, cflags))
+                try:
+                    p = sp.Popen(['colordiff', '-U1', 'expect', 'result'], stdout=sp.PIPE)
+                except:
+                    p = sp.Popen(['diff', '-U1', 'expect', 'result'], stdout=sp.PIPE)
                 print(p.communicate()[0].decode(errors='ignore'))
                 os.remove('expect')
                 os.remove('result')
@@ -405,14 +447,14 @@ result_string = {
     TestBase.TEST_SUCCESS_FIXED:  'Test succeeded (with some fixup)',
 }
 
-def run_single_case(case, flags, opts, diff, dbg):
+def run_single_case(case, flags, opts, arg):
     result = []
 
     # for python3
     _locals = {}
     exec("import %s; tc = %s.TestCase()" % (case, case), globals(), _locals)
     tc = _locals['tc']
-    tc.set_debug(dbg)
+    tc.set_debug(arg.debug)
 
     for flag in flags:
         for opt in opts:
@@ -421,7 +463,7 @@ def run_single_case(case, flags, opts, diff, dbg):
             if ret == TestBase.TEST_SUCCESS:
                 ret = tc.pre()
                 if ret == TestBase.TEST_SUCCESS:
-                    ret = tc.run(case, cflags, diff)
+                    ret = tc.run(case, cflags, arg.diff, int(arg.timeout))
                     ret = tc.post(ret)
             result.append(ret)
 
@@ -459,6 +501,8 @@ def parse_argument():
                         help="show internal command and result for debugging")
     parser.add_argument("-n", "--no-color", dest='color', action='store_false',
                         help="suppress color in the output")
+    parser.add_argument("-t", "--timeout", dest='timeout', default=5,
+                        help="fail test if it runs more than TIMEOUT seconds")
 
     return parser.parse_args()
 
@@ -515,7 +559,7 @@ if __name__ == "__main__":
 
     for tc in sorted(testcases):
         name = tc[:-3]  # remove '.py'
-        result = run_single_case(name, flags, opts.split(), arg.diff, arg.debug)
+        result = run_single_case(name, flags, opts.split(), arg)
         print_test_result(name, result, arg.color)
         for r in result:
             stats[r] += 1

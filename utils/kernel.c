@@ -1,7 +1,7 @@
 /*
  * Linux kernel ftrace support code.
  *
- * Copyright (c) 2015-2017  LG Electronics,  Namhyung Kim <namhyung@gmail.com>
+ * Copyright (c) 2015-2018  LG Electronics,  Namhyung Kim <namhyung@gmail.com>
  *
  * Released under the GPL v2.
  */
@@ -11,7 +11,6 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <dirent.h>
-#include <fnmatch.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 
@@ -60,12 +59,10 @@ static void put_tracing_file(char *file)
 	free(file);
 }
 
-static int __write_tracing_file(const char *name, const char *val, bool append,
-				bool correct_sys_prefix)
+static int open_tracing_file(const char *name, bool append)
 {
 	char *file;
-	int fd, ret = -1;
-	ssize_t size = strlen(val);
+	int fd;
 	int flags = O_WRONLY;
 
 	file = get_tracing_file(name);
@@ -80,10 +77,18 @@ static int __write_tracing_file(const char *name, const char *val, bool append,
 		flags |= O_TRUNC;
 
 	fd = open(file, flags);
-	if (fd < 0) {
+	if (fd < 0)
 		pr_dbg("cannot open tracing file: %s: %m\n", name);
-		goto out;
-	}
+
+	put_tracing_file(file);
+	return fd;
+}
+
+static int __write_tracing_file(int fd, const char *name, const char *val,
+				bool append, bool correct_sys_prefix)
+{
+	int ret = -1;
+	ssize_t size = strlen(val);
 
 	if (correct_sys_prefix) {
 		char *newval = (char *)val;
@@ -124,20 +129,35 @@ static int __write_tracing_file(const char *name, const char *val, bool append,
 	if (ret < 0)
 		pr_dbg("write '%s' to tracing/%s failed: %m\n", val, name);
 
-	close(fd);
-out:
-	put_tracing_file(file);
 	return ret;
 }
 
 static int write_tracing_file(const char *name, const char *val)
 {
-	return __write_tracing_file(name, val, false, false);
+	int ret;
+	int fd = open_tracing_file(name, false);
+
+	if (fd < 0)
+		return -1;
+
+	ret = __write_tracing_file(fd, name, val, false, false);
+
+	close(fd);
+	return ret;
 }
 
 static int append_tracing_file(const char *name, const char *val)
 {
-	return __write_tracing_file(name, val, true, false);
+	int ret;
+	int fd = open_tracing_file(name, true);
+
+	if (fd < 0)
+		return -1;
+
+	ret = __write_tracing_file(fd, name, val, true, false);
+
+	close(fd);
+	return ret;
 }
 
 static int set_tracing_pid(int pid)
@@ -148,7 +168,9 @@ static int set_tracing_pid(int pid)
 	if (append_tracing_file("set_ftrace_pid", buf) < 0)
 		return -1;
 
-	return append_tracing_file("set_event_pid", buf);
+	/* ignore error on old kernel */
+	append_tracing_file("set_event_pid", buf);
+	return 0;
 }
 
 static int set_tracing_clock(void)
@@ -161,50 +183,48 @@ struct kfilter {
 	char name[];
 };
 
+static int set_filter_file(const char *filter_file, struct list_head *filters)
+{
+	struct kfilter *pos, *tmp;
+	int ret = -1;
+	int fd;
+
+	fd = open_tracing_file(filter_file, true);
+	if (fd < 0)
+		return -1;
+
+	list_for_each_entry_safe(pos, tmp, filters, list) {
+		if (__write_tracing_file(fd, filter_file, pos->name,
+					 true, true) < 0)
+			goto out;
+
+		list_del(&pos->list);
+		free(pos);
+
+		/* separate filters by space */
+		if (write(fd, " ", 1) != 1)
+			goto out;
+	}
+	ret = 0;
+
+out:
+	close(fd);
+	return ret;
+}
+
 static int set_tracing_filter(struct uftrace_kernel_writer *kernel)
 {
-	const char *filter_file;
-	struct kfilter *pos, *tmp;
+	if (set_filter_file("set_graph_function", &kernel->filters) < 0)
+		return -1;
 
-	filter_file = "set_graph_function";
-	list_for_each_entry_safe(pos, tmp, &kernel->filters, list) {
-		if (__write_tracing_file(filter_file, pos->name,
-					 true, true) < 0)
-			return -1;
+	/* ignore error on old kernel */
+	set_filter_file("set_graph_notrace", &kernel->notrace);
 
-		list_del(&pos->list);
-		free(pos);
-	}
+	if (set_filter_file("set_ftrace_filter", &kernel->patches) < 0)
+		return -1;
 
-	filter_file = "set_graph_notrace";
-	list_for_each_entry_safe(pos, tmp, &kernel->notrace, list) {
-		if (__write_tracing_file(filter_file, pos->name,
-					 true, true) < 0)
-			return -1;
-
-		list_del(&pos->list);
-		free(pos);
-	}
-
-	filter_file = "set_ftrace_filter";
-	list_for_each_entry_safe(pos, tmp, &kernel->patches, list) {
-		if (__write_tracing_file(filter_file, pos->name,
-					 true, true) < 0)
-			return -1;
-
-		list_del(&pos->list);
-		free(pos);
-	}
-
-	filter_file = "set_ftrace_notrace";
-	list_for_each_entry_safe(pos, tmp, &kernel->nopatch, list) {
-		if (__write_tracing_file(filter_file, pos->name,
-					 true, true) < 0)
-			return -1;
-
-		list_del(&pos->list);
-		free(pos);
-	}
+	if (set_filter_file("set_ftrace_notrace", &kernel->nopatch) < 0)
+		return -1;
 
 	return 0;
 }
@@ -254,25 +274,70 @@ static int set_tracing_options(struct uftrace_kernel_writer *kernel)
 	return 0;
 }
 
+static void add_single_filter(struct list_head *head, char *name)
+{
+	struct kfilter *kfilter;
+
+	kfilter = xmalloc(sizeof(*kfilter) + strlen(name) + 1);
+	strcpy(kfilter->name, name);
+	list_add(&kfilter->list, head);
+}
+
+static void add_pattern_filter(struct list_head *head,
+			       struct uftrace_pattern *patt)
+{
+	char *filename;
+	FILE *fp;
+	char buf[1024];
+
+	filename = get_tracing_file("available_filter_functions");
+	fp = fopen(filename, "r");
+	if (fp == NULL)
+		pr_err("failed to open 'tracing/available_filter_functions' file");
+
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		/* remove module name part */
+		char *pos = strchr(buf, '[');
+		size_t len;
+
+		if (pos)
+			*pos = '\0';
+
+		/* remove trailing whitespace */
+		len = strlen(buf);
+		if (isspace(buf[len - 1]))
+			buf[len - 1] = '\0';
+
+		if (match_filter_pattern(patt, buf))
+			add_single_filter(head, buf);
+	}
+
+	fclose(fp);
+	put_tracing_file(filename);
+}
+
 static void build_kernel_filter(struct uftrace_kernel_writer *kernel,
 				char *filter_str,
+				enum uftrace_pattern_type ptype,
 				struct list_head *filters,
 				struct list_head *notrace)
 {
 	struct list_head *head;
-	struct kfilter *kfilter;
-	char *pos, *str, *name;
+	struct strv strv = STRV_INIT;
+	char *pos, *name;
+	int j;
 
 	if (filter_str == NULL)
 		return;
 
-	pos = str = xstrdup(filter_str);
+	strv_split(&strv, filter_str, ";");
 
-	name = strtok(pos, ";");
-	while (name) {
+	strv_for_each(&strv, name, j) {
+		struct uftrace_pattern patt;
+
 		pos = strstr(name, "@kernel");
 		if (pos == NULL)
-			goto next;
+			continue;
 		*pos = '\0';
 
 		if (name[0] == '!') {
@@ -282,14 +347,16 @@ static void build_kernel_filter(struct uftrace_kernel_writer *kernel,
 		else
 			head = filters;
 
-		kfilter = xmalloc(sizeof(*kfilter) + strlen(name) + 1);
-		strcpy(kfilter->name, name);
-		list_add(&kfilter->list, head);
+		init_filter_pattern(ptype, &patt, name);
 
-next:
-		name = strtok(NULL, ";");
+		if (patt.type == PATT_SIMPLE)
+			add_single_filter(head, name);
+		else
+			add_pattern_filter(head, &patt);
+
+		free_filter_pattern(&patt);
 	}
-	free(str);
+	strv_free(&strv);
 }
 
 struct kevent {
@@ -321,7 +388,8 @@ static void add_single_event(struct list_head *events, char *name)
 	list_add_tail(&kevent->list, events);
 }
 
-static void add_glob_event(struct list_head *events, char *name)
+static void add_pattern_event(struct list_head *events,
+			      struct uftrace_pattern *patt)
 {
 	char *filename;
 	FILE *fp;
@@ -334,7 +402,7 @@ static void add_glob_event(struct list_head *events, char *name)
 
 	while (fgets(buf, sizeof(buf), fp) != NULL) {
 		/* it's ok to have a trailing '\n' */
-		if (fnmatch(name, buf, 0) == 0)
+		if (match_filter_pattern(patt, buf))
 			add_single_event(events, buf);
 	}
 
@@ -343,31 +411,36 @@ static void add_glob_event(struct list_head *events, char *name)
 }
 
 static void build_kernel_event(struct uftrace_kernel_writer *kernel,
-			       char *event_str, struct list_head *events)
+			       char *event_str, enum uftrace_pattern_type ptype,
+			       struct list_head *events)
 {
-	char *pos, *str, *name;
+	struct strv strv = STRV_INIT;
+	char *pos, *name;
+	int j;
 
 	if (event_str == NULL)
 		return;
 
-	pos = str = xstrdup(event_str);
+	strv_split(&strv, event_str, ";");
 
-	name = strtok(pos, ";");
-	while (name) {
+	strv_for_each(&strv, name, j) {
+		struct uftrace_pattern patt;
+
 		pos = strstr(name, "@kernel");
 		if (pos == NULL)
-			goto next;
+			continue;
 		*pos = '\0';
 
-		if (strpbrk(name, "*?[]{}"))
-			add_glob_event(events, name);
-		else
-			add_single_event(events, name);
+		init_filter_pattern(ptype, &patt, name);
 
-next:
-		name = strtok(NULL, ";");
+		if (patt.type == PATT_SIMPLE)
+			add_single_event(events, name);
+		else
+			add_pattern_event(events, &patt);
+
+		free_filter_pattern(&patt);
 	}
-	free(str);
+	strv_free(&strv);
 }
 
 static int reset_tracing_files(void)
@@ -384,13 +457,11 @@ static int reset_tracing_files(void)
 	if (write_tracing_file("set_ftrace_pid", " ") < 0)
 		return -1;
 
-	if (write_tracing_file("set_event_pid", " ") < 0)
-		return -1;
-
 	if (write_tracing_file("set_graph_function", " ") < 0)
 		return -1;
 
 	/* ignore error on old kernel */
+	write_tracing_file("set_event_pid", " ");
 	write_tracing_file("set_graph_notrace", " ");
 	write_tracing_file("options/event-fork", "0");
 	write_tracing_file("options/function-fork", "0");
@@ -467,6 +538,58 @@ out:
 	return -EINVAL;
 }
 
+static void skip_kernel_functions(struct uftrace_kernel_writer *kernel)
+{
+	unsigned int i;
+	struct kfilter *kfilter;
+	const char *skip_funcs[] = {
+		/*
+		 * Some (old) kernel and architecture doesn't support VDSO
+		 * so there will be many sys_clock_gettime() in the output
+		 * due to internal call in libmcount.  It'd be better
+		 * ignoring them not to confuse users.  I think it does NOT
+		 * affect to the output when VDSO is enabled.
+		 */
+		"sys_clock_gettime",
+		/*
+		 * Currently kernel tracing seems to wake up uftrace writer
+		 * threads too often using the irq_work interrupt.  This
+		 * messes up the trace output so it'd be better hiding them.
+		 */
+		"smp_irq_work_interrupt",
+		/* Disable syscall tracing in the kernel */
+		"syscall_trace_enter_phase1",
+		"syscall_slow_exit_work",
+	};
+
+	for (i = 0; i < ARRAY_SIZE(skip_funcs); i++) {
+		bool add = true;
+		const char *name = skip_funcs[i];
+		struct kfilter *pos;
+
+		/* Don't skip it if user particularly want to see them*/
+		list_for_each_entry(pos, &kernel->filters, list) {
+			if (strcmp(pos->name, name)) {
+				add = false;
+				break;
+			}
+		}
+
+		list_for_each_entry(pos, &kernel->patches, list) {
+			if (strcmp(pos->name, name)) {
+				add = false;
+				break;
+			}
+		}
+
+		if (add) {
+			kfilter = xmalloc(sizeof(*kfilter) + strlen(name) + 1);
+			strcpy(kfilter->name, name);
+			list_add(&kfilter->list, &kernel->notrace);
+		}
+	}
+}
+
 /**
  * setup_kernel_tracing - prepare to record kernel ftrace data (binary)
  * @kernel : kernel ftrace handle
@@ -486,11 +609,12 @@ int setup_kernel_tracing(struct uftrace_kernel_writer *kernel, struct opts *opts
 	INIT_LIST_HEAD(&kernel->nopatch);
 	INIT_LIST_HEAD(&kernel->events);
 
-	build_kernel_filter(kernel, opts->filter,
+	build_kernel_filter(kernel, opts->filter, opts->patt_type,
 			    &kernel->filters, &kernel->notrace);
-	build_kernel_filter(kernel, opts->patch,
+	build_kernel_filter(kernel, opts->patch, opts->patt_type,
 			    &kernel->patches, &kernel->nopatch);
-	build_kernel_event(kernel, opts->event, &kernel->events);
+	build_kernel_event(kernel, opts->event, opts->patt_type,
+			   &kernel->events);
 
 	if (opts->kernel)
 		kernel->tracer = KERNEL_GRAPH_TRACER;
@@ -500,19 +624,8 @@ int setup_kernel_tracing(struct uftrace_kernel_writer *kernel, struct opts *opts
 	/* mark kernel tracing is enabled (for event tracing) */
 	opts->kernel = true;
 
-	if (opts->kernel_skip_out) {
-		/*
-		 * Some (old) kernel and architecture doesn't support VDSO
-		 * so there will be many sys_clock_gettime() in the output
-		 * due to internal call in libmcount.  It'd be better
-		 * ignoring them not to confuse users.  I think it does NOT
-		 * affect to the output when VDSO is enabled.
-		 *
-		 * If an user wants to see them, give --kernel-full option.
-		 */
-		build_kernel_filter(kernel, "!sys_clock_gettime@kernel",
-				    &kernel->filters, &kernel->notrace);
-	}
+	if (opts->kernel_skip_out)
+		skip_kernel_functions(kernel);
 
 	ret = __setup_kernel_tracing(kernel);
 	if (ret < 0)
@@ -547,7 +660,7 @@ int setup_kernel_tracing(struct uftrace_kernel_writer *kernel, struct opts *opts
 int start_kernel_tracing(struct uftrace_kernel_writer *kernel)
 {
 	char *trace_file;
-	char buf[4096];
+	char buf[PATH_MAX];
 	int i;
 	int saved_errno;
 
@@ -616,7 +729,7 @@ out:
 int record_kernel_trace_pipe(struct uftrace_kernel_writer *kernel,
 			     int cpu, int sock)
 {
-	char buf[4096];
+	char buf[PATH_MAX];
 	ssize_t n;
 
 	if (cpu < 0 || cpu >= kernel->nr_cpus)
@@ -766,7 +879,7 @@ static int read_file(char *filename, char *buf, size_t len)
 static int save_kernel_file(FILE *fp, const char *name)
 {
 	ssize_t len;
-	char buf[4096];
+	char buf[PATH_MAX];
 
 	snprintf(buf, sizeof(buf), "%s/%s", TRACING_DIR, name);
 
@@ -783,7 +896,7 @@ static int save_kernel_file(FILE *fp, const char *name)
 static int save_event_files(struct uftrace_kernel_writer *kernel, FILE *fp)
 {
 	int ret = -1;
-	char buf[4096];
+	char buf[PATH_MAX];
 	DIR *subsys = NULL;
 	DIR *event = NULL;
 	struct dirent *sys, *name;
@@ -905,7 +1018,7 @@ static int load_current_kernel(struct uftrace_kernel_reader *kernel)
 {
 	int fd;
 	size_t len;
-	char buf[4096];
+	char buf[PATH_MAX];
 	bool is_big_endian = !strcmp(get_endian_str(), "BE");
 	struct pevent *pevent = kernel->pevent;
 
@@ -945,7 +1058,7 @@ static int load_kernel_files(struct uftrace_kernel_reader *kernel)
 {
 	char *path = NULL;
 	FILE *fp;
-	char buf[4096];
+	char buf[PATH_MAX];
 	struct pevent *pevent = kernel->pevent;
 	int ret = 0;
 
@@ -1054,7 +1167,7 @@ static int scandir_filter(const struct dirent *d)
 int setup_kernel_data(struct uftrace_kernel_reader *kernel)
 {
 	int i;
-	char buf[4096];
+	char buf[PATH_MAX];
 	enum kbuffer_endian endian = KBUFFER_ENDIAN_LITTLE;
 	enum kbuffer_long_size longsize = KBUFFER_LSIZE_8;
 	struct dirent **list;
@@ -1608,6 +1721,7 @@ retry:
 	}
 
 	memcpy(&(*taskp)->kstack, first_rstack, sizeof(*first_rstack));
+	kernel->last_read_cpu = first_cpu;
 
 	return first_cpu;
 }

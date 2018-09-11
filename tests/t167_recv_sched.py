@@ -30,16 +30,21 @@ class TestCase(TestBase):
     recv_p = None
 
     def pre(self):
-        recv_cmd = '%s recv -d %s' % (TestBase.ftrace, TDIR)
+        if not TestBase.check_dependency(self, 'perf_context_switch'):
+            return TestBase.TEST_SKIP
+        if not TestBase.check_perf_paranoid(self):
+            return TestBase.TEST_SKIP
+
+        recv_cmd = '%s recv -d %s' % (TestBase.uftrace_cmd, TDIR)
         self.recv_p = sp.Popen(recv_cmd.split())
 
         options = '-H %s -E %s' % ('localhost', 'linux:schedule')
-        record_cmd = '%s record %s %s' % (TestBase.ftrace, options, 't-' + self.name)
+        record_cmd = '%s record %s %s' % (TestBase.uftrace_cmd, options, 't-' + self.name)
         sp.call(record_cmd.split())
         return TestBase.TEST_SUCCESS
 
     def runcmd(self):
-        return '%s replay -d %s' % (TestBase.ftrace, TDIR2)
+        return '%s replay -d %s' % (TestBase.uftrace_cmd.split()[0], TDIR2)
 
     def post(self, ret):
         self.recv_p.terminate()

@@ -62,8 +62,14 @@ OPTIONS
 \--event-full
 :   Show all (user) events outside of user functions.  This option is only meaningful when used with \--chrome or \--flame-graph options.
 
+\--no-event
+:   Do not show any events.
+
 \--demangle=*TYPE*
 :   Use demangled C++ symbol names for filters, triggers, arguments and/or return values.  Possible values are "full", "simple" and "no".  Default is "simple" which ignores function arguments and template parameters.
+
+--match=*TYPE*
+:   Use pattern match using TYPE.  Possible types are `regex` and `glob`.  Default is `regex`.
 
 
 EXAMPLE
