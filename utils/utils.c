@@ -16,6 +16,9 @@
 
 volatile bool uftrace_done;
 
+/* default uftrace options to be applied for analysis commands */
+struct strv default_opts = STRV_INIT;
+
 void sighandler(int sig)
 {
 	uftrace_done = true;
@@ -133,7 +136,7 @@ int writev_all(int fd, struct iovec *iov, int count)
 	return 0;
 }
 
-int remove_directory(char *dirname)
+int remove_directory(const char *dirname)
 {
 	DIR *dp;
 	struct dirent *ent;
@@ -178,17 +181,105 @@ failed:
 	return ret;
 }
 
-int create_directory(char *dirname)
+static bool is_uftrace_directory(const char *path)
+{
+	int fd;
+	bool ret = false;
+	char *info_path = NULL;
+	char sig[UFTRACE_MAGIC_LEN] = {0,};
+
+	/* ensure that there is "info" file in the recorded directory */
+	xasprintf(&info_path, "%s/info", path);
+	fd = open(info_path, O_RDONLY);
+	free(info_path);
+
+	if (fd != -1) {
+		if (read(fd, sig, UFTRACE_MAGIC_LEN) != UFTRACE_MAGIC_LEN) {
+			/*
+			 * partial read() will return false anyway
+			 * since memcmp() below cannot success.
+			 */
+		}
+		close(fd);
+		return !memcmp(sig, UFTRACE_MAGIC_STR, UFTRACE_MAGIC_LEN);
+	}
+
+	/* if "info" file is missing, also check that there is "default.opts" */
+	xasprintf(&info_path, "%s/default.opts", path);
+	if (!access(info_path, F_OK))
+		ret = true;
+	free(info_path);
+
+	return ret;
+}
+
+static bool is_empty_directory(const char *path)
+{
+	DIR *dp = opendir(path);
+	struct dirent *ent;
+	int ret = true;
+
+	if (dp == NULL)
+		return false;
+
+	while ((ent = readdir(dp)) != NULL) {
+		if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
+			continue;
+
+		ret = false;
+		break;
+	}
+	closedir(dp);
+
+	return ret;
+}
+
+static bool can_remove_directory(const char *path)
+{
+	if (access(path, F_OK) != 0)
+		return false;
+
+	return is_uftrace_directory(path) || is_empty_directory(path);
+}
+
+static bool create_default_opts(const char *dirname)
+{
+	char *opts_str = strv_join(&default_opts, " ");
+	char opts_filename[PATH_MAX];
+	FILE *fp;
+	bool ret = false;
+
+	snprintf(opts_filename, PATH_MAX, "%s/default.opts", dirname);
+	fp = fopen(opts_filename, "w");
+	if (fp == NULL) {
+		pr_dbg("Open failed: %s\n", opts_filename);
+		goto out;
+	}
+
+	if (opts_str)
+		fprintf(fp, "%s\n", opts_str);
+	fclose(fp);
+	ret = true;
+
+out:
+	strv_free(&default_opts);
+	free(opts_str);
+	return ret;
+}
+
+int create_directory(const char *dirname)
 {
 	int ret = -1;
 	char *oldname = NULL;
 
 	xasprintf(&oldname, "%s.old", dirname);
 
-	if (!access(dirname, F_OK)) {
-		if (!access(oldname, F_OK) && remove_directory(oldname) < 0) {
-			pr_warn("removing old directory failed: %m\n");
-			goto out;
+	if (can_remove_directory(dirname)) {
+		if (can_remove_directory(oldname)) {
+			if (remove_directory(oldname) < 0) {
+				pr_warn("removing old directory failed: %m\n");
+				goto out;
+			}
 		}
 
 		if (rename(dirname, oldname) < 0) {
@@ -201,12 +292,14 @@ int create_directory(char *dirname)
 	if (ret < 0)
 		pr_warn("creating directory failed: %m\n");
 
+	create_default_opts(dirname);
+
 out:
 	free(oldname);
 	return ret;
 }
 
-int chown_directory(char *dirname)
+int chown_directory(const char *dirname)
 {
 	DIR *dp;
 	struct dirent *ent;
@@ -388,6 +481,44 @@ uint64_t parse_time(char *arg, int limited_digits)
 	return val;
 }
 
+uint64_t parse_timestamp(char *arg)
+{
+	char *sep;
+	unsigned long tmp;
+	uint64_t ts;
+	int len;
+
+	tmp = strtoul(arg, &sep, 0);
+	ts = tmp * NSEC_PER_SEC;
+
+	if (*sep == '.') {
+		arg = sep + 1;
+		tmp = strtoul(arg, &sep, 0);
+
+		len = 0;
+		while (isdigit(*arg)) {
+			arg++;
+			len++;
+		}
+
+		/* if resolution is lower than nsec */
+		while (len < 9) {
+			tmp *= 10;
+			len++;
+		}
+
+		/* if resolution is higher than nsec */
+		while (len > 9) {
+			tmp /= 10;
+			len--;
+		}
+
+		ts += tmp;
+	}
+
+	return ts;
+}
+
 /**
  * strjoin - join two strings with a delimiter
  * @left:  string buffer to join (dynamic allocated, can be NULL)
@@ -489,6 +620,21 @@ void strv_append(struct strv *strv, const char *str)
 	strv->p[strv->nr + 0] = xstrdup(str);
 	strv->p[strv->nr + 1] = NULL;
 	strv->nr++;
+}
+
+/**
+ * str_replace - replace a string to a new one
+ * @strv: string vector
+ * @idx:  index of the (old) string
+ * @str:  new string to be replaced
+ *
+ * This function replaces @strv[@idx] to @str.  Callers should not use the old
+ * string after this function.
+ */
+void strv_replace(struct strv *strv, int idx, const char *str)
+{
+	free(strv->p[idx]);
+	strv->p[idx] = xstrdup(str);
 }
 
 /**

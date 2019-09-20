@@ -8,6 +8,8 @@
 #define PERF_MMAP_SIZE  (132 * 1024)  /* 32 + 1 pages */
 #define PERF_WATERMARK  (8 * 1024)    /* 2 pages */
 
+#define COMM_LEN  16
+
 struct uftrace_perf_writer {
 	int			*event_fd;
 	void			**page;
@@ -37,8 +39,10 @@ struct perf_comm_event {
 	 * type: PERF_RECORD_COMM (3)
 	 */
 	uint32_t		 pid, tid;
-	char			 comm[16];   /* variable length (aligned to 8) */
-	struct sample_id	 sample_id;  /* needs to be read separately */
+        /* variable length (aligned to 8) */
+	char			 comm[COMM_LEN];
+        /* needs to be read separately */
+	struct sample_id	 sample_id;
 };
 
 struct perf_context_switch_event {
@@ -62,7 +66,7 @@ struct uftrace_task_event {
 struct uftrace_comm_event {
 	int		pid;
 	bool		exec;
-	char		comm[16];
+	char		comm[COMM_LEN];
 };
 
 #ifdef HAVE_PERF_CLOCKID
@@ -116,15 +120,15 @@ struct uftrace_perf_reader {
 	} u;
 };
 
-struct ftrace_file_handle;
+struct uftrace_data;
 struct uftrace_record;
 
-int setup_perf_data(struct ftrace_file_handle *handle);
-void finish_perf_data(struct ftrace_file_handle *handle);
-int read_perf_data(struct ftrace_file_handle *handle);
-struct uftrace_record * get_perf_record(struct ftrace_file_handle *handle,
+int setup_perf_data(struct uftrace_data *handle);
+void finish_perf_data(struct uftrace_data *handle);
+int read_perf_data(struct uftrace_data *handle);
+struct uftrace_record * get_perf_record(struct uftrace_data *handle,
 					struct uftrace_perf_reader *perf);
-void update_perf_task_comm(struct ftrace_file_handle *handle);
-void process_perf_event(struct ftrace_file_handle *handle);
+void update_perf_task_comm(struct uftrace_data *handle);
+void process_perf_event(struct uftrace_data *handle);
 
 #endif /* UFTRACE_PERF_H */

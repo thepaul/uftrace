@@ -5,14 +5,11 @@
 - report w/ multi-thread
 - config file support
 - filter by argument value
-- filter by function size
 - filter by source location
-- filter by caller(?)
 - SDT argument support
 - LTT-ng event (tracepoint) support
-- symbol file compression
 - reading/watching external data (global variable, cpu, ...)
-- show kernel function argument and return value (with kprobes)
+- show kernel function argument and return value (with dynamic events)
 - different clock support (TSC on x86, ...)
 - generic field support for report
 - field and sort support for TUI
@@ -23,7 +20,8 @@
 - write useful script examples
 - dynamic tracing support
 - attach to existing process
-- signal trigger support (for daemons)
 - process and display multiple data together
 - graph diff support
 - full demangling support
+- improve rust demangling
+- dynamic object naming (tagging?)

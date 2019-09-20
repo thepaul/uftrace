@@ -1,13 +1,10 @@
 QUICK GUIDE
 ===========
 
-On Ubuntu machines, following commands will build and install uftrace from
-source.
+On Linux distros, following commands will build and install uftrace from source.
 
-    $ sudo apt-get install libdw-dev            # for debug info       (optional)
-    $ sudo apt-get install pandoc               # for man pages        (optional)
-    $ sudo apt-get install libpython2.7-dev     # for python scripting (optional)
-    $ sudo apt-get install libncursesw5-dev     # for TUI              (optional)
+    $ sudo misc/install-deps.sh    # optional for advanced features
+    $ ./configure                  # --prefix can be used to change install dir
     $ make
     $ sudo make install
 
@@ -24,8 +21,9 @@ The latest version of uftrace is available at Github.
 DEPENDENCY
 ==========
 
-Now uftrace can be built without any external libraries.  But in order to use
-more advanced features, it'd be better to install them like below.
+The uftrace is written in C and tried to minimize external dependencies.
+Currently, uftrace can be built without any external libraries.  But in order to
+use more advanced features, it'd be better to install them like below.
 
 Firstly, please make sure `pkg-config` is installed in the system to properly
 detect the dependencies of uftrace.  Otherwise, some packages may not be
@@ -48,10 +46,10 @@ On redhat based systems (like Fedora, RHEL), it'll be `elfutils-devel`.
     $ sudo dnf install elfutils-devel
 
 It also uses libstdc++ library to demangle C++ symbols in full detail.
-And ncursesw library to implement text user interface (TUI) on console.
-But they're not mandatory as uftrace has its own demangler for shorter symbol
+But it's not mandatory as uftrace has its own demangler for shorter symbol
 name (it omits arguments, templates and so on).
 
+And ncursesw library is to implement text user interface (TUI) on console.
 The ncurses(w) library provides terminal handling routines so `uftrace tui`
 command is built on top of them.  As it improves user experience of trace data
 analysis, you need to consider install it if you do things like `uftrace graph`
@@ -116,6 +114,8 @@ directories or build directory with this script.
       --without-libstdc++   build without libstdc++              (even if found on the system)
       --without-libpython   build without libpython2.7           (even if found on the system)
       --without-libncurses  build without libncursesw            (even if found on the system)
+      --without-perf        build without perf event             (even if available)
+      --without-schedule    build without scheduler event        (even if available)
 
       -p                    preserve old setting
 
@@ -128,6 +128,10 @@ directories or build directory with this script.
 
 Also you can set the target architecture and compiler options like CC, CFLAGS.
 
+It's also possible to disable some features depending on external libraries or
+system behaviors.  For example --without-libpython option will make scripting
+feature disabled - `uftrace script` command will still exist but won't work.
+
 For cross compile, you may want to setup the toolchain something like below:
 
     $ export CROSS_COMPILE=/path/to/cross/toolchain/arm-unknown-linux-gnueabihf-
@@ -136,6 +140,7 @@ For cross compile, you may want to setup the toolchain something like below:
 This assumes you already installed the cross-built `libelf` on the sysroot
 directory.  Otherwise, you can also build it from source (please see below) or
 use it on a different path using `--with-elfutils=<PATH>`.
+
 
 BUILD WITH ELFUTILS (libelf)
 ============================

@@ -1,8 +1,12 @@
 #!/usr/bin/env python
 
+import random
 import os, sys
+import tempfile
 import glob, re
 import subprocess as sp
+import multiprocessing
+import time
 
 class TestBase:
     supported_lang = {
@@ -20,19 +24,24 @@ class TestBase:
     TEST_SKIP = -7
     TEST_SUCCESS_FIXED = -8
 
-    objdir = 'objdir' in os.environ and os.environ['objdir'] or '..'
+    basedir = os.path.dirname(os.getcwd())
+    objdir = 'objdir' in os.environ and os.environ['objdir'] or basedir
     uftrace_cmd = objdir + '/uftrace --no-pager --no-event -L' + objdir
 
     default_cflags = ['-fno-inline', '-fno-builtin', '-fno-ipa-cp',
                       '-fno-omit-frame-pointer', '-D_FORTIFY_SOURCE=0']
 
-    def __init__(self, name, result, lang='C', cflags='', ldflags='', sort='task'):
+    def __init__(self, name, result, lang='C', cflags='', ldflags='', sort='task', serial=False):
+        _tmp = tempfile.mkdtemp(prefix='test_%s_' % name)
+        os.chdir(_tmp)
+        self.test_dir = _tmp
         self.name = name
         self.result = result
         self.cflags = cflags
         self.ldflags = ldflags
         self.lang = lang
         self.sort_method = sort
+        self.serial = serial
 
     def set_debug(self, dbg):
         self.debug = dbg
@@ -41,7 +50,19 @@ class TestBase:
         if self.debug:
             print(msg)
 
+    def gen_port(self):
+        self.port = random.randint(40000, 50000)
+
+    def convert_abs_path(self, build_cmd):
+        cmd = build_cmd.split()
+        src_idx = [i for i, _cmd in enumerate(cmd) if _cmd.startswith('s-')][0]
+        abs_src = os.path.join(self.basedir, 'tests', cmd[src_idx])
+        cmd[src_idx] = abs_src
+        return " ".join(cmd)
+
     def build_it(self, build_cmd):
+        build_cmd = self.convert_abs_path(build_cmd)
+
         try:
             p = sp.Popen(build_cmd.split(), stderr=sp.PIPE)
             if p.wait() != 0:
@@ -72,6 +93,23 @@ class TestBase:
                     (lang['cc'], prog, build_cflags, src, build_ldflags)
 
         self.pr_debug("build command: %s" % build_cmd)
+        return self.build_it(build_cmd)
+
+    def build_notrace_lib(self, dstname, srcname, cflags='', ldflags =''):
+        lang = TestBase.supported_lang['C']
+
+        build_cflags  = ' '.join(TestBase.default_cflags + [self.cflags, cflags, \
+                                  os.getenv(lang['flags'], '')])
+        build_ldflags = ' '.join([self.ldflags, ldflags, \
+                                  os.getenv('LDFLAGS', '')])
+
+        lib_cflags = build_cflags + ' -shared -fPIC'
+
+        build_cmd = '%s -o lib%s.so %s s-%s.c %s' % \
+                    (lang['cc'], dstname, lib_cflags, srcname, build_ldflags)
+
+        build_cmd = build_cmd.replace('-pg', '').replace('-finstrument-functions', '')
+        self.pr_debug("build command for library: %s" % build_cmd)
         return self.build_it(build_cmd)
 
     def build_libabc(self, cflags='', ldflags=''):
@@ -108,7 +146,7 @@ class TestBase:
         self.pr_debug("build command for library: %s" % build_cmd)
         return self.build_it(build_cmd)
 
-    def build_libmain(self, exename, srcname, libs, cflags='', ldflags=''):
+    def build_libmain(self, exename, srcname, libs, cflags='', ldflags='', instrument=True):
         if self.lang not in TestBase.supported_lang:
             self.pr_debug("%s: unsupported language: %s" % (self.name, self.lang))
             return TestBase.TEST_UNSUPP_LANG
@@ -123,6 +161,8 @@ class TestBase:
             exe_ldflags += ' -l' + lib[3:-3]
 
         build_cmd = '%s -o %s %s %s %s' % (lang['cc'], prog, build_cflags, srcname, exe_ldflags)
+        if not instrument:
+            build_cmd = build_cmd.replace('-pg', '').replace('-finstrument-functions', '')
 
         self.pr_debug("build command for executable: %s" % build_cmd)
         return self.build_it(build_cmd)
@@ -145,8 +185,8 @@ class TestBase:
                 continue
             # ignore result of remaining functions which follows a blank line
             if ln.strip() == '':
-                break;
-            pid_patt = re.compile('[^[]*\[ *(\d+)\] |')
+                break
+            pid_patt = re.compile('[^[]+\[ *(\d+)\] |')
             m = pid_patt.match(ln)
             try:
                 pid = int(m.group(1))
@@ -316,7 +356,7 @@ class TestBase:
 
     def check_dependency(self, item):
         import os.path
-        return os.path.exists('../check-deps/' + item)
+        return os.path.exists('%s/check-deps/' % self.basedir + item)
 
     def check_perf_paranoid(self):
         try:
@@ -331,8 +371,30 @@ class TestBase:
 
         return True
 
+    def prerun(self, timeout):
+        ret = TestBase.TEST_SUCCESS
+
+        class Timeout(Exception):
+            pass
+
+        def timeout_handler(sig, frame):
+            raise Timeout
+
+        import signal
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(timeout)
+
+        try:
+            ret = self.pre()
+        except Timeout:
+            ret = TestBase.TEST_TIME_OUT
+        signal.alarm(0)
+
+        return ret
+
     def run(self, name, cflags, diff, timeout):
         ret = TestBase.TEST_SUCCESS
+        dif = ''
 
         test_cmd = self.runcmd()
         self.pr_debug("test command: %s" % test_cmd)
@@ -366,20 +428,24 @@ class TestBase:
         ret = p.wait()
         if ret < 0:
             if timed_out:
-                return TestBase.TEST_TIME_OUT
+                return TestBase.TEST_TIME_OUT, ''
             else:
-                return TestBase.TEST_ABNORMAL_EXIT
+                return TestBase.TEST_ABNORMAL_EXIT, ''
         if ret > 0:
             if ret == 2:
-                return TestBase.TEST_ABNORMAL_EXIT
-            return TestBase.TEST_NONZERO_RETURN
+                return TestBase.TEST_ABNORMAL_EXIT, ''
+            if diff:
+                dif = "%s: %s returns %d\n" % (name, cflags, ret)
+            return TestBase.TEST_NONZERO_RETURN, dif
 
         self.pr_debug("=========== %s ===========\n%s" % ("original", result_origin))
         self.pr_debug("=========== %s ===========\n%s" % (" result ", result_tested))
         self.pr_debug("=========== %s ===========\n%s" % ("expected", result_expect))
 
         if result_expect.strip() == '':
-            return TestBase.TEST_DIFF_RESULT
+            if diff:
+                dif = "%s: has no output for %s\n" % (name, cflags)
+            return TestBase.TEST_DIFF_RESULT, dif
 
         if result_expect != result_tested:
             result_expect = self.sort(self.fixup(cflags, self.result))
@@ -393,18 +459,20 @@ class TestBase:
                 f = open('result', 'w')
                 f.write(result_tested + '\n')
                 f.close()
-                print("%s: diff result of %s" % (name, cflags))
+                dif = "%s: diff result of %s\n" % (name, cflags)
                 try:
                     p = sp.Popen(['colordiff', '-U1', 'expect', 'result'], stdout=sp.PIPE)
                 except:
                     p = sp.Popen(['diff', '-U1', 'expect', 'result'], stdout=sp.PIPE)
-                print(p.communicate()[0].decode(errors='ignore'))
+                dif += p.communicate()[0].decode(errors='ignore')
                 os.remove('expect')
                 os.remove('result')
-            return TestBase.TEST_DIFF_RESULT
+            return TestBase.TEST_DIFF_RESULT, dif
 
-        return ret
+        return ret, ''
 
+    def __del__(self):
+        sp.call(['rm', '-rf', self.test_dir])
 
 RED     = '\033[1;31m'
 GREEN   = '\033[1;32m'
@@ -447,6 +515,15 @@ result_string = {
     TestBase.TEST_SUCCESS_FIXED:  'Test succeeded (with some fixup)',
 }
 
+
+def check_serial_case(case):
+    # for python3
+    _locals = {}
+    exec("import %s; tc = %s.TestCase()" % (case, case), globals(), _locals)
+    tc = _locals['tc']
+    return tc.serial
+
+
 def run_single_case(case, flags, opts, arg):
     result = []
 
@@ -455,29 +532,78 @@ def run_single_case(case, flags, opts, arg):
     exec("import %s; tc = %s.TestCase()" % (case, case), globals(), _locals)
     tc = _locals['tc']
     tc.set_debug(arg.debug)
+    timeout = int(arg.timeout)
 
     for flag in flags:
         for opt in opts:
             cflags = ' '.join(["-" + flag, "-" + opt])
+            dif = ''
             ret = tc.build(tc.name, cflags)
             if ret == TestBase.TEST_SUCCESS:
-                ret = tc.pre()
+                ret = tc.prerun(timeout)
                 if ret == TestBase.TEST_SUCCESS:
-                    ret = tc.run(case, cflags, arg.diff, int(arg.timeout))
+                    ret, dif = tc.run(case, cflags, arg.diff, timeout)
                     ret = tc.post(ret)
-            result.append(ret)
+            result.append((ret, dif))
 
     return result
 
-def print_test_result(case, result, color):
-    if sys.stdout.isatty() and color:
+
+def save_test_result(result, case, shared):
+    # save diff before results for print_test_result() to see it
+    shared.diffs[case]   = [r[1] for r in result]
+    shared.results[case] = [r[0] for r in result]
+    shared.progress += 1
+    for r in result:
+        shared.stats[r[0]] += 1
+        shared.total += 1
+
+
+def print_test_result(case, result, diffs, color):
+    if color:
         result_list = [colored_result[r] for r in result]
     else:
         result_list = [text_result[r] for r in result]
 
+    for dif in diffs:
+        if dif != '':
+            sys.stdout.write(dif + '\n')
+
     output = case[1:4]
     output += ' %-20s' % case[5:] + ': ' + ' '.join(result_list) + '\n'
     sys.stdout.write(output)
+
+
+def print_test_header(opts, flags):
+    optslen = len(opts)
+
+    header1 = '%-24s ' % 'Test case'
+    header2 = '-' * 24 + ':'
+    empty = '                      '
+
+    for flag in flags:
+        # align with optimization flags
+        header1 += ' ' + flag[:optslen] + empty[len(flag):optslen]
+        header2 += ' ' + opts
+
+    print(header1)
+    print(header2)
+
+
+def print_test_report(color, shared):
+    success = shared.stats[TestBase.TEST_SUCCESS] + shared.stats[TestBase.TEST_SUCCESS_FIXED]
+    percent = 100.0 * success / shared.total
+
+    print("")
+    print("runtime test stats")
+    print("====================")
+    print("total %5d  Tests executed (success: %.2f%%)" % (shared.total, percent))
+    for r in res:
+        if color:
+            result = colored_result[r]
+        else:
+            result = text_result[r]
+        print("  %s: %5d  %s" % (result, shared.stats[r], result_string[r]))
 
 
 def parse_argument():
@@ -503,8 +629,11 @@ def parse_argument():
                         help="suppress color in the output")
     parser.add_argument("-t", "--timeout", dest='timeout', default=5,
                         help="fail test if it runs more than TIMEOUT seconds")
+    parser.add_argument("-j", "--worker", dest='worker', type=int, default=multiprocessing.cpu_count(),
+                        help="Parallel worker count; using all core for default")
 
     return parser.parse_args()
+
 
 if __name__ == "__main__":
     # prevent to create .pyc files (it makes some tests failed)
@@ -522,12 +651,7 @@ if __name__ == "__main__":
                 print("cannot find testcase for : %s" % arg.case)
                 sys.exit(0)
 
-    opts = ' '.join(sorted(['O'+o for o in arg.opts]))
-    optslen = len(opts);
-
-    header1 = '%-24s ' % 'Test case'
-    header2 = '-' * 24 + ':'
-    empty = '                      '
+    opts = ' '.join(sorted(['O' + o for o in arg.opts]))
 
     if arg.pg_flag:
         flags = ['pg']
@@ -535,15 +659,17 @@ if __name__ == "__main__":
         flags = ['finstrument-functions']
     else:
         flags = arg.flags.split()
-    for flag in flags:
-        # align with optimization flags
-        header1 += ' ' + flag[:optslen] + empty[len(flag):optslen]
-        header2 += ' ' + opts
 
-    print(header1)
-    print(header2)
+    from functools import partial
 
-    total = 0
+    manager = multiprocessing.Manager()
+    shared = manager.dict()
+
+    shared.tests_count = len(testcases)
+    shared.progress = 0
+    shared.results = dict()
+    shared.diffs = dict()
+    shared.total = 0
     res = []
     res.append(TestBase.TEST_SUCCESS)
     res.append(TestBase.TEST_SUCCESS_FIXED)
@@ -555,26 +681,41 @@ if __name__ == "__main__":
     res.append(TestBase.TEST_UNSUPP_LANG)
     res.append(TestBase.TEST_SKIP)
 
-    stats = dict.fromkeys(res, 0)
+    shared.stats = dict.fromkeys(res, 0)
+    pool = multiprocessing.Pool(arg.worker)
+    serial_pool = multiprocessing.Pool(1)
 
     for tc in sorted(testcases):
-        name = tc[:-3]  # remove '.py'
-        result = run_single_case(name, flags, opts.split(), arg)
-        print_test_result(name, result, arg.color)
-        for r in result:
-            stats[r] += 1
-            total += 1
+        _pool = pool
+        name = tc.split('.')[0]  # remove '.py'
+        clbk = partial(save_test_result, case=name, shared=shared)
+        if check_serial_case(name):
+            _pool = serial_pool
 
-    success = stats[TestBase.TEST_SUCCESS] + stats[TestBase.TEST_SUCCESS_FIXED]
-    percent = 100.0 * success / total
+        _pool.apply_async(run_single_case, callback=clbk,
+                         args=[name, flags, opts.split(), arg])
 
-    print("")
-    print("runtime test stats")
-    print("====================")
-    print("total %5d  Tests executed (success: %.2f%%)" % (total, percent))
-    for r in res:
-        if sys.stdout.isatty() and arg.color:
-            result = colored_result[r]
-        else:
-            result = text_result[r]
-        print("  %s: %5d  %s" % (result, stats[r], result_string[r]))
+    print("Start %s tests with %d worker" % (shared.tests_count, arg.worker))
+    print_test_header(opts, flags)
+
+    color = arg.color
+    if not sys.stdout.isatty():
+        color = False
+    if 'TERM' in os.environ and os.environ['TERM'] == 'dumb':
+        color = False
+
+    for tc in sorted(testcases):
+        name = tc.split('.')[0]  # remove '.py'
+
+        while name not in shared.results:
+            time.sleep(1)
+
+        print_test_result(name, shared.results[name], shared.diffs[name], color)
+
+    pool.close()
+    pool.join()
+
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+    print_test_report(color, shared)

@@ -17,24 +17,6 @@ struct mcount_regs {
 #define ARCH_MAX_REG_ARGS  3
 #define ARCH_MAX_FLOAT_REGS  8
 
-enum x86_reg_index {
-	X86_REG_INT_BASE = 0,
-	/* integer registers */
-	X86_REG_ECX,
-	X86_REG_EDX,
-
-	X86_REG_FLOAT_BASE = 100,
-	/* floating-point registers */
-	X86_REG_XMM0,
-	X86_REG_XMM1,
-	X86_REG_XMM2,
-	X86_REG_XMM3,
-	X86_REG_XMM4,
-	X86_REG_XMM5,
-	X86_REG_XMM6,
-	X86_REG_XMM7,
-};
-
 #define HAVE_MCOUNT_ARCH_CONTEXT
 struct mcount_arch_context {
 	double xmm[ARCH_MAX_FLOAT_REGS];
@@ -46,5 +28,7 @@ unsigned long * mcount_arch_parent_location(struct symtabs *symtabs,
 					    unsigned long child_ip);
 #define ARCH_PLT0_SIZE  16
 #define ARCH_PLTHOOK_ADDR_OFFSET  6
+
+#define ARCH_CAN_RESTORE_PLTHOOK   1
 
 #endif /* __MCOUNT_ARCH_H__ */

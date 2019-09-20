@@ -16,12 +16,14 @@
 #include "utils/utils.h"
 #include "utils/fstack.h"
 #include "utils/graph.h"
+#include "utils/report.h"
 #include "utils/list.h"
 #include "utils/rbtree.h"
 #include "utils/field.h"
 #include "utils/dwarf.h"
 
 #define KEY_ESCAPE  27
+#define BLANK  32
 
 static bool tui_finished;
 static bool tui_debug;
@@ -34,18 +36,8 @@ struct tui_graph_node {
 };
 
 struct tui_report_node {
-	struct rb_node name_link;
-	struct rb_node sort_link;
+	struct uftrace_report_node n;
 	struct list_head head; // links tui_graph_node.link
-	char *name;
-	uint64_t time;
-	uint64_t min_time;
-	uint64_t max_time;
-	uint64_t self_time;
-	uint64_t min_self_time;
-	uint64_t max_self_time;
-	uint64_t recursive_time;
-	unsigned calls;
 };
 
 struct tui_list_node {
@@ -64,10 +56,10 @@ struct tui_window_ops {
 	void * (*sibling_next)(struct tui_window *win, void *node);
 	bool (*needs_blank)(struct tui_window *win, void *prev, void *next);
 	bool (*enter)(struct tui_window *win, void *node);
-	bool (*collapse)(struct tui_window *win, void *node, int depth);
-	bool (*expand)(struct tui_window *win, void *node, int depth);
-	void (*header)(struct tui_window *win, struct ftrace_file_handle *handle);
-	void (*footer)(struct tui_window *win, struct ftrace_file_handle *handle);
+	bool (*collapse)(struct tui_window *win, void *node, bool all, int depth);
+	bool (*expand)(struct tui_window *win, void *node, bool all, int depth);
+	void (*header)(struct tui_window *win, struct uftrace_data *handle);
+	void (*footer)(struct tui_window *win, struct uftrace_data *handle);
 	void (*display)(struct tui_window *win, void *node);
 	bool (*search)(struct tui_window *win, void *node, char *str);
 	bool (*longest_child)(struct tui_window *win, void *node);
@@ -81,6 +73,7 @@ struct tui_window {
 	void *old;
 	int top_index;
 	int curr_index;
+	int last_index;
 	int search_count;
 };
 
@@ -132,6 +125,8 @@ static void tui_window_move_down(struct tui_window *win);
 #define FIELD_SPACE  2
 #define FIELD_SEP  " :"
 
+#define POS_SIZE 5
+
 #define C_NORMAL  0
 #define C_HEADER  1
 #define C_GREEN   2
@@ -142,18 +137,21 @@ static const char *help[] = {
 	"ARROW         Navigation",
 	"PgUp/Dn",
 	"Home/End",
-	"Enter         Select/Fold",
+	"Enter         Fold/unfold graph or Select session",
 	"G             Show (full) call graph",
 	"g             Show call graph for this function",
 	"R             Show uftrace report",
+	"r             Show uftrace report for this function",
 	"I             Show uftrace info",
 	"S             Change session",
 	"O             Open editor",
-	"c/e           Collapse/Expand graph",
+	"c/e           Collapse/Expand direct children graph",
+	"C/E           Collapse/Expand all descendant graph",
 	"n/p           Next/Prev sibling",
 	"u             Move up to parent",
 	"l             Move to the longest executed child",
 	"j/k           Move down/up",
+	"z             Set current line to the center of screen",
 	"/             Search",
 	"</>/N/P       Search next/prev",
 	"v             Show debug message",
@@ -311,12 +309,11 @@ static int create_data(struct uftrace_session *sess, void *arg)
 	return 0;
 }
 
-static void tui_setup(struct ftrace_file_handle *handle, struct opts *opts)
+static void tui_setup(struct uftrace_data *handle, struct opts *opts)
 {
 	walk_sessions(&handle->sessions, create_data, NULL);
 
 	tui_report.name_tree = RB_ROOT;
-	tui_report.sort_tree = RB_ROOT;
 
 	setup_field(&graph_output_fields, opts, setup_default_graph_field,
 		    graph_field_table, ARRAY_SIZE(graph_field_table));
@@ -339,19 +336,14 @@ static void tui_cleanup(void)
 	graph_remove_task();
 }
 
-static struct uftrace_graph * get_graph(struct ftrace_task_handle *task,
+static struct uftrace_graph * get_graph(struct uftrace_task_reader *task,
 					uint64_t time, uint64_t addr)
 {
 	struct tui_graph *graph;
 	struct uftrace_session_link *sessions = &task->h->sessions;
 	struct uftrace_session *sess;
 
-	sess = find_task_session(sessions, task->tid, time);
-	if (sess == NULL)
-		sess = find_task_session(sessions, task->t->pid, time);
-	if (sess == NULL)
-		sess = find_task_session(sessions, task->t->ppid, time);
-
+	sess = find_task_session(sessions, task->t, time);
 	if (sess == NULL) {
 		struct uftrace_session *fsess = sessions->first;
 
@@ -368,150 +360,57 @@ static struct uftrace_graph * get_graph(struct ftrace_task_handle *task,
 	return NULL;
 }
 
-static struct tui_report_node * find_report_node(struct tui_report *report,
-						 char *symname)
-{
-	struct tui_report_node *node;
-	struct rb_node *parent = NULL;
-	struct rb_node **p = &report->name_tree.rb_node;
-
-	while (*p) {
-		int cmp;
-
-		parent = *p;
-		node = rb_entry(parent, struct tui_report_node, name_link);
-
-		cmp = strcmp(node->name, symname);
-		if (cmp == 0)
-			return node;
-
-		if (cmp < 0)
-			p = &parent->rb_left;
-		else
-			p = &parent->rb_right;
-	}
-
-	node = xzalloc(sizeof(*node));
-	node->name = xstrdup(symname);
-	INIT_LIST_HEAD(&node->head);
-
-	rb_link_node(&node->name_link, parent, p);
-	rb_insert_color(&node->name_link, &report->name_tree);
-	report->nr_func++;
-
-	return node;
-}
-
-static void prepare_report_node(struct tui_report_node *node)
-{
-	struct tui_graph_node *gn;
-
-	list_for_each_entry(gn, &node->head, link) {
-		node->time      += gn->n.time;
-		node->self_time += gn->n.time - gn->n.child_time;
-		node->calls     += gn->n.nr_calls;
-	}
-
-	node->time -= node->recursive_time;
-}
-
-static int cmp_report_node(struct tui_report_node *a, struct tui_report_node *b)
-{
-	/* TODO: apply sort key */
-	if (a->time != b->time)
-		return a->time > b->time ? 1 : -1;
-
-	return 0;
-}
-
-static void sort_report_node(struct tui_report *report,
-			     struct tui_report_node *node)
-{
-	struct tui_report_node *iter;
-	struct rb_node *parent = NULL;
-	struct rb_node **p = &report->sort_tree.rb_node;
-
-	prepare_report_node(node);
-
-	while (*p) {
-		int cmp;
-
-		parent = *p;
-		iter = rb_entry(parent, struct tui_report_node, sort_link);
-
-		cmp = cmp_report_node(iter, node);
-		if (cmp < 0)
-			p = &parent->rb_left;
-		else
-			p = &parent->rb_right;
-	}
-
-	rb_link_node(&node->sort_link, parent, p);
-	rb_insert_color(&node->sort_link, &report->sort_tree);
-}
-
-static void sort_tui_report(struct tui_report *report)
-{
-	struct rb_node *node = rb_first(&report->name_tree);
-	struct tui_report_node *tui_node;
-
-	while (node) {
-		tui_node = rb_entry(node, struct tui_report_node, name_link);
-		sort_report_node(report, tui_node);
-
-		node = rb_next(node);
-	}
-}
-
 static bool list_is_none(struct list_head *list)
 {
 	return list->next == NULL && list->prev == NULL;
 }
 
-static void update_report_node(struct ftrace_task_handle *task, char *symname,
+static void update_report_node(struct uftrace_task_reader *task, char *symname,
 			       struct uftrace_task_graph *tg)
 {
-	struct fstack *fstack = &task->func_stack[task->stack_count];
-	uint64_t total_time = fstack->total_time;
-	uint64_t self_time = fstack->total_time - fstack->child_time;
 	struct tui_report_node *node;
 	struct tui_graph_node *graph_node;
-	int i;
 
-	node = find_report_node(&tui_report, symname);
+	/* graph is not set probably due to filters (or error?) */
+	if (tg->node == NULL)
+		return;
+
+	node = (struct tui_report_node *)report_find_node(&tui_report.name_tree,
+							  symname);
+	if (node == NULL) {
+		node = xzalloc(sizeof(*node));
+		INIT_LIST_HEAD(&node->head);
+		report_add_node(&tui_report.name_tree, symname, (void *)node);
+		tui_report.nr_func++;
+	}
 
 	graph_node = (struct tui_graph_node *)tg->node;
 	if (list_is_none(&graph_node->link))
 		list_add_tail(&graph_node->link, &node->head);
 
-	if (node->max_time < total_time)
-		node->max_time = total_time;
-	if (node->min_time == 0 || node->min_time > total_time)
-		node->min_time = total_time;
-	if (node->max_self_time < self_time)
-		node->max_self_time = self_time;
-	if (node->min_self_time == 0 || node->min_self_time > self_time)
-		node->min_self_time = self_time;
-
-	for (i = 0; i < task->stack_count; i++) {
-		if (task->func_stack[i].addr == fstack->addr) {
-			node->recursive_time += total_time;
-			break;
-		}
-	}
+	report_update_node(&node->n, task);
 }
 
-static int build_tui_node(struct ftrace_task_handle *task,
-			  struct uftrace_record *rec)
+static int build_tui_node(struct uftrace_task_reader *task,
+			  struct uftrace_record *rec,
+			  struct opts *opts)
 {
 	struct uftrace_task_graph *tg;
 	struct uftrace_graph *graph;
 	struct tui_graph_node *graph_node;
 	struct sym *sym;
 	char *name;
+	uint64_t addr = rec->addr;
+
+	if (is_kernel_record(task, rec)) {
+		struct uftrace_session *fsess;
+
+		fsess = task->h->sessions.first;
+		addr = get_kernel_address(&fsess->symtabs, addr);
+	}
 
 	tg = graph_get_task(task, sizeof(*tg));
-	graph = get_graph(task, rec->time, rec->addr);
+	graph = get_graph(task, rec->time, addr);
 
 	if (tg->node == NULL || tg->graph != graph)
 		tg->node = &graph->root;
@@ -520,19 +419,24 @@ static int build_tui_node(struct ftrace_task_handle *task,
 
 	if (rec->type == UFTRACE_ENTRY || rec->type == UFTRACE_EXIT) {
 		sym = task_find_sym_addr(&task->h->sessions,
-					 task, rec->time, rec->addr);
-		name = symbol_getname(sym, rec->addr);
+					 task, rec->time, addr);
+
+		/* skip it if --no-libcall is given */
+		if (!opts->libcall && sym && sym->type == ST_PLT_FUNC)
+			return 0;
+
+		name = symbol_getname(sym, addr);
 
 		if (rec->type == UFTRACE_EXIT)
 			update_report_node(task, name, tg);
 	}
 	else if (rec->type == UFTRACE_EVENT) {
 		sym = &sched_sym;
-		name = symbol_getname(sym, rec->addr);
+		name = symbol_getname(sym, addr);
 
-		if (rec->addr == EVENT_ID_PERF_SCHED_IN)
+		if (addr == EVENT_ID_PERF_SCHED_IN)
 			update_report_node(task, name, tg);
-		else if (rec->addr != EVENT_ID_PERF_SCHED_OUT)
+		else if (addr != EVENT_ID_PERF_SCHED_OUT)
 			return 0;
 	}
 	else  /* rec->type == UFTRACE_LOST */
@@ -548,11 +452,11 @@ static int build_tui_node(struct ftrace_task_handle *task,
 	return 0;
 }
 
-static void add_remaining_node(struct opts *opts, struct ftrace_file_handle *handle)
+static void add_remaining_node(struct opts *opts, struct uftrace_data *handle)
 {
 	uint64_t last_time;
 	struct fstack *fstack;
-	struct ftrace_task_handle *task;
+	struct uftrace_task_reader *task;
 	struct uftrace_task_graph *tg;
 	struct sym *sym;
 	char *name;
@@ -653,6 +557,24 @@ static void copy_graph_node(struct uftrace_graph_node *dst,
 	}
 }
 
+static int tui_last_index(struct tui_window *win)
+{
+	int count = win->curr_index;
+	void *next, *prev = win->curr;
+
+	while (true) {
+		next = win->ops->next(win, prev, false);
+		if (next == NULL)
+			return count;
+
+		count++;
+		if (win->ops->needs_blank(win, prev, next))
+			count++;
+
+		prev = next;
+	}
+}
+
 static void tui_window_init(struct tui_window *win,
 			    const struct tui_window_ops *ops)
 {
@@ -662,6 +584,7 @@ static void tui_window_init(struct tui_window *win,
 	win->top = top;
 	win->curr = win->old = top;
 	win->top_index = win->curr_index = 0;
+	win->last_index = tui_last_index(win);
 }
 
 static struct tui_graph * tui_graph_init(struct opts *opts)
@@ -694,10 +617,10 @@ static struct tui_graph * tui_graph_init(struct opts *opts)
 	partial_graph.top_mask  = xzalloc(graph->mask_size);
 	partial_graph.disp_mask = xmalloc(graph->mask_size);
 
-	tui_window_init(&partial_graph.win, &graph_ops);
-
 	INIT_LIST_HEAD(&partial_graph.ug.root.head);
 	INIT_LIST_HEAD(&partial_graph.ug.special_nodes);
+
+	tui_window_init(&partial_graph.win, &graph_ops);
 
 	/* select first session */
 	partial_graph.ug.sess = graph->ug.sess;
@@ -731,7 +654,7 @@ static void build_partial_graph(struct tui_report_node *root_node,
 
 	graph->ug.sess = target->ug.sess;
 
-	xasprintf(&str, "=== Function Call Graph for '%s' ===", root_node->name);
+	xasprintf(&str, "=== Function Call Graph for '%s' ===", root_node->n.name);
 
 	root = (struct tui_graph_node*) &graph->ug.root;
 	root->n.name = str;
@@ -779,7 +702,7 @@ static void build_partial_graph(struct tui_report_node *root_node,
 	root = append_graph_node(&graph->ug.root, target,
 				 "========== Call Graph ==========");
 
-	root = append_graph_node(&root->n, target, root_node->name);
+	root = append_graph_node(&root->n, target, root_node->n.name);
 
 	list_for_each_entry(node, &root_node->head, link) {
 		if (node->graph != &target->ug)
@@ -897,7 +820,6 @@ static struct tui_graph_node * graph_next_node(struct tui_graph_node *node,
 				indent_mask[*depth] = false;
 		}
 	}
-
 	return NULL;
 }
 
@@ -1001,16 +923,18 @@ static bool win_enter_graph(struct tui_window *win, void *node)
 		return false;
 
 	curr->folded = !curr->folded;
+	win->last_index = tui_last_index(win);
 	return true;
 }
 
-static int fold_graph_node(struct tui_graph_node *node, bool fold, int depth)
+static int fold_graph_node(struct tui_graph_node *node, bool fold,
+			   bool all, int depth)
 {
 	struct tui_graph_node *child;
 	int count = 0;
 	bool curr_fold = fold;
 
-	if (depth < 0)
+	if (!all && depth < 0)
 		return 0;
 	else if (depth > 0)
 		curr_fold = false;
@@ -1025,23 +949,31 @@ static int fold_graph_node(struct tui_graph_node *node, bool fold, int depth)
 	}
 
 	list_for_each_entry(child, &node->n.head, n.list)
-		count += fold_graph_node(child, fold, depth - 1);
+		count += fold_graph_node(child, fold, all, depth - 1);
 
 	return count;
 }
 
-static bool win_collapse_graph(struct tui_window *win, void *node, int depth)
+static bool win_collapse_graph(struct tui_window *win, void *node, bool all,
+			       int depth)
 {
-	return fold_graph_node(node, true, depth);
+	bool result = fold_graph_node(node, true, all, depth);
+
+	win->last_index = tui_last_index(win);
+	return result;
 }
 
-static bool win_expand_graph(struct tui_window *win, void *node, int depth)
+static bool win_expand_graph(struct tui_window *win, void *node, bool all,
+			     int depth)
 {
-	return fold_graph_node(node, false, depth);
+	bool result = fold_graph_node(node, false, all, depth);
+
+	win->last_index = tui_last_index(win);
+	return result;
 }
 
 static void win_header_graph(struct tui_window *win,
-			     struct ftrace_file_handle *handle)
+			     struct uftrace_data *handle)
 {
 	int w = 0, c;
 	char *buf, *p;
@@ -1061,7 +993,7 @@ static void win_header_graph(struct tui_window *win,
 
 	if (list_empty(&graph_output_fields)) {
 		printw("%-*.*s", COLS, COLS, "uftrace graph TUI");
-		return;
+		goto out;
 	}
 
 	buf = p = xmalloc(w + 1);
@@ -1077,6 +1009,7 @@ static void win_header_graph(struct tui_window *win,
 	printw("%-*.*s", COLS, COLS, buf);
 	free(buf);
 
+out:
 	/* start with same make as top */
 	graph->disp = graph->win.top;
 	graph->disp_depth = graph->top_depth;
@@ -1084,8 +1017,29 @@ static void win_header_graph(struct tui_window *win,
 	memcpy(graph->disp_mask, graph->top_mask, graph->mask_size);
 }
 
+static int win_pos_percent(struct tui_window *win)
+{
+	return win->curr_index * 100.0 / win->last_index;
+}
+
+static void win_footer(struct tui_window *win, char *msg)
+{
+	int pos_start = COLS - POS_SIZE;
+	int msg_len = strlen(msg);
+	char footer[COLS + 1];
+
+	memset(footer, BLANK, sizeof(footer));
+	memcpy(footer, msg, COLS < msg_len ? COLS : msg_len);
+	if (pos_start > msg_len)
+		snprintf(footer + pos_start, POS_SIZE, "%3d%%", win_pos_percent(win));
+
+	footer[COLS] = '\0';
+
+	printw("%-*s", COLS, footer);
+}
+
 static void win_footer_graph(struct tui_window *win,
-			     struct ftrace_file_handle *handle)
+			     struct uftrace_data *handle)
 {
 	char buf[COLS + 1];
 	struct tui_graph *graph = (struct tui_graph *)win;
@@ -1093,9 +1047,10 @@ static void win_footer_graph(struct tui_window *win,
 	struct uftrace_session *sess = graph->ug.sess;
 
 	if (tui_debug) {
-		snprintf(buf, COLS, "uftrace graph: top: %d depth: %d, curr: %d depth: %d",
+		snprintf(buf, COLS, "uftrace graph: top: %d depth: %d, curr: %d depth: %d last: %d",
 			 graph->win.top_index, graph->top_depth,
-			 graph->win.curr_index, graph->curr_depth);
+			 graph->win.curr_index, graph->curr_depth,
+			 graph->win.last_index);
 	}
 	else if (tui_search) {
 		snprintf(buf, COLS, "uftrace graph: searching \"%s\"  (%d match, %s)",
@@ -1122,10 +1077,8 @@ static void win_footer_graph(struct tui_window *win,
 				 SESSION_ID_LEN, sess->sid, sess->exename);
 		}
 	}
-	buf[COLS] = '\0';
 
-	printw("%-*s", COLS, buf);
-
+	win_footer(win, buf);
 	graph->disp_update = false;
 }
 
@@ -1251,7 +1204,7 @@ static bool win_longest_child_graph(struct tui_window *win, void *node)
 	curr->folded = false;
 
 	list_for_each_entry(child, &curr->n.head, n.list) {
-		fold_graph_node(child, true, 0);
+		fold_graph_node(child, true, false, 0);
 		if (longest_child_time < child->n.time) {
 			longest_child_time = child->n.time;
 			longest_child = child;
@@ -1265,6 +1218,7 @@ static bool win_longest_child_graph(struct tui_window *win, void *node)
 	while (win->curr != longest_child)
 		tui_window_move_down(win);
 
+	win->last_index = tui_last_index(win);
 	return true;
 }
 
@@ -1323,7 +1277,9 @@ static struct tui_report * tui_report_init(struct opts *opts)
 {
 	struct tui_window *win = &tui_report.win;
 
-	sort_tui_report(&tui_report);
+	report_setup_sort("total");
+	report_sort_nodes(&tui_report.name_tree, &tui_report.sort_tree);
+
 	tui_window_init(win, &report_ops);
 
 	return &tui_report;
@@ -1338,39 +1294,39 @@ static void * win_top_report(struct tui_window *win, bool update)
 	struct tui_report *report = (struct tui_report *)win;
 	struct rb_node *node = rb_first(&report->sort_tree);
 
-	return rb_entry(node, struct tui_report_node, sort_link);
+	return rb_entry(node, struct tui_report_node, n.sort_link);
 }
 
 static void * win_prev_report(struct tui_window *win, void *node, bool update)
 {
 	struct tui_report_node *curr = node;
-	struct rb_node *rbnode = rb_prev(&curr->sort_link);
+	struct rb_node *rbnode = rb_prev(&curr->n.sort_link);
 
 	if (rbnode == NULL)
 		return NULL;
 
-	return rb_entry(rbnode, struct tui_report_node, sort_link);
+	return rb_entry(rbnode, struct tui_report_node, n.sort_link);
 }
 
 static void * win_next_report(struct tui_window *win, void *node, bool update)
 {
 	struct tui_report_node *curr = node;
-	struct rb_node *rbnode = rb_next(&curr->sort_link);
+	struct rb_node *rbnode = rb_next(&curr->n.sort_link);
 
 	if (rbnode == NULL)
 		return NULL;
 
-	return rb_entry(rbnode, struct tui_report_node, sort_link);
+	return rb_entry(rbnode, struct tui_report_node, n.sort_link);
 }
 
 static bool win_search_report(struct tui_window *win, void *node, char *str)
 {
 	struct tui_report_node *curr = node;
 
-	return strstr(curr->name, str);
+	return strstr(curr->n.name, str);
 }
 
-static void win_header_report(struct tui_window *win, struct ftrace_file_handle *handle)
+static void win_header_report(struct tui_window *win, struct uftrace_data *handle)
 {
 	int w = 46;
 
@@ -1379,7 +1335,7 @@ static void win_header_report(struct tui_window *win, struct ftrace_file_handle 
 		printw("%*s", COLS - w, "");
 }
 
-static void win_footer_report(struct tui_window *win, struct ftrace_file_handle *handle)
+static void win_footer_report(struct tui_window *win, struct uftrace_data *handle)
 {
 	char buf[COLS + 1];
 
@@ -1392,14 +1348,23 @@ static void win_footer_report(struct tui_window *win, struct ftrace_file_handle 
 			 tui_search, win->search_count, "use '<' and '>' keys to navigate");
 	}
 	else {
-		struct tui_report *report = (struct tui_report *)win;
+		struct debug_location *dloc;
 
-		snprintf(buf, COLS, "uftrace report: %s (%d sessions, %d functions)",
-			 handle->dirname, report->nr_sess, report->nr_func);
+		dloc = win->ops->location(win, win->curr);
+
+		if (dloc != NULL && dloc->file != NULL) {
+			snprintf(buf, COLS, "uftrace report: %s [line:%d]",
+				 dloc->file->name, dloc->line);
+		}
+		else {
+			struct tui_report *report = (struct tui_report *)win;
+
+			snprintf(buf, COLS, "uftrace report: %s (%d sessions, %d functions)",
+				 handle->dirname, report->nr_sess, report->nr_func);
+		}
 	}
-	buf[COLS] = '\0';
 
-	printw("%-*.*s", COLS, COLS, buf);
+	win_footer(win, buf);
 }
 
 static void win_display_report(struct tui_window *win, void *node)
@@ -1408,14 +1373,14 @@ static void win_display_report(struct tui_window *win, void *node)
 	int width = 38;  /* 3 output fields and spaces */
 
 	printw("  ");
-	print_time(curr->time);
+	print_time(curr->n.total.sum);
 	printw("  ");
-	print_time(curr->self_time);
+	print_time(curr->n.self.sum);
 	printw("  ");
-	printw("%10u", curr->calls);
+	printw("%10lu", curr->n.call);
 	printw("  ");
 
-	printw("%-*.*s", COLS - width, COLS - width, curr->name);
+	printw("%-*.*s", COLS - width, COLS - width, curr->n.name);
 }
 
 static struct debug_location *win_location_report(struct tui_window *win,
@@ -1501,13 +1466,13 @@ static void build_info_node(void *data, const char *fmt, ...)
 }
 
 static struct tui_list * tui_info_init(struct opts *opts,
-				       struct ftrace_file_handle *handle)
+				       struct uftrace_data *handle)
 {
 	INIT_LIST_HEAD(&tui_info.head);
 	process_uftrace_info(handle, opts, build_info_node, &tui_info);
 
 	tui_window_init(&tui_info.win, &info_ops);
-			
+
 	return &tui_info;
 }
 
@@ -1523,7 +1488,7 @@ static void tui_info_finish(void)
 }
 
 static void win_header_info(struct tui_window *win,
-			    struct ftrace_file_handle *handle)
+			    struct uftrace_data *handle)
 {
 
 	printw("%-*.*s", COLS, COLS, "uftrace info");
@@ -1533,43 +1498,18 @@ static void win_header_info(struct tui_window *win,
 	({ int _x = snprintf(buf + len, sz - len, fmt, ## __VA_ARGS__); len += _x; })
 
 static void win_footer_info(struct tui_window *win,
-			    struct ftrace_file_handle *handle)
+			    struct uftrace_data *handle)
 {
 	char buf[256];
-	size_t sz = sizeof(buf);
-	int len = 0;
-
-	print_buf("uftrace version: %s (+", UFTRACE_VERSION);
-
-#ifdef HAVE_CXA_DEMANGLE
-	print_buf(" demangle");
-#endif
-
-#ifdef HAVE_LIBPYTHON2
-	print_buf(" python");
-#endif
-
-#ifdef HAVE_PERF_CLOCKID
-	print_buf(" perf");
-#endif
-
-#ifdef HAVE_LIBNCURSES
-	print_buf(" ncurses");
-#endif
-
-	if (unlikely(len == 0))
-		print_buf(" none");
-
-	print_buf(" )");
-
-	printw("%-*.*s", COLS, COLS, buf);
+	snprintf(buf, COLS, "uftrace version: %s", UFTRACE_VERSION);
+	win_footer(win, buf);
 }
 
 static void win_display_info(struct tui_window *win, void *node)
 {
 	struct tui_list_node *curr = node;
 
-	printw("%-*.*s", COLS, COLS, curr->data);
+	printw("%-*.*s", COLS, COLS, (char *)curr->data);
 }
 
 static const struct tui_window_ops info_ops = {
@@ -1631,13 +1571,13 @@ static void tui_session_finish(void)
 }
 
 static void win_header_session(struct tui_window *win,
-			       struct ftrace_file_handle *handle)
+			       struct uftrace_data *handle)
 {
 	printw("%s %-*s", "Key", COLS - 4, "uftrace command");
 }
 
 static void win_footer_session(struct tui_window *win,
-			       struct ftrace_file_handle *handle)
+			       struct uftrace_data *handle)
 {
 	char buf[256];
 	struct tui_list *s_list = (struct tui_list *)win;
@@ -1658,7 +1598,7 @@ static void win_footer_session(struct tui_window *win,
 		break;
 	}
 
-	printw("%-*s", COLS, buf);
+	win_footer(win, buf);
 }
 
 static struct tui_graph * get_current_graph(struct tui_list_node *node,
@@ -1743,7 +1683,7 @@ static bool win_enter_session(struct tui_window *win, void *node)
 	/* get first child (= actual function) */
 	ugnode = list_first_entry(&ugnode->head, typeof(*ugnode), list);
 
-	func = find_report_node(&tui_report, ugnode->name);
+	func = (void *)report_find_node(&tui_report.name_tree, ugnode->name);
 
 	build_partial_graph(func, get_current_graph(node, NULL));
 	return true;
@@ -1934,13 +1874,13 @@ static bool tui_window_move_prev(struct tui_window *win)
 	}
 
 	/* fold the current node before moving to the previous sibling */
-	count = win->ops->collapse(win, win->curr, 0);
+	count = win->ops->collapse(win, win->curr, false, 0);
 
 	while (win->curr != prev)
 		tui_window_move_up(win);
 
 	/* collapse the current node after moving to the previous sibling */
-	count += win->ops->collapse(win, win->curr, 1);
+	count += win->ops->collapse(win, win->curr, false, 1);
 
 	return count;
 }
@@ -1961,19 +1901,19 @@ static bool tui_window_move_next(struct tui_window *win)
 	}
 
 	/* fold the current node before moving to the next sibling */
-	count = win->ops->collapse(win, win->curr, 0);
+	count = win->ops->collapse(win, win->curr, false, 0);
 
 	while (win->curr != next)
 		tui_window_move_down(win);
 
 	/* collapse the current node after moving to the next sibling */
-	count += win->ops->collapse(win, win->curr, 1);
+	count += win->ops->collapse(win, win->curr, false, 1);
 
 	return count;
 }
 
 static void tui_window_display(struct tui_window *win, bool full_redraw,
-			       struct ftrace_file_handle *handle)
+			       struct uftrace_data *handle)
 {
 	int count;
 	void *node = win->top;
@@ -2020,6 +1960,78 @@ next:
 	attron(COLOR_PAIR(C_HEADER) | A_BOLD);
 	win->ops->footer(win, handle);
 	attroff(COLOR_PAIR(C_HEADER) | A_BOLD);
+}
+
+static void tui_window_set_middle_prev(struct tui_window *win, void *target)
+{
+	void *prev;
+
+	while (win->curr != target)
+		tui_window_move_up(win);
+
+	while (win->curr_index - win->top_index < LINES / 2) {
+		prev = win->ops->prev(win, win->top, false);
+		if (prev == NULL)
+			break;
+
+		if (win->ops->needs_blank(win, prev, win->top))
+			win->top_index--;
+
+		win->top = win->ops->prev(win, win->top, true);
+		win->top_index--;
+	}
+}
+
+static void tui_window_set_middle_next(struct tui_window *win, void *target)
+{
+	void *old, *next;
+	int next_index;
+
+	while (win->curr != target)
+		tui_window_move_down(win);
+
+	/* move next to the end of the page */
+	old = next = win->curr;
+	next_index = win->curr_index;
+
+	while (next_index - win->top_index < LINES - 2) {
+		next = win->ops->next(win, old, false);
+		if (next == NULL)
+			return;
+
+		next_index++;
+
+		if (win->ops->needs_blank(win, old, next))
+			next_index++;
+
+		old = next;
+	}
+	next = win->ops->prev(win, old, false);
+
+	/* move the top down only if there's node at the end */
+	while (win->curr_index - win->top_index >= LINES / 2) {
+		next = win->ops->next(win, next, false);
+		if (next == NULL)
+			break;
+
+		old = win->top;
+		win->top = win->ops->next(win, old, true);
+		win->top_index++;
+
+		if (win->ops->needs_blank(win, old, win->top))
+			win->top_index++;
+	}
+}
+
+static void tui_window_set_middle(struct tui_window *win)
+{
+	int offset_from_top = win->curr_index - win->top_index;
+	int offset_half = LINES / 2;
+
+	if (offset_from_top < offset_half - 2)
+		tui_window_set_middle_prev(win, win->curr);
+	else if (offset_from_top > offset_half + 1)
+		tui_window_set_middle_next(win, win->curr);
 }
 
 static bool tui_window_can_search(struct tui_window *win)
@@ -2125,8 +2137,7 @@ static void tui_window_search_prev(struct tui_window *win)
 			break;
 	}
 
-	while (win->curr != node)
-		tui_window_move_up(win);
+	tui_window_set_middle_prev(win, node);
 }
 
 static void tui_window_search_next(struct tui_window *win)
@@ -2145,8 +2156,7 @@ static void tui_window_search_next(struct tui_window *win)
 			break;
 	}
 
-	while (win->curr != node)
-		tui_window_move_down(win);
+	tui_window_set_middle_next(win, node);
 }
 
 static bool tui_window_change(struct tui_window *win,
@@ -2168,22 +2178,22 @@ static bool tui_window_enter(struct tui_window *win,
 	return win->ops->enter(win, win->curr);
 }
 
-static bool tui_window_collapse(struct tui_window *win)
+static bool tui_window_collapse(struct tui_window *win, bool all)
 {
 	if (win->ops->collapse == NULL)
 		return false;
 
 	/* fold all the directly children */
-	return win->ops->collapse(win, win->curr, 1);
+	return win->ops->collapse(win, win->curr, all, 1);
 }
 
-static bool tui_window_expand(struct tui_window *win)
+static bool tui_window_expand(struct tui_window *win, bool all)
 {
 	if (win->ops->expand == NULL)
 		return false;
 
 	/* unfold all the directly children */
-	return win->ops->expand(win, win->curr, 1);
+	return win->ops->expand(win, win->curr, all, 1);
 }
 
 static bool tui_window_move_parent(struct tui_window *win)
@@ -2196,7 +2206,7 @@ static bool tui_window_move_parent(struct tui_window *win)
 	while (win->curr != parent)
 		tui_window_move_up(win);
 
-	return tui_window_collapse(win);
+	return tui_window_collapse(win, false);
 }
 
 static bool tui_window_longest_child(struct tui_window *win)
@@ -2301,7 +2311,13 @@ static void tui_window_help(void)
 	delwin(win);
 }
 
-static void tui_main_loop(struct opts *opts, struct ftrace_file_handle *handle)
+static inline void cancel_search()
+{
+	free(tui_search);
+	tui_search = NULL;
+}
+
+static void tui_main_loop(struct opts *opts, struct uftrace_data *handle)
 {
 	int key = 0;
 	bool full_redraw = true;
@@ -2332,22 +2348,28 @@ static void tui_main_loop(struct opts *opts, struct ftrace_file_handle *handle)
 			break;
 		case KEY_UP:
 		case 'k':
+			cancel_search();
 			tui_window_move_up(win);
 			break;
 		case KEY_DOWN:
 		case 'j':
+			cancel_search();
 			tui_window_move_down(win);
 			break;
 		case KEY_PPAGE:
+			cancel_search();
 			tui_window_page_up(win);
 			break;
 		case KEY_NPAGE:
+			cancel_search();
 			tui_window_page_down(win);
 			break;
 		case KEY_HOME:
+			cancel_search();
 			tui_window_move_home(win);
 			break;
 		case KEY_END:
+			cancel_search();
 			tui_window_move_end(win);
 			break;
 		case KEY_ENTER:
@@ -2360,9 +2382,11 @@ static void tui_main_loop(struct opts *opts, struct ftrace_file_handle *handle)
 				switch ((long)cmd->data) {
 				case TUI_SESS_REPORT:
 					win = &report->win;
+					tui_window_move_home(win);
 					break;
 				case TUI_SESS_INFO:
 					win = &info->win;
+					tui_window_move_home(win);
 					break;
 				case TUI_SESS_HELP:
 					tui_window_help();
@@ -2373,13 +2397,13 @@ static void tui_main_loop(struct opts *opts, struct ftrace_file_handle *handle)
 					/* change window for the current graph */
 					graph = get_current_graph(win->curr, NULL);
 					win = &graph->win;
+					tui_window_move_home(win);
 					break;
 				}
 			}
 			break;
 		case KEY_ESCAPE:
-			free(tui_search);  /* cancel search */
-			tui_search = NULL;
+			cancel_search();
 			break;
 		case 'G':
 			if (tui_window_change(win, &graph->win)) {
@@ -2393,11 +2417,17 @@ static void tui_main_loop(struct opts *opts, struct ftrace_file_handle *handle)
 				struct tui_report_node *func;
 				struct tui_graph_node *curr = win->curr;
 
-				func = find_report_node(report, curr->n.name);
+				func = (void *)report_find_node(&report->name_tree,
+								curr->n.name);
+				if (func == NULL)
+					break;
 				build_partial_graph(func, graph);
 			}
 			else if (win == &report->win) {
 				build_partial_graph(win->curr, graph);
+			}
+			else {
+				break;
 			}
 
 			win = &partial_graph.win;
@@ -2407,9 +2437,29 @@ static void tui_main_loop(struct opts *opts, struct ftrace_file_handle *handle)
 			full_redraw = true;
 			break;
 		case 'R':
-		case 'r':
 			if (tui_window_change(win, &report->win)) {
 				win = &report->win;
+				tui_window_move_home(win);
+				full_redraw = true;
+			}
+			break;
+		case 'r':
+			if (tui_window_change(win, &report->win)) {
+				struct tui_report_node *func;
+				struct tui_graph_node *graph_curr = win->curr;
+
+				func = (void *)report_find_node(&report->name_tree,
+					       graph_curr->n.name);
+				if (func == NULL)
+					break;
+
+				/* change to report window */
+				win = &report->win;
+
+				/* move focus on the same function */
+				tui_window_move_home(win);
+				tui_window_set_middle_next(win, func);
+
 				full_redraw = true;
 			}
 			break;
@@ -2429,10 +2479,16 @@ static void tui_main_loop(struct opts *opts, struct ftrace_file_handle *handle)
 			full_redraw = tui_window_open_editor(win);
 			break;
 		case 'c':
-			full_redraw = tui_window_collapse(win);
+			full_redraw = tui_window_collapse(win, false);
 			break;
 		case 'e':
-			full_redraw = tui_window_expand(win);
+			full_redraw = tui_window_expand(win, false);
+			break;
+		case 'C':
+			full_redraw = tui_window_collapse(win, true);
+			break;
+		case 'E':
+			full_redraw = tui_window_expand(win, true);
 			break;
 		case 'p':
 			full_redraw = tui_window_move_prev(win);
@@ -2445,6 +2501,9 @@ static void tui_main_loop(struct opts *opts, struct ftrace_file_handle *handle)
 			break;
 		case 'l':
 			full_redraw = tui_window_longest_child(win);
+			break;
+		case 'z':
+			tui_window_set_middle(win);
 			break;
 		case '/':
 			if (tui_window_can_search(win)) {
@@ -2506,11 +2565,21 @@ out:
 	tui_session_finish();
 }
 
+static void display_loading_msg()
+{
+	char *tuimsg = "Building graph for TUI...";
+	int row, col;
+
+	getmaxyx(stdscr, row, col);
+	mvprintw(row / 2, (col - strlen(tuimsg)) / 2, "%s", tuimsg);
+	refresh();
+}
+
 int command_tui(int argc, char *argv[], struct opts *opts)
 {
 	int ret;
-	struct ftrace_file_handle handle;
-	struct ftrace_task_handle *task;
+	struct uftrace_data handle;
+	struct uftrace_task_reader *task;
 
 	ret = open_data_file(opts, &handle);
 	if (ret < 0) {
@@ -2527,6 +2596,9 @@ int command_tui(int argc, char *argv[], struct opts *opts)
 
 	atexit(tui_cleanup);
 
+	/* Print a message before main screen is launched. */
+	display_loading_msg();
+
 	tui_setup(&handle, opts);
 	fstack_setup_filters(opts, &handle);
 
@@ -2539,7 +2611,7 @@ int command_tui(int argc, char *argv[], struct opts *opts)
 		if (!fstack_check_filter(task))
 			continue;
 
-		ret = build_tui_node(task, rec);
+		ret = build_tui_node(task, rec, opts);
 		if (ret)
 			break;
 	}

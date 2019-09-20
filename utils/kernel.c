@@ -31,6 +31,9 @@
 
 static bool kernel_tracing_enabled;
 
+/* tree of executed kernel functions */
+static struct rb_root kfunc_tree = RB_ROOT;
+
 static int prepare_kbuffer(struct uftrace_kernel_reader *kernel, int cpu);
 
 static int
@@ -194,20 +197,21 @@ static int set_filter_file(const char *filter_file, struct list_head *filters)
 		return -1;
 
 	list_for_each_entry_safe(pos, tmp, filters, list) {
-		if (__write_tracing_file(fd, filter_file, pos->name,
-					 true, true) < 0)
-			goto out;
+		/*
+		 * it might fail with non-existing functions added by
+		 * add_single_filter() or skip_kernel_functions().
+		 */
+		__write_tracing_file(fd, filter_file, pos->name, true, true);
 
 		list_del(&pos->list);
 		free(pos);
 
 		/* separate filters by space */
 		if (write(fd, " ", 1) != 1)
-			goto out;
+			pr_dbg2("writing filter file failed, but ignoring...\n");
 	}
 	ret = 0;
 
-out:
 	close(fd);
 	return ret;
 }
@@ -335,7 +339,7 @@ static void build_kernel_filter(struct uftrace_kernel_writer *kernel,
 	strv_for_each(&strv, name, j) {
 		struct uftrace_pattern patt;
 
-		pos = strstr(name, "@kernel");
+		pos = has_kernel_filter(name);
 		if (pos == NULL)
 			continue;
 		*pos = '\0';
@@ -426,7 +430,7 @@ static void build_kernel_event(struct uftrace_kernel_writer *kernel,
 	strv_for_each(&strv, name, j) {
 		struct uftrace_pattern patt;
 
-		pos = strstr(name, "@kernel");
+		pos = has_kernel_filter(name);
 		if (pos == NULL)
 			continue;
 		*pos = '\0';
@@ -538,10 +542,43 @@ out:
 	return -EINVAL;
 }
 
-static void skip_kernel_functions(struct uftrace_kernel_writer *kernel)
+static void check_and_add_list(struct uftrace_kernel_writer *kernel,
+			       const char *funcs[], size_t funcs_len,
+			       struct list_head *list)
 {
 	unsigned int i;
 	struct kfilter *kfilter;
+
+	for (i = 0; i < funcs_len; i++) {
+		bool add = true;
+		const char *name = funcs[i];
+		struct kfilter *pos;
+
+		/* Don't skip it if user particularly want to see them*/
+		list_for_each_entry(pos, &kernel->filters, list) {
+			if (!strcmp(pos->name, name)) {
+				add = false;
+				break;
+			}
+		}
+
+		list_for_each_entry(pos, &kernel->patches, list) {
+			if (!strcmp(pos->name, name)) {
+				add = false;
+				break;
+			}
+		}
+
+		if (add) {
+			kfilter = xmalloc(sizeof(*kfilter) + strlen(name) + 1);
+			strcpy(kfilter->name, name);
+			list_add_tail(&kfilter->list, list);
+		}
+	}
+}
+
+static void skip_kernel_functions(struct uftrace_kernel_writer *kernel)
+{
 	const char *skip_funcs[] = {
 		/*
 		 * Some (old) kernel and architecture doesn't support VDSO
@@ -561,33 +598,15 @@ static void skip_kernel_functions(struct uftrace_kernel_writer *kernel)
 		"syscall_trace_enter_phase1",
 		"syscall_slow_exit_work",
 	};
+	const char *skip_patches[] = {
+		/* kernel 4.17 changed syscall entry on x86_64 */
+		"do_syscall_64",
+	};
 
-	for (i = 0; i < ARRAY_SIZE(skip_funcs); i++) {
-		bool add = true;
-		const char *name = skip_funcs[i];
-		struct kfilter *pos;
-
-		/* Don't skip it if user particularly want to see them*/
-		list_for_each_entry(pos, &kernel->filters, list) {
-			if (strcmp(pos->name, name)) {
-				add = false;
-				break;
-			}
-		}
-
-		list_for_each_entry(pos, &kernel->patches, list) {
-			if (strcmp(pos->name, name)) {
-				add = false;
-				break;
-			}
-		}
-
-		if (add) {
-			kfilter = xmalloc(sizeof(*kfilter) + strlen(name) + 1);
-			strcpy(kfilter->name, name);
-			list_add(&kfilter->list, &kernel->notrace);
-		}
-	}
+	check_and_add_list(kernel, skip_funcs, ARRAY_SIZE(skip_funcs),
+			   &kernel->notrace);
+	check_and_add_list(kernel, skip_patches, ARRAY_SIZE(skip_patches),
+			   &kernel->nopatch);
 }
 
 /**
@@ -1070,7 +1089,7 @@ static int load_kernel_files(struct uftrace_kernel_reader *kernel)
 
 	while (fgets(buf, sizeof(buf), fp) != NULL) {
 		char name[128];
-		size_t len;
+		size_t len = 0;
 
 		if (strncmp(buf, "TRACEFS:", 8) != 0) {
 			char val[32];
@@ -1095,7 +1114,10 @@ static int load_kernel_files(struct uftrace_kernel_reader *kernel)
 			continue;
 		}
 
-		sscanf(buf, "TRACEFS: %[^:]: %zd\n", name, &len);
+		if (sscanf(buf, "TRACEFS: %[^:]: %zd\n", name, &len) != 2) {
+			ret = -1;
+			break;
+		}
 
 		if (fread(buf, 1, len, fp) != len) {
 			ret = -1;
@@ -1335,6 +1357,56 @@ static int next_kbuffer_page(struct uftrace_kernel_reader *kernel, int cpu)
 	return prepare_kbuffer(kernel, cpu);
 }
 
+struct uftrace_kfunc {
+	struct rb_node	node;
+	uint64_t	addr;
+};
+
+static void add_kfunc_addr(struct rb_root *root, uint64_t addr)
+{
+	struct rb_node *parent = NULL;
+	struct rb_node **p = &root->rb_node;
+	struct uftrace_kfunc *iter, *kfunc;
+
+	while (*p) {
+		parent = *p;
+		iter = rb_entry(parent, struct uftrace_kfunc, node);
+
+		if (iter->addr == addr)
+			return;
+
+		if (iter->addr > addr)
+			p = &parent->rb_left;
+		else
+			p = &parent->rb_right;
+	}
+
+	kfunc = xmalloc(sizeof(*kfunc));
+	kfunc->addr = addr;
+
+	rb_link_node(&kfunc->node, parent, p);
+	rb_insert_color(&kfunc->node, root);
+}
+
+static bool find_kfunc_addr(struct rb_root *root, uint64_t addr)
+{
+	struct rb_node *node = root->rb_node;
+	struct uftrace_kfunc *iter;
+
+	while (node) {
+		iter = rb_entry(node, struct uftrace_kfunc, node);
+
+		if (iter->addr == addr)
+			return true;
+
+		if (iter->addr > addr)
+			node = node->rb_left;
+		else
+			node = node->rb_right;
+	}
+	return false;
+}
+
 static int
 funcgraph_entry_handler(struct trace_seq *s, struct pevent_record *record,
 			struct event_format *event, void *context)
@@ -1471,7 +1543,7 @@ int read_kernel_cpu_data(struct uftrace_kernel_reader *kernel, int cpu)
 	return 0;
 }
 
-static int read_kernel_cpu(struct ftrace_file_handle *handle, int cpu)
+static int read_kernel_cpu(struct uftrace_data *handle, int cpu)
 {
 	struct uftrace_kernel_reader *kernel = handle->kernel;
 	struct uftrace_rstack_list *rstack_list = &kernel->rstack_list[cpu];
@@ -1487,7 +1559,7 @@ static int read_kernel_cpu(struct ftrace_file_handle *handle, int cpu)
 	 */
 	while (read_kernel_cpu_data(kernel, cpu) == 0) {
 		struct uftrace_session *sess = handle->sessions.first;
-		struct ftrace_task_handle *task;
+		struct uftrace_task_reader *task;
 		struct uftrace_trigger tr = {};
 		uint64_t real_addr;
 		uint64_t time_filter = handle->time_filter;
@@ -1512,7 +1584,7 @@ static int read_kernel_cpu(struct ftrace_file_handle *handle, int cpu)
 			time_filter = task->filter.time->threshold;
 
 		/* filter match needs full (64-bit) address */
-		real_addr = get_real_address(curr->addr);
+		real_addr = get_kernel_address(&sess->symtabs, curr->addr);
 		/*
 		 * it might set TRACE trigger, which shows
 		 * function even if it's less than the time filter.
@@ -1522,6 +1594,8 @@ static int read_kernel_cpu(struct ftrace_file_handle *handle, int cpu)
 		if (curr->type == UFTRACE_ENTRY) {
 			/* it needs to wait until matching exit found */
 			add_to_rstack_list(rstack_list, curr, NULL);
+
+			add_kfunc_addr(&kfunc_tree, real_addr);
 
 			if (tr.flags & TRIGGER_FL_TIME_FILTER) {
 				struct time_filter_stack *tfs;
@@ -1543,6 +1617,10 @@ static int read_kernel_cpu(struct ftrace_file_handle *handle, int cpu)
 			struct uftrace_rstack_list_node *last;
 			uint64_t delta;
 			int count;
+			bool filtered = false;
+
+			if (!find_kfunc_addr(&kfunc_tree, real_addr))
+				continue;
 
 			if (task->filter.time) {
 				struct time_filter_stack *tfs;
@@ -1576,8 +1654,13 @@ static int read_kernel_cpu(struct ftrace_file_handle *handle, int cpu)
 			}
 
 			delta = curr->time - last->rstack.time;
+			if (delta < time_filter)
+				filtered = true;
 
-			if (delta < time_filter) {
+			if (handle->caller_filter)
+				filtered |= !(tr.flags & TRIGGER_FL_CALLER);
+
+			if (filtered) {
 				/* also delete matching entry (at the last) */
 				while (count--)
 					delete_last_rstack_list(rstack_list);
@@ -1666,8 +1749,8 @@ void * read_kernel_event(struct uftrace_kernel_reader *kernel, int cpu, int *psi
  * This function returns the cpu number (> 0) if it reads a rstack,
  * -1 if it's done.
  */
-int read_kernel_stack(struct ftrace_file_handle *handle,
-		      struct ftrace_task_handle **taskp)
+int read_kernel_stack(struct uftrace_data *handle,
+		      struct uftrace_task_reader **taskp)
 {
 	int i;
 	int first_cpu = -1;
@@ -1727,7 +1810,7 @@ retry:
 }
 
 struct uftrace_record * get_kernel_record(struct uftrace_kernel_reader *kernel,
-					  struct ftrace_task_handle *task,
+					  struct uftrace_task_reader *task,
 					  int cpu)
 {
 	static struct uftrace_record lost_record;
@@ -1765,7 +1848,7 @@ struct uftrace_record * get_kernel_record(struct uftrace_kernel_reader *kernel,
 #define FUNCGRAPH_EXIT   10
 #define TEST_EXAMPLE     100
 
-static struct ftrace_file_handle test_handle;
+static struct uftrace_data test_handle;
 static struct uftrace_session test_sess;
 static void kernel_test_finish_file(void);
 static void kernel_test_finish_handle(void);
@@ -1872,7 +1955,6 @@ struct test_example {
 static int test_tids[NUM_TASK] = { 1234, 5678 };
 
 static struct header_page header = { 0, 4096 };
-static struct type_len_ts padding = { KBUFFER_TYPE_PADDING, 0 };
 
 static struct type_len_ts test_len_ts[NUM_CPU][NUM_RECORD] = {
 	{
@@ -1950,7 +2032,6 @@ static int kernel_test_setup_file(struct uftrace_kernel_reader *kernel, bool eve
 	int cpu, i;
 	FILE *fp;
 	char *filename;
-	unsigned long pad;
 
 	kernel->dirname = "kernel.dir";
 	kernel->nr_cpus = NUM_CPU;
@@ -1985,7 +2066,7 @@ static int kernel_test_setup_file(struct uftrace_kernel_reader *kernel, bool eve
 	for (cpu = 0; cpu < kernel->nr_cpus; cpu++) {
 		if (asprintf(&filename, "%s/kernel-cpu%d.dat",
 			     kernel->dirname, cpu) < 0) {
-			pr_dbg("cannot alloc filename: %s/%d.dat",
+			pr_dbg("cannot alloc filename: %s/kernel-cpu%d.dat",
 			       kernel->dirname, cpu);
 			return -1;
 		}
@@ -2017,11 +2098,6 @@ static int kernel_test_setup_file(struct uftrace_kernel_reader *kernel, bool eve
 		}
 
 		/* pad to page size */
-		fwrite(&padding, 1, sizeof(padding), fp);
-
-		pad = 4096 - ftell(fp);
-		fwrite(&pad, 1, sizeof(pad), fp);
-
 		fallocate(fileno(fp), 0, 0, 4096);
 
 		free(filename);
@@ -2036,7 +2112,7 @@ static int kernel_test_setup_file(struct uftrace_kernel_reader *kernel, bool eve
 }
 
 static int kernel_test_setup_handle(struct uftrace_kernel_reader *kernel,
-				    struct ftrace_file_handle *handle)
+				    struct uftrace_data *handle)
 {
 	int i;
 
@@ -2094,7 +2170,7 @@ static void kernel_test_finish_file(void)
 
 static void kernel_test_finish_handle(void)
 {
-	struct ftrace_file_handle *handle = &test_handle;
+	struct uftrace_data *handle = &test_handle;
 
 	free(handle->tasks);
 	handle->tasks = NULL;
@@ -2104,9 +2180,9 @@ TEST_CASE(kernel_read)
 {
 	int cpu, i;
 	int timestamp[NUM_CPU] = { };
-	struct ftrace_file_handle *handle = &test_handle;
+	struct uftrace_data *handle = &test_handle;
 	struct uftrace_kernel_reader *kernel = xzalloc(sizeof(*kernel));
-	struct ftrace_task_handle *task;
+	struct uftrace_task_reader *task;
 
 	TEST_EQ(kernel_test_setup_file(kernel, false), 0);
 	TEST_EQ(kernel_test_setup_handle(kernel, handle), 0);

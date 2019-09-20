@@ -19,6 +19,7 @@ struct symtabs;
 
 struct debug_file {
 	struct list_head	list;
+	struct rb_node		node;
 	char			*name;
 };
 
@@ -34,10 +35,11 @@ struct debug_info {
 	struct rb_root		args;
 	struct rb_root		rets;
 	struct rb_root		enums;
-	struct list_head	files;
+	struct rb_root		files;
 	struct debug_location	*locs;
 	int			nr_locs;
 	int			nr_locs_used;
+	int			file_type;
 };
 
 extern void prepare_debug_info(struct symtabs *symtabs,
@@ -53,7 +55,7 @@ extern char * get_dwarf_retspec(struct debug_info *dinfo, char *name,
 				unsigned long addr);
 struct debug_location *find_file_line(struct symtabs *symtabs, uint64_t addr);
 extern void save_debug_info(struct symtabs *symtabs, char *dirname);
-extern void load_debug_info(struct symtabs *symtabs);
+extern void load_debug_info(struct symtabs *symtabs, bool needs_srcline);
 extern void save_debug_file(FILE *fp, char code, char *str, unsigned long val);
 
 #endif /* UFTRACE_DWARF_H */

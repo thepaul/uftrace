@@ -2,13 +2,13 @@
 
 from runtest import TestBase
 import subprocess as sp
-import os, re
+import os
 
 TDIR='xxx'
 
 class TestCase(TestBase):
     def __init__(self):
-        TestBase.__init__(self, 'openclose', """
+        TestBase.__init__(self, 'openclose', serial=True, result="""
 # DURATION    TID     FUNCTION
    1.088 us [18343] | __monstartup();
    0.640 us [18343] | __cxa_atexit();
@@ -54,6 +54,6 @@ class TestCase(TestBase):
         major, minor, release = uname[2].split('.')
         if uname[0] == 'Linux' and uname[4] == 'x86_64' and \
            int(major) >= 4 and int(minor) >= 17:
-            return re.sub('sys_[a-zA-Z0-9_]+', 'do_syscall_64', result)
-        else:
-            return result.replace('sys_open', 'sys_openat')
+            result = result.replace('sys_', '__x64_sys_')
+
+        return result.replace(' sys_open', ' sys_openat')

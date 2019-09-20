@@ -17,12 +17,26 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 
+#ifdef HAVE_LIBCAPSTONE
+# include <capstone/capstone.h>
+#endif
+
 #include "uftrace.h"
 #include "mcount-arch.h"
 #include "utils/rbtree.h"
 #include "utils/symbol.h"
 #include "utils/filter.h"
 #include "utils/compiler.h"
+
+/* could be defined in mcount-arch.h */
+#ifndef  ARCH_SUPPORT_AUTO_RECOVER
+# define ARCH_SUPPORT_AUTO_RECOVER  0
+#endif
+
+/* plt_hooker has return address to hook */
+#ifndef  ARCH_CAN_RESTORE_PLTHOOK
+# define ARCH_CAN_RESTORE_PLTHOOK  0
+#endif
 
 enum filter_result {
 	FILTER_RSTACK = -1,
@@ -70,6 +84,19 @@ struct mcount_event {
 
 #define MAX_EVENT  4
 
+enum mcount_watch_item {
+	MCOUNT_WATCH_NONE	= 0,
+	MCOUNT_WATCH_CPU	= (1 << 0),
+};
+
+struct mcount_watchpoint {
+	bool		inited;
+	/* per-thread watch points */
+	int		cpu;
+
+	/* global watch points */
+};
+
 #ifndef DISABLE_MCOUNT_FILTER
 struct mcount_mem_regions {
 	struct rb_root root;
@@ -98,6 +125,7 @@ struct mcount_thread_data {
 	int				record_idx;
 	bool				recursion_marker;
 	bool				in_exception;
+	bool				dead;
 	unsigned long			cygprof_dummy;
 	struct mcount_ret_stack		*rstack;
 	void				*argbuf;
@@ -107,6 +135,7 @@ struct mcount_thread_data {
 	struct mcount_event		event[MAX_EVENT];
 	int				nr_events;
 	struct mcount_mem_regions	mem_regions;
+	struct mcount_watchpoint	watch;
 	struct mcount_arch_context	arch;
 };
 
@@ -130,7 +159,9 @@ static inline void mcount_restore_arch_context(struct mcount_arch_context *ctx) 
 
 extern TLS struct mcount_thread_data mtd;
 
-bool mcount_guard_recursion(struct mcount_thread_data *mtdp, bool force);
+void __mcount_guard_recursion(struct mcount_thread_data *mtdp);
+void __mcount_unguard_recursion(struct mcount_thread_data *mtdp);
+bool mcount_guard_recursion(struct mcount_thread_data *mtdp);
 void mcount_unguard_recursion(struct mcount_thread_data *mtdp);
 
 extern uint64_t mcount_threshold;  /* nsec */
@@ -157,6 +188,9 @@ static inline bool mcount_should_stop(void)
 #ifdef DISABLE_MCOUNT_FILTER
 static inline void mcount_filter_setup(struct mcount_thread_data *mtdp) {}
 static inline void mcount_filter_release(struct mcount_thread_data *mtdp) {}
+static inline void mcount_watch_init(void) {}
+static inline void mcount_watch_setup(struct mcount_thread_data *mtdp) {}
+static inline void mcount_watch_release(struct mcount_thread_data *mtdp) {}
 #endif /* DISABLE_MCOUNT_FILTER */
 
 static inline uint64_t mcount_gettime(void)
@@ -216,7 +250,10 @@ static inline void mcount_memcpy4(void * restrict dst,
 }
 
 extern void mcount_return(void);
+extern void dynamic_return(void);
 extern unsigned long plthook_return(void);
+
+extern unsigned long mcount_return_fn;
 
 extern struct mcount_thread_data * mcount_prepare(void);
 
@@ -231,6 +268,7 @@ extern void mcount_rstack_reset_exception(struct mcount_thread_data *mtdp,
 					  unsigned long frame_addr);
 extern void mcount_auto_restore(struct mcount_thread_data *mtdp);
 extern void mcount_auto_reset(struct mcount_thread_data *mtdp);
+extern bool mcount_rstack_has_plthook(struct mcount_thread_data *mtdp);
 
 extern void prepare_shmem_buffer(struct mcount_thread_data *mtdp);
 extern void clear_shmem_buffer(struct mcount_thread_data *mtdp);
@@ -244,6 +282,7 @@ enum plthook_special_action {
 	PLT_FL_FLUSH		= 1U << 4,
 	PLT_FL_EXCEPT		= 1U << 5,
 	PLT_FL_RESOLVE		= 1U << 6,
+	PLT_FL_DLSYM		= 1U << 7,
 };
 
 struct plthook_special_func {
@@ -251,17 +290,33 @@ struct plthook_special_func {
 	unsigned flags;  /* enum plthook_special_action */
 };
 
+struct plthook_skip_symbol {
+	const char *name;
+	void       *addr;
+};
+
 struct plthook_data {
+	/* links to the 'plthook_modules' list */
 	struct list_head		list;
+	/* full path of this module */
 	const char			*mod_name;
+	/* used by dynamic linker (PLT resolver), saved in GOT[1] */
 	unsigned long			module_id;
+	/* base address where this module is loaded */
 	unsigned long			base_addr;
+	/* start address of PLT code (PLT0) */
 	unsigned long			plt_addr;
+	/* symbol table for PLT functions */
 	struct symtab			dsymtab;
+	/* address of global offset table (GOT) used for PLT */
 	unsigned long			*pltgot_ptr;
+	/* original address of each function (resolved by dynamic linker) */
 	unsigned long			*resolved_addr;
+	/* array of function that needs special care (see above) */
 	struct plthook_special_func	*special_funcs;
 	int				nr_special;
+	/* architecture-specific info */
+	void				*arch;
 };
 
 unsigned long setup_pltgot(struct plthook_data *pd, int got_idx, int sym_idx,
@@ -274,6 +329,8 @@ extern void destroy_dynsym_indexes(void);
 extern unsigned long mcount_arch_plthook_addr(struct plthook_data *pd, int idx);
 
 extern unsigned long plthook_resolver_addr;
+extern const struct plthook_skip_symbol plt_skip_syms[];
+extern size_t plt_skip_nr;
 
 struct uftrace_trigger;
 struct uftrace_arg_spec;
@@ -329,23 +386,54 @@ void save_trigger_read(struct mcount_thread_data *mtdp,
 		       enum trigger_read_type type, bool diff);
 #endif  /* DISABLE_MCOUNT_FILTER */
 
+void save_watchpoint(struct mcount_thread_data *mtdp,
+		     struct mcount_ret_stack *rstack,
+		     unsigned long watchpoints);
+
 struct mcount_dynamic_info {
 	struct mcount_dynamic_info *next;
-	char *mod_name;
+	struct uftrace_mmap *map;
 	unsigned long base_addr;
 	unsigned long text_addr;
-	unsigned long text_size;
+	int text_size;
 	unsigned long trampoline;
 	void *arch;
 };
 
+struct mcount_disasm_engine {
+#ifdef HAVE_LIBCAPSTONE
+	csh		engine;
+#endif
+};
+
+#define INSTRUMENT_SUCCESS                       0
+#define INSTRUMENT_FAILED                       -1
+#define INSTRUMENT_SKIPPED                      -2
+
 int mcount_dynamic_update(struct symtabs *symtabs, char *patch_funcs,
-			  enum uftrace_pattern_type ptype);
+			  enum uftrace_pattern_type ptype,
+			  struct mcount_disasm_engine *disasm);
+
+struct mcount_orig_insn {
+	struct rb_node		node;
+	unsigned long		addr;
+	void			*insn;
+};
+
+struct mcount_orig_insn *mcount_save_code(unsigned long addr, unsigned insn_size,
+					  void *jmp_insn, unsigned jmp_size);
+void *mcount_find_code(unsigned long addr);
+void mcount_freeze_code(void);
 
 /* these should be implemented for each architecture */
 int mcount_setup_trampoline(struct mcount_dynamic_info *adi);
 void mcount_cleanup_trampoline(struct mcount_dynamic_info *mdi);
-int mcount_patch_func(struct mcount_dynamic_info *mdi, struct sym *sym);
+
+int mcount_patch_func(struct mcount_dynamic_info *mdi, struct sym *sym,
+		      struct mcount_disasm_engine *disasm, unsigned min_size);
+
+void mcount_disasm_init(struct mcount_disasm_engine *disasm);
+void mcount_disasm_finish(struct mcount_disasm_engine *disasm);
 
 struct mcount_event_info {
 	char *module;

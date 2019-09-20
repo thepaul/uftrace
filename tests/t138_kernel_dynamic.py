@@ -5,7 +5,7 @@ import os
 
 class TestCase(TestBase):
     def __init__(self):
-        TestBase.__init__(self, 'openclose', """
+        TestBase.__init__(self, 'openclose', serial=True, result="""
 # DURATION    TID     FUNCTION
             [ 9875] | main() {
             [ 9875] |   fopen() {
@@ -38,7 +38,7 @@ class TestCase(TestBase):
     def fixup(self, cflags, result):
         uname = os.uname()
 
-        result = result.replace('sys_open', 'sys_openat')
+        result = result.replace(' sys_open', ' sys_openat')
 
         # Linux v4.17 (x86_64) changed syscall routines
         major, minor, release = uname[2].split('.')

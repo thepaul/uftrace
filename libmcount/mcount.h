@@ -35,6 +35,7 @@ enum mcount_rstack_flag {
 	MCOUNT_FL_TRACE		= (1U << 10),
 	MCOUNT_FL_ARGUMENT	= (1U << 11),
 	MCOUNT_FL_READ		= (1U << 12),
+	MCOUNT_FL_CALLER	= (1U << 13),
 };
 
 struct plthook_data;
@@ -81,6 +82,6 @@ struct mcount_shmem_buffer {
 };
 
 /* must be in sync with enum debug_domain (bits) */
-#define DBG_DOMAIN_STR  "TSDFfsKMPERW"
+#define DBG_DOMAIN_STR  "TSDFfsKMpPERW"
 
 #endif /* UFTRACE_MCOUNT_H */

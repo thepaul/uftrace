@@ -39,7 +39,7 @@ static void print_duration(struct field_data *fd)
 
 static void print_tid(struct field_data *fd)
 {
-	struct ftrace_task_handle *task = fd->task;
+	struct uftrace_task_reader *task = fd->task;
 	pr_out("[%6d]", task->tid);
 }
 
@@ -58,7 +58,7 @@ static void print_addr(struct field_data *fd)
 
 static void print_timestamp(struct field_data *fd)
 {
-	struct ftrace_task_handle *task = fd->task;
+	struct uftrace_task_reader *task = fd->task;
 
 	uint64_t  sec = task->timestamp / NSEC_PER_SEC;
 	uint64_t nsec = task->timestamp % NSEC_PER_SEC;
@@ -68,7 +68,7 @@ static void print_timestamp(struct field_data *fd)
 
 static void print_timedelta(struct field_data *fd)
 {
-	struct ftrace_task_handle *task = fd->task;
+	struct uftrace_task_reader *task = fd->task;
 	uint64_t delta = 0;
 
 	if (task->timestamp_last)
@@ -79,7 +79,7 @@ static void print_timedelta(struct field_data *fd)
 
 static void print_elapsed(struct field_data *fd)
 {
-	struct ftrace_task_handle *task = fd->task;
+	struct uftrace_task_reader *task = fd->task;
 	uint64_t elapsed = task->timestamp - task->h->time_range.first;
 
 	print_time_unit(elapsed);
@@ -87,14 +87,14 @@ static void print_elapsed(struct field_data *fd)
 
 static void print_task(struct field_data *fd)
 {
-	struct ftrace_task_handle *task = fd->task;
+	struct uftrace_task_reader *task = fd->task;
 
 	pr_out("%*s", 15, task->t->comm);
 }
 
 static void print_module(struct field_data *fd)
 {
-	struct ftrace_task_handle *task = fd->task;
+	struct uftrace_task_reader *task = fd->task;
 	struct fstack *fstack = fd->fstack;
 	uint64_t timestamp = task->timestamp;
 	struct uftrace_session *s;
@@ -107,17 +107,10 @@ static void print_module(struct field_data *fd)
 		return;
 	}
 
-	s = find_session(&task->h->sessions, task->tid, timestamp);
-	if (s == NULL)
-		s = find_session(&task->h->sessions, task->t->pid, timestamp);
-	if (s == NULL)  /* for fork/vfork() */
-		s = find_session(&task->h->sessions, task->t->ppid, timestamp);
-
+	s = find_task_session(&task->h->sessions, task->t, timestamp);
 	if (s) {
 		map = find_map(&s->symtabs, fstack->addr);
-		if (map == MAP_MAIN)
-			modname = basename(s->exename);
-		else if (map == MAP_KERNEL)
+		if (map == MAP_KERNEL)
 			modname = "[kernel]";
 		else if (map)
 			modname = basename(map->libname);
@@ -147,8 +140,8 @@ static struct display_field field_tid = {
 static struct display_field field_addr = {
 	.id      = REPLAY_F_ADDR,
 	.name    = "addr",
-#if __SIZEOF_LONG == 4
-	.header  = "  ADDR  ",
+#if __SIZEOF_LONG__ == 4
+	.header  = " ADDRESS",
 	.length  = 8,
 #else
 	.header  = "   ADDRESS  ",
@@ -215,7 +208,7 @@ static struct display_field *field_table[] = {
 	&field_module,
 };
 
-static void print_field(struct ftrace_task_handle *task,
+static void print_field(struct uftrace_task_reader *task,
 			struct fstack *fstack, void *arg)
 {
 	struct field_data fd = {
@@ -240,7 +233,7 @@ static void setup_default_field(struct list_head *fields, struct opts *opts)
 	add_field(fields, field_table[REPLAY_F_TID]);
 }
 
-static int task_column_depth(struct ftrace_task_handle *task, struct opts *opts)
+static int task_column_depth(struct uftrace_task_reader *task, struct opts *opts)
 {
 	if (!opts->column_view)
 		return 0;
@@ -251,7 +244,7 @@ static int task_column_depth(struct ftrace_task_handle *task, struct opts *opts)
 	return task->column_index * opts->column_offset;
 }
 
-static void print_backtrace(struct ftrace_task_handle *task)
+static void print_backtrace(struct uftrace_task_reader *task)
 {
 	struct uftrace_session_link *sessions = &task->h->sessions;
 	int i;
@@ -286,14 +279,17 @@ static void print_backtrace(struct ftrace_task_handle *task)
 	}
 }
 
-static void print_event(struct ftrace_task_handle *task,
+static void print_event(struct uftrace_task_reader *task,
 			struct uftrace_record *urec,
 			int color)
 {
 	unsigned evt_id = urec->addr;
 	char *evt_name = get_event_name(task->h, evt_id);
 
-	if (evt_id >= EVENT_ID_USER) {
+	if (evt_id == EVENT_ID_EXTERN_DATA) {
+		pr_color(color, "%s: %s", evt_name, task->args.data);
+	}
+	else if (evt_id >= EVENT_ID_USER) {
 		/* TODO: some events might have arguments */
 		pr_color(color, "%s", evt_name);
 	}
@@ -301,7 +297,7 @@ static void print_event(struct ftrace_task_handle *task,
 		pr_color(color, "%s", evt_name);
 
 		if (evt_id == EVENT_ID_PERF_COMM)
-			pr_color(color, " (name=%s)", task->args.data);
+			pr_color(color, " (name=%s)", (char *)task->args.data);
 	}
 	else if (evt_id >= EVENT_ID_BUILTIN) {
 		union {
@@ -310,6 +306,7 @@ static void print_event(struct ftrace_task_handle *task,
 			struct uftrace_pmu_cycle  *cycle;
 			struct uftrace_pmu_cache  *cache;
 			struct uftrace_pmu_branch *branch;
+			int                       *cpu;
 		} u;
 
 		switch (evt_id) {
@@ -356,16 +353,21 @@ static void print_event(struct ftrace_task_handle *task,
 			return;
 		case EVENT_ID_DIFF_PMU_CACHE:
 			u.cache = task->args.data;
-			pr_color(color, "%s (refers=%+"PRId64", misses=%+"PRId64", hit=%d%%)",
+			pr_color(color, "%s (refers=%+"PRId64", misses=%+"PRId64", hit=%"PRId64"%%)",
 				 evt_name, u.cache->refers, u.cache->misses,
 				 (u.cache->refers - u.cache->misses) * 100 / u.cache->refers);
 			return;
 		case EVENT_ID_DIFF_PMU_BRANCH:
 			u.branch = task->args.data;
-			pr_color(color, "%s (branch=%+"PRId64", misses=%+"PRId64", predict=%d%%)",
+			pr_color(color, "%s (branch=%+"PRId64", misses=%+"PRId64", predict=%"PRId64"%%)",
 				 evt_name, u.branch->branch, u.branch->misses,
 				 (u.branch->branch - u.branch->misses) * 100 / u.branch->branch);
 			return;
+		case EVENT_ID_WATCH_CPU:
+			u.cpu = task->args.data;
+			pr_color(color, "%s (cpu=%d)", evt_name, *u.cpu);
+			return;
+
 		default:
 			pr_color(color, "%s", evt_name);
 			break;
@@ -381,8 +383,8 @@ static void print_event(struct ftrace_task_handle *task,
 	free(evt_name);
 }
 
-static int print_flat_rstack(struct ftrace_file_handle *handle,
-			     struct ftrace_task_handle *task,
+static int print_flat_rstack(struct uftrace_data *handle,
+			     struct uftrace_task_reader *task,
 			     struct opts *opts)
 {
 	static int count;
@@ -395,6 +397,10 @@ static int print_flat_rstack(struct ftrace_file_handle *handle,
 	sym = task_find_sym(sessions, task, rstack);
 	name = symbol_getname(sym, rstack->addr);
 	fstack = &task->func_stack[rstack->depth];
+
+	/* skip it if --no-libcall is given */
+	if (!opts->libcall && sym && sym->type == ST_PLT_FUNC)
+		goto out;
 
 	switch (rstack->type) {
 	case UFTRACE_ENTRY:
@@ -420,7 +426,7 @@ static int print_flat_rstack(struct ftrace_file_handle *handle,
 		pr_out(" time (%"PRIu64")\n", rstack->time);
 		break;
 	}
-
+out:
 	symbol_putname(sym, name);
 	return 0;
 }
@@ -439,9 +445,25 @@ static void print_task_newline(int current_tid)
 #define print_args(fmt, ...)						\
 ({ int _x = snprintf(args + n, len, fmt, ##__VA_ARGS__); n += _x; len -= _x; })
 
-void get_argspec_string(struct ftrace_task_handle *task,
-		        char *args, size_t len,
-		        enum argspec_string_bits str_mode)
+#define print_escaped_char(c)						\
+	do {								\
+		if (c == '\n')						\
+			print_args("\\\\n");				\
+		else if (c == '\t')					\
+			print_args("\\\\t");				\
+		else if (c == '\\')					\
+			print_args("\\\\");				\
+		else if (c == '"')					\
+			print_args("\\\"");				\
+		else if (isprint(c))					\
+			print_args("%c", c);				\
+		else							\
+			print_args("\\\\x%02hhx", c);			\
+	} while (0)
+
+void get_argspec_string(struct uftrace_task_reader *task,
+			char *args, size_t len,
+			enum argspec_string_bits str_mode)
 {
 	int i = 0, n = 0;
 	char *str = NULL;
@@ -481,9 +503,9 @@ void get_argspec_string(struct ftrace_task_handle *task,
 	assert(arg_list && !list_empty(arg_list));
 
 	if (needs_paren)
-		print_args("(");
+		print_args("%s(%s", color_bold, color_reset);
 	else if (needs_assignment)
-		print_args(" = ");
+		print_args("%s = %s", color_bold, color_reset);
 
 	list_for_each_entry(spec, arg_list, list) {
 		char fmtstr[16];
@@ -497,7 +519,7 @@ void get_argspec_string(struct ftrace_task_handle *task,
 			continue;
 
 		if (i > 0)
-			print_args(", ");
+			print_args("%s, %s", color_bold, color_reset);
 
 		memset(val.v, 0, sizeof(val));
 		fmt = ARG_SPEC_CHARS[spec->fmt];
@@ -569,21 +591,15 @@ void get_argspec_string(struct ftrace_task_handle *task,
 				print_args("\\\"");
 				while (*p) {
 					char c = *p++;
-					if (c == '\n')
-						print_args("\\\\n");
-					else if (c == '\t')
-						print_args("\\\\t");
-					else if (c == '"')
-						print_args("\\\"");
-					else if (isprint(c))
-						print_args("%c", c);
-					else
-						print_args("\\\\x%02hhx", c);
+					print_escaped_char(c);
 				}
 				print_args("\\\"");
 			}
-			else
+			else {
+				print_args("%s", color_string);
 				print_args("\"%.*s\"", slen + newline, str);
+				print_args("%s", color_reset);
+			}
 
 			/* std::string can be represented as "TEXT"s from C++14 */
 			if (spec->fmt == ARG_FMT_STD_STRING)
@@ -596,10 +612,16 @@ void get_argspec_string(struct ftrace_task_handle *task,
 			char c;
 
 			memcpy(&c, data, 1);
-			if (isprint(c))
+			if (needs_escape) {
+				print_args("'");
+				print_escaped_char(c);
+				print_args("'");
+			}
+			else {
+				print_args("%s", color_string);
 				print_args("'%c'", c);
-			else
-				print_args("'\\x%02hhx'", c);
+				print_args("%s", color_reset);
+			}
 			size = 1;
 		}
 		else if (spec->fmt == ARG_FMT_FLOAT) {
@@ -627,7 +649,7 @@ void get_argspec_string(struct ftrace_task_handle *task,
 				break;
 			}
 		}
-		else if (spec->fmt == ARG_FMT_FUNC_PTR) {
+		else if (spec->fmt == ARG_FMT_PTR) {
 			struct uftrace_session_link *sessions = &task->h->sessions;
 			struct sym *sym;
 
@@ -636,10 +658,15 @@ void get_argspec_string(struct ftrace_task_handle *task,
 						 task->rstack->time,
 						 (uint64_t)val.i);
 
-			if (sym)
+			if (sym) {
+				print_args("%s", color_symbol);
 				print_args("&%s", sym->name);
-			else
+				print_args("%s", color_reset);
+			}
+			else if (val.p)
 				print_args("%p", val.p);
+			else
+				print_args("0");
 		}
 		else if (spec->fmt == ARG_FMT_ENUM) {
 			struct uftrace_session_link *sessions = &task->h->sessions;
@@ -648,38 +675,50 @@ void get_argspec_string(struct ftrace_task_handle *task,
 			struct debug_info *dinfo;
 			char *estr;
 
-			s = find_task_session(sessions, task->tid,
+			memcpy(val.v, data, spec->size);
+			s = find_task_session(sessions, task->t,
 					      task->rstack->time);
 
 			map = find_map(&s->symtabs, task->rstack->addr);
-			if (map == MAP_MAIN)
-				dinfo = &s->symtabs.dinfo;
-			else
-				dinfo = &map->dinfo;
+			if (map == NULL || map->mod == NULL) {
+				print_args("<ENUM?> %lx", val.i);
+				goto next;
+			}
 
-			memcpy(val.v, data, spec->size);
+			dinfo = &map->mod->dinfo;
 			estr = get_enum_string(&dinfo->enums, spec->enum_str, val.i);
+			if (strstr(estr, "|") && strcmp("|", color_enum_or)) {
+				struct strv enum_vals = STRV_INIT;
+
+				strv_split(&enum_vals, estr, "|");
+				free(estr);
+				estr = strv_join(&enum_vals, color_enum_or);
+				strv_free(&enum_vals);
+			}
+
+			print_args("%s", color_enum);
 			if (strlen(estr) >= len)
 				print_args("<ENUM>");
 			else
 				print_args("%s", estr);
+			print_args("%s", color_reset);
 			free(estr);
 		}
 		else {
-			assert(idx < ARRAY_SIZE(len_mod));
-			lm = len_mod[idx];
-
 			if (spec->fmt != ARG_FMT_AUTO)
 				memcpy(val.v, data, spec->size);
 
-			snprintf(fmtstr, sizeof(fmtstr), "%%#%s%c", lm, fmt);
+			assert(idx < ARRAY_SIZE(len_mod));
+			lm = len_mod[idx];
 
-			if (spec->size > (int)sizeof(long))
+			snprintf(fmtstr, sizeof(fmtstr), "%%#%s%c", lm, fmt);
+			if (spec->size == 8)
 				print_args(fmtstr, val.ll);
 			else
 				print_args(fmtstr, val.i);
 		}
 
+next:
 		i++;
 		data += ALIGN(size, 4);
 
@@ -692,8 +731,7 @@ void get_argspec_string(struct ftrace_task_handle *task,
 	}
 
 	if (needs_paren) {
-		args[n] = ')';
-		args[n+1] = '\0';
+		print_args("%s)%s", color_bold, color_reset);
 	} else {
 		if (needs_semi_colon)
 			args[n++] = ';';
@@ -701,11 +739,11 @@ void get_argspec_string(struct ftrace_task_handle *task,
 	}
 }
 
-static int print_graph_rstack(struct ftrace_file_handle *handle,
-			      struct ftrace_task_handle *task,
+static int print_graph_rstack(struct uftrace_data *handle,
+			      struct uftrace_task_reader *task,
 			      struct opts *opts)
 {
-	struct uftrace_record *rstack = task->rstack;
+	struct uftrace_record *rstack;
 	struct uftrace_session_link *sessions = &handle->sessions;
 	struct sym *sym = NULL;
 	enum argspec_string_bits str_mode = 0;
@@ -717,33 +755,38 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 	if (task == NULL)
 		return 0;
 
+	rstack = task->rstack;
 	if (rstack->type == UFTRACE_LOST)
 		goto lost;
 
 	sym = task_find_sym(sessions, task, rstack);
 	symname = symbol_getname(sym, rstack->addr);
 
+	/* skip it if --no-libcall is given */
+	if (!opts->libcall && sym && sym->type == ST_PLT_FUNC)
+		goto out;
+
 	if (rstack->type == UFTRACE_ENTRY) {
-		if(symname[strlen(symname) - 1] != ')' || rstack->more)
+		if (symname[strlen(symname) - 1] != ')' || rstack->more)
 			str_mode |= NEEDS_PAREN;
 	}
 
 	task->timestamp_last = task->timestamp;
 	task->timestamp = rstack->time;
 
-	if (opts->libname && sym && sym->type == ST_PLT) {
+	if (opts->libname && sym && sym->type == ST_PLT_FUNC) {
 		struct uftrace_session *s;
 
-		s = find_task_session(sessions, task->tid, rstack->time);
-		if (s) {
+		s = find_task_session(sessions, task->t, rstack->time);
+		if (s != NULL) {
 			map = find_symbol_map(&s->symtabs, symname);
-			if (map && map != MAP_MAIN)
+			if (map != NULL)
 				libname = basename(map->libname);
 		}
 	}
 
 	if (rstack->type == UFTRACE_ENTRY) {
-		struct ftrace_task_handle *next = NULL;
+		struct uftrace_task_reader *next = NULL;
 		struct fstack *fstack;
 		int rstack_depth = rstack->depth;
 		int depth;
@@ -780,8 +823,7 @@ static int print_graph_rstack(struct ftrace_file_handle *handle,
 		fstack = &task->func_stack[task->stack_count - 1];
 
 		if (!opts->no_merge)
-			next = fstack_skip(handle, task, rstack_depth,
-					   opts->event_skip_out);
+			next = fstack_skip(handle, task, rstack_depth, opts);
 
 		if (task == next &&
 		    next->rstack->depth == rstack_depth &&
@@ -891,20 +933,19 @@ lost:
 		else /* kernel sometimes have unknown count */
 			pr_red("%*s/* LOST some records!! */\n",
 			       depth * 2, "");
+		return 0;
 	}
 	else if (rstack->type == UFTRACE_EVENT) {
 		int depth;
 		struct fstack *fstack;
-		struct ftrace_task_handle *next = NULL;
+		struct uftrace_task_reader *next = NULL;
 		struct uftrace_record rec = *rstack;
 		uint64_t evt_id = rstack->addr;
 
 		depth = task->display_depth;
 
-		/* skip kernel event messages outside of user functions */
-		if (opts->kernel_skip_out && task->user_stack_count == 0 &&
-		    is_kernel_record(task, rstack))
-			return 0;
+		if (!fstack_check_filter(task))
+			goto out;
 
 		/* give a new line when tid is changed */
 		if (opts->task_newline)
@@ -917,7 +958,7 @@ lost:
 		 * it might overwrite rstack - use (saved) rec for printing.
 		 */
 		if (evt_id == EVENT_ID_PERF_SCHED_OUT && !opts->no_merge)
-			next = fstack_skip(handle, task, 0, opts->event_skip_out);
+			next = fstack_skip(handle, task, 0, opts);
 
 		if (task == next &&
 		    next->rstack->addr == EVENT_ID_PERF_SCHED_IN) {
@@ -928,25 +969,32 @@ lost:
 			evt_id = EVENT_ID_PERF_SCHED_IN;
 		}
 
+		/* show external data regardless of display depth */
+		if (evt_id == EVENT_ID_EXTERN_DATA)
+			depth = 0;
+
 		/* for sched-in to show schedule duration */
 		fstack = &task->func_stack[task->stack_count];
 
-		if (evt_id == EVENT_ID_PERF_SCHED_IN &&
-		    fstack->total_time)
-			print_field(task, fstack, NULL);
-		else
-			print_field(task, NULL, NO_TIME);
+		if (!(fstack->flags & FSTACK_FL_NORECORD) && fstack_enabled) {
+			if (evt_id == EVENT_ID_PERF_SCHED_IN &&
+			    fstack->total_time)
+				print_field(task, fstack, NULL);
+			else
+				print_field(task, NULL, NO_TIME);
 
-		pr_color(task->event_color, "%*s/* ", depth * 2, "");
-		print_event(task, &rec, task->event_color);
-		pr_color(task->event_color, " */\n");
+			pr_color(task->event_color, "%*s/* ", depth * 2, "");
+			print_event(task, &rec, task->event_color);
+			pr_color(task->event_color, " */\n");
+		}
+
 	}
 out:
 	symbol_putname(sym, symname);
 	return 0;
 }
 
-static void print_warning(struct ftrace_task_handle *task)
+static void print_warning(struct uftrace_task_reader *task)
 {
 	if (print_empty_field(&output_fields, 1))
 		pr_out(" | ");
@@ -954,7 +1002,7 @@ static void print_warning(struct ftrace_task_handle *task)
 	       (task->display_depth + 1) * 2, "");
 }
 
-static bool skip_sys_exit(struct opts *opts, struct ftrace_task_handle *task)
+static bool skip_sys_exit(struct opts *opts, struct uftrace_task_reader *task)
 {
 	uint64_t ip;
 	struct sym *sym;
@@ -971,7 +1019,8 @@ static bool skip_sys_exit(struct opts *opts, struct ftrace_task_handle *task)
 	if (sym == NULL)
 		return false;
 
-	if (!strncmp(sym->name, "sys_exit", 8))
+	/* Linux 4.17 added __x64_sys_exit, __ia32_sys_exit and so on */
+	if (strstr(sym->name, "sys_exit"))
 		return true;
 	if (!strcmp(sym->name, "do_syscall_64"))
 		return true;
@@ -980,14 +1029,14 @@ static bool skip_sys_exit(struct opts *opts, struct ftrace_task_handle *task)
 }
 
 static void print_remaining_stack(struct opts *opts,
-				  struct ftrace_file_handle *handle)
+				  struct uftrace_data *handle)
 {
 	int i, k;
 	int total = 0;
 	struct uftrace_session_link *sessions = &handle->sessions;
 
 	for (i = 0; i < handle->nr_tasks; i++) {
-		struct ftrace_task_handle *task = &handle->tasks[i];
+		struct uftrace_task_reader *task = &handle->tasks[i];
 		int zero_count = 0;
 
 		if (skip_sys_exit(opts, task))
@@ -1009,7 +1058,7 @@ static void print_remaining_stack(struct opts *opts,
 	pr_out("\n================================================\n");
 
 	for (i = 0; i < handle->nr_tasks; i++) {
-		struct ftrace_task_handle *task = &handle->tasks[i];
+		struct uftrace_task_reader *task = &handle->tasks[i];
 		int zero_count = 0;
 
 		if (task->stack_count == 0)
@@ -1054,8 +1103,8 @@ int command_replay(int argc, char *argv[], struct opts *opts)
 {
 	int ret;
 	uint64_t prev_time = 0;
-	struct ftrace_file_handle handle;
-	struct ftrace_task_handle *task;
+	struct uftrace_data handle;
+	struct uftrace_task_reader *task;
 
 	__fsetlocking(outfp, FSETLOCKING_BYCALLER);
 	__fsetlocking(logfp, FSETLOCKING_BYCALLER);

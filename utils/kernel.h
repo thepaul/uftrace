@@ -2,6 +2,7 @@
 #define UFTRACE_KERNEL_H
 
 #include "libtraceevent/event-parse.h"
+#include "utils/utils.h"
 
 #define KERNEL_NOP_TRACER    "nop"
 #define KERNEL_GRAPH_TRACER  "function_graph"
@@ -34,7 +35,7 @@ struct uftrace_kernel_reader {
 	void				**mmaps;
 	struct kbuffer			**kbufs;
 	struct pevent			*pevent;
-	struct ftrace_file_handle	*handle;
+	struct uftrace_data	*handle;
 	struct uftrace_record		*rstacks;
 	struct uftrace_rstack_list	*rstack_list;
 	struct trace_seq		trace_buf;
@@ -58,14 +59,14 @@ void list_kernel_events(void);
 
 /* these functions will be used at replay time */
 int setup_kernel_data(struct uftrace_kernel_reader *kernel);
-int read_kernel_stack(struct ftrace_file_handle *handle,
-		      struct ftrace_task_handle **taskp);
+int read_kernel_stack(struct uftrace_data *handle,
+		      struct uftrace_task_reader **taskp);
 int read_kernel_cpu_data(struct uftrace_kernel_reader *kernel,
 			 int cpu);
 void * read_kernel_event(struct uftrace_kernel_reader *kernel,
 			 int cpu, int *psize);
 struct uftrace_record * get_kernel_record(struct uftrace_kernel_reader *kernel,
-					  struct ftrace_task_handle *task,
+					  struct uftrace_task_reader *task,
 					  int cpu);
 int finish_kernel_data(struct uftrace_kernel_reader *kernel);
 
@@ -76,7 +77,7 @@ static inline bool has_kernel_data(struct uftrace_kernel_reader *kernel)
 
 static inline bool has_kernel_event(char *events)
 {
-	return events && strstr(events, "@kernel");
+	return events && has_kernel_filter(events);
 }
 
 bool check_kernel_pid_filter(void);

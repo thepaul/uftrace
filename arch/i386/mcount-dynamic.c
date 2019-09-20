@@ -20,22 +20,28 @@ int mcount_setup_trampoline(struct mcount_dynamic_info *mdi)
 	unsigned char trampoline[] = { 0xe8, 0x00, 0x00, 0x00, 0x00, 0x58, 0xff, 0x60, 0x04 };
 	unsigned long fentry_addr = (unsigned long)__fentry__;
 	size_t trampoline_size = 16;
+	void *trampoline_check;
 
 	/* find unused 16-byte at the end of the code segment */
-	mdi->trampoline = ALIGN(mdi->addr + mdi->size, PAGE_SIZE) - trampoline_size;
+	mdi->trampoline = ALIGN(mdi->text_addr + mdi->text_size, PAGE_SIZE) - trampoline_size;
 
-	if (unlikely(mdi->trampoline < mdi->addr + mdi->size)) {
+	if (unlikely(mdi->trampoline < mdi->text_addr + mdi->text_size)) {
 		mdi->trampoline += trampoline_size;
-		mdi->size += PAGE_SIZE;
+		mdi->text_size += PAGE_SIZE;
 
 		pr_dbg2("adding a page for fentry trampoline at %#lx\n",
 			mdi->trampoline);
 
-		mmap((void *)mdi->trampoline, PAGE_SIZE, PROT_READ | PROT_WRITE,
-		     MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		trampoline_check = mmap((void *)mdi->trampoline, PAGE_SIZE,
+					PROT_READ | PROT_WRITE,
+		     			MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS,
+					-1, 0);
+
+		if (trampoline_check == MAP_FAILED)
+			pr_err("failed to mmap trampoline for setup");
 	}
 
-	if (mprotect((void *)mdi->addr, mdi->size, PROT_READ | PROT_WRITE)) {
+	if (mprotect((void *)mdi->text_addr, mdi->text_size, PROT_READ | PROT_WRITE)) {
 		pr_dbg("cannot setup trampoline due to protection: %m\n");
 		return -1;
 	}
@@ -49,7 +55,7 @@ int mcount_setup_trampoline(struct mcount_dynamic_info *mdi)
 
 void mcount_cleanup_trampoline(struct mcount_dynamic_info *mdi)
 {
-	if (mprotect((void *)mdi->addr, mdi->size, PROT_EXEC))
+	if (mprotect((void *)mdi->text_addr, mdi->text_size, PROT_EXEC))
 		pr_err("cannot restore trampoline due to protection");
 }
 
@@ -58,7 +64,7 @@ void mcount_cleanup_trampoline(struct mcount_dynamic_info *mdi)
 static unsigned long get_target_addr(struct mcount_dynamic_info *mdi, unsigned long addr)
 {
 	while (mdi) {
-		if (mdi->addr <= addr && addr < mdi->addr + mdi->size)
+		if (mdi->text_addr <= addr && addr < mdi->text_addr + mdi->text_size)
 			return mdi->trampoline - (addr + CALL_INSN_SIZE);
 
 		mdi = mdi->next;
@@ -96,7 +102,8 @@ static int patch_fentry_func(struct mcount_dynamic_info *mdi, struct sym *sym)
 	return 0;
 }
 
-int mcount_patch_func(struct mcount_dynamic_info *mdi, struct sym *sym)
+int mcount_patch_func(struct mcount_dynamic_info *mdi, struct sym *sym,
+		      struct mcount_disasm_engine *disasm, unsigned min_size)
 {
 	return patch_fentry_func(mdi, sym);
 }

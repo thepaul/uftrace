@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <signal.h>
 #include <errno.h>
+#include <sys/stat.h>
 
 #include "uftrace.h"
 #include "utils/utils.h"
@@ -30,7 +31,11 @@ static void reset_live_opts(struct opts *opts)
 	 * These options are handled in record and no need to do it in
 	 * replay again.
 	 */
-	opts->filter	= NULL;
+	free(opts->filter);
+	opts->filter = NULL;
+	free(opts->caller);
+	opts->caller = NULL;
+
 	opts->depth	= MCOUNT_DEFAULT_DEPTH;
 	opts->disabled	= false;
 	opts->no_event  = false;
@@ -86,17 +91,21 @@ static void setup_child_environ(struct opts *opts)
 	}
 	else
 		setenv("LD_PRELOAD", libpath, 1);
+
+	free(libpath);
 }
 
 int command_live(int argc, char *argv[], struct opts *opts)
 {
 	char template[32] = "/tmp/uftrace-live-XXXXXX";
-	int fd = mkstemp(template);
+	int fd;
 	struct sigaction sa = {
 		.sa_flags = SA_RESETHAND,
 	};
 	int ret;
 
+	umask(022);
+	fd = mkstemp(template);
 	if (fd < 0)
 		pr_err("cannot create temp name");
 
@@ -131,6 +140,9 @@ int command_live(int argc, char *argv[], struct opts *opts)
 		int ret2;
 
 		reset_live_opts(opts);
+
+		if (opts->use_pager)
+			start_pager(setup_pager());
 
 		pr_dbg("live-record finished.. \n");
 		if (opts->report) {

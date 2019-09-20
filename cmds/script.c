@@ -21,8 +21,8 @@
 #include "libtraceevent/event-parse.h"
 
 
-static int run_script_for_rstack(struct ftrace_file_handle *handle,
-				 struct ftrace_task_handle *task,
+static int run_script_for_rstack(struct uftrace_data *handle,
+				 struct uftrace_task_reader *task,
 				 struct opts *opts)
 {
 	struct uftrace_record *rstack = task->rstack;
@@ -32,6 +32,10 @@ static int run_script_for_rstack(struct ftrace_file_handle *handle,
 
 	sym = task_find_sym(sessions, task, rstack);
 	symname = symbol_getname(sym, rstack->addr);
+
+	/* skip it if --no-libcall is given */
+	if (!opts->libcall && sym && sym->type == ST_PLT_FUNC)
+		goto out;
 
 	task->timestamp_last = task->timestamp;
 	task->timestamp = rstack->time;
@@ -128,8 +132,8 @@ out:
 int command_script(int argc, char *argv[], struct opts *opts)
 {
 	int ret;
-	struct ftrace_file_handle handle;
-	struct ftrace_task_handle *task;
+	struct uftrace_data handle;
+	struct uftrace_task_reader *task;
 	struct script_info info = {
 		.name           = opts->script_file,
 		.version        = UFTRACE_VERSION,
@@ -173,7 +177,7 @@ int command_script(int argc, char *argv[], struct opts *opts)
 
 	fstack_setup_filters(opts, &handle);
 
-	strv_copy(&info.args, argc, argv);
+	strv_copy(&info.cmds, argc, argv);
 
 	/* initialize script */
 	if (script_init(&info, opts->patt_type) < 0)

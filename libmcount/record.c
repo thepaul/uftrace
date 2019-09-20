@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
@@ -22,25 +23,25 @@
 
 #define ARG_STR_MAX	98
 
-static struct mcount_shmem_buffer *allocate_shmem_buffer(char *buf, size_t size,
+static struct mcount_shmem_buffer *allocate_shmem_buffer(char *sess_id, size_t size,
 							 int tid, int idx)
 {
 	int fd;
 	int saved_errno = 0;
 	struct mcount_shmem_buffer *buffer = NULL;
 
-	snprintf(buf, size, SHMEM_SESSION_FMT, mcount_session_name(), tid, idx);
+	snprintf(sess_id, size, SHMEM_SESSION_FMT, mcount_session_name(), tid, idx);
 
-	fd = shm_open(buf, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	fd = shm_open(sess_id, O_RDWR | O_CREAT | O_TRUNC, 0600);
 	if (fd < 0) {
 		saved_errno = errno;
-		pr_dbg("failed to open shmem buffer: %s\n", buf);
+		pr_dbg("failed to open shmem buffer: %s\n", sess_id);
 		goto out;
 	}
 
 	if (ftruncate(fd, shmem_bufsize) < 0) {
 		saved_errno = errno;
-		pr_dbg("failed to resizing shmem buffer: %s\n", buf);
+		pr_dbg("failed to resizing shmem buffer: %s\n", sess_id);
 		goto out;
 	}
 
@@ -48,7 +49,7 @@ static struct mcount_shmem_buffer *allocate_shmem_buffer(char *buf, size_t size,
 		      MAP_SHARED, fd, 0);
 	if (buffer == MAP_FAILED) {
 		saved_errno = errno;
-		pr_dbg("failed to mmap shmem buffer: %s\n", buf);
+		pr_dbg("failed to mmap shmem buffer: %s\n", sess_id);
 		buffer = NULL;
 		goto out;
 	}
@@ -358,7 +359,7 @@ static bool find_mem_region(struct rb_root *root, unsigned long addr)
 			p = &parent->rb_right;
 	}
 
-	pr_dbg2("cannot find mem region: %lx\n");
+	pr_dbg2("cannot find mem region: %lx\n", addr);
 	return false;
 }
 
@@ -719,6 +720,52 @@ void save_trigger_read(struct mcount_thread_data *mtdp,
 	}
 }
 
+void save_watchpoint(struct mcount_thread_data *mtdp,
+		     struct mcount_ret_stack *rstack,
+		     unsigned long watchpoints)
+{
+	uint64_t timestamp;
+	ptrdiff_t rstack_idx;
+	bool init_watch;
+
+	timestamp = rstack->end_time ?: rstack->start_time;
+	rstack_idx = rstack - mtdp->rstack;
+	init_watch = !mtdp->watch.inited;
+
+	if (init_watch) {
+		/*
+		 * Normally watch point event comes before the rstack (record)
+		 * in order to indicate where it's changed precisely.
+		 * But first watch point event needs to come after the first
+		 * record otherwise it'd not shown since 'event-skip' mechanism.
+		 * so add 2(nsec) so that it can be 1 nsec later.
+		 */
+		timestamp += 2;
+		mtdp->watch.inited = true;
+	}
+
+	/* save watch event before normal record */
+	timestamp -= 1;
+
+	if (watchpoints & MCOUNT_WATCH_CPU) {
+		int cpu = sched_getcpu();
+
+		if ((mtdp->watch.cpu != cpu || init_watch) &&
+		    mtdp->nr_events < MAX_EVENT) {
+			struct mcount_event *event;
+			event = &mtdp->event[mtdp->nr_events++];
+
+			event->id    = EVENT_ID_WATCH_CPU;
+			event->time  = timestamp;
+			event->idx   = rstack_idx;
+			event->dsize = sizeof(cpu);
+
+			mcount_memcpy4(event->data, &cpu, sizeof(cpu));
+		}
+		mtdp->watch.cpu = cpu;
+	}
+}
+
 #else
 void *get_argbuf(struct mcount_thread_data *mtdp,
 		 struct mcount_ret_stack *rstack)
@@ -734,6 +781,12 @@ void save_retval(struct mcount_thread_data *mtdp,
 void save_trigger_read(struct mcount_thread_data *mtdp,
 		       struct mcount_ret_stack *rstack,
 		       enum trigger_read_type type)
+{
+}
+
+void save_watchpoint(struct mcount_thread_data *mtdp,
+		     struct mcount_ret_stack *rstack,
+		     unsigned long watchpoints)
 {
 }
 #endif
@@ -1012,14 +1065,23 @@ int record_trace_data(struct mcount_thread_data *mtdp,
 	return 0;
 }
 
+static void write_map(FILE *out, struct uftrace_mmap *map,
+		      unsigned char major, unsigned char minor,
+		      uint32_t ino, uint64_t off)
+{
+	/* write prev_map when it finds a new map */
+	fprintf(out, "%"PRIx64"-%"PRIx64" %.4s %08"PRIx64" %02x:%02x %-26u %s\n",
+			map->start, map->end, map->prot, off, major, minor,
+			ino, map->libname);
+}
+
 void record_proc_maps(char *dirname, const char *sess_id,
 		      struct symtabs *symtabs)
 {
 	FILE *ifp, *ofp;
 	char buf[PATH_MAX];
 	struct uftrace_mmap *prev_map = NULL;
-	char *last_libname = NULL;
-	bool last_prot_x = false;
+	bool prev_written = false;
 
 	ifp = fopen("/proc/self/maps", "r");
 	if (ifp == NULL)
@@ -1036,13 +1098,18 @@ void record_proc_maps(char *dirname, const char *sess_id,
 	while (fgets(buf, sizeof(buf), ifp)) {
 		unsigned long start, end;
 		char prot[5];
+		unsigned char major, minor;
+		unsigned char prev_major = 0, prev_minor = 0;
+		uint32_t ino, prev_ino = 0;
+		uint64_t off, prev_off = 0;
 		char path[PATH_MAX];
 		size_t namelen;
 		struct uftrace_mmap *map;
 
 		/* skip anon mappings */
-		if (sscanf(buf, "%lx-%lx %s %*x %*x:%*x %*d %s\n",
-			   &start, &end, prot, path) != 4)
+		if (sscanf(buf, "%lx-%lx %s %"SCNx64" %hhx:%hhx %u %s\n",
+			   &start, &end, prot, &off, &major, &minor,
+			   &ino, path) != 8)
 			continue;
 
 		/*
@@ -1050,38 +1117,34 @@ void record_proc_maps(char *dirname, const char *sess_id,
 		 * but [stack] is still needed to get kernel base address.
 		 */
 		if (path[0] == '[') {
-			if (strncmp(path, "[stack", 6) == 0) {
-				symtabs->kernel_base = get_kernel_base(buf);
-				last_prot_x = true;
-				goto next;
+			if (prev_map && !prev_written) {
+				write_map(ofp, prev_map, prev_major,
+					  prev_minor, prev_ino, prev_off);
+				prev_written = true;
 			}
-			else
-				continue;
-		}
-
-		/*
-		 * use first mapping only to calculate the offset correctly.
-		 * but if the first mapping is not executable, extends it
-		 * to span to the executable (probably the second) mapping.
-		 */
-		if (last_libname && !strcmp(last_libname, path)) {
-			if (!last_prot_x && (prot[2] == 'x')) {
-				prev_map->end = end;
-				last_prot_x = true;
-
-				snprintf(buf, sizeof(buf), "%"PRIx64"-%"PRIx64" %s",
-					 prev_map->start, prev_map->end,
-					 strchr(buf, ' ') + 1);
-				goto next;
+			if (strncmp(path, "[stack", 6) == 0) {
+				symtabs->kernel_base = guess_kernel_base(buf);
+				fprintf(ofp, "%s", buf);
 			}
 			continue;
 		}
 
-		last_prot_x = (prot[2] == 'x');
+		if (prev_map != NULL) {
+			/* extend prev_map to have all segments */
+			if (!strcmp(path, prev_map->libname)) {
+				prev_map->end = end;
+				if (prot[2] == 'x')
+					mcount_memcpy1(prev_map->prot, prot, 4);
+				continue;
+			}
 
-		/* still need to write the map for executable */
-		if (!strcmp(path, symtabs->filename))
-			symtabs->exec_base = start;
+			/* write prev_map when it finds a new map */
+			if (!prev_written) {
+				write_map(ofp, prev_map, prev_major,
+					  prev_minor, prev_ino, prev_off);
+				prev_written = true;
+			}
+		}
 
 		/* save map for the executable */
 		namelen = ALIGN(strlen(path) + 1, 4);
@@ -1094,7 +1157,10 @@ void record_proc_maps(char *dirname, const char *sess_id,
 		mcount_memcpy1(map->prot, prot, 4);
 		mcount_memcpy1(map->libname, path, namelen);
 		map->libname[strlen(path)] = '\0';
-		last_libname = map->libname;
+
+		/* still need to write the map for executable */
+		if (!strcmp(path, symtabs->filename))
+			symtabs->exec_base = start;
 
 		if (prev_map)
 			prev_map->next = map;
@@ -1103,10 +1169,11 @@ void record_proc_maps(char *dirname, const char *sess_id,
 
 		map->next = NULL;
 		prev_map = map;
-next:
-		/* defer write until it finds an exec-map */
-		if (last_prot_x)
-			fprintf(ofp, "%s", buf);
+		prev_off = off;
+		prev_ino = ino;
+		prev_major = major;
+		prev_minor = minor;
+		prev_written = false;
 	}
 
 	fclose(ifp);

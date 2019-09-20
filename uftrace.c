@@ -47,6 +47,8 @@ const char *argp_program_bug_address = "https://github.com/namhyung/uftrace/issu
 
 static bool dbg_domain_set = false;
 
+static bool parsing_default_opts = false;
+
 enum options {
 	OPT_flat	= 301,
 	OPT_no_libcall,
@@ -73,6 +75,7 @@ enum options {
 	OPT_task_newline,
 	OPT_chrome_trace,
 	OPT_flame_graph,
+	OPT_graphviz,
 	OPT_sample_time,
 	OPT_diff,
 	OPT_sort_column,
@@ -91,13 +94,13 @@ enum options {
 	OPT_keep_pid,
 	OPT_diff_policy,
 	OPT_event_full,
-	OPT_nest_libcall,
 	OPT_record,
-	OPT_auto_args,
 	OPT_libname,
 	OPT_match_type,
 	OPT_no_randomize_addr,
 	OPT_no_event,
+	OPT_signal,
+	OPT_srcline,
 };
 
 static struct argp_option uftrace_options[] = {
@@ -106,6 +109,12 @@ static struct argp_option uftrace_options[] = {
 	{ "notrace", 'N', "FUNC", 0, "Don't trace those FUNCs" },
 	{ "trigger", 'T', "FUNC@act[,act,...]", 0, "Trigger action on those FUNCs" },
 	{ "depth", 'D', "DEPTH", 0, "Trace functions within DEPTH" },
+	{ "time-filter", 't', "TIME", 0, "Hide small functions run less than the TIME" },
+	{ "caller-filter", 'C', "FUNC", 0, "Only trace callers of those FUNCs" },
+	{ "argument", 'A', "FUNC@arg[,arg,...]", 0, "Show function arguments" },
+	{ "retval", 'R', "FUNC@retval", 0, "Show function return value" },
+	{ "patch", 'P', "FUNC", 0, "Apply dynamic patching for FUNCs" },
+	{ "size-filter", 'Z', "SIZE", 0, "Apply dynamic patching for functions bigger than SIZE" },
 	{ "debug", 'v', 0, 0, "Print debug messages" },
 	{ "verbose", 'v', 0, 0, "Print verbose (debug) messages" },
 	{ "data", 'd', "DATA", 0, "Use this DATA instead of uftrace.data" },
@@ -137,9 +146,6 @@ static struct argp_option uftrace_options[] = {
 	{ "column-offset", OPT_column_offset, "DEPTH", 0, "Offset of each column (default: 8)" },
 	{ "no-pltbind", OPT_bind_not, 0, 0, "Do not bind dynamic symbols (LD_BIND_NOT)" },
 	{ "task-newline", OPT_task_newline, 0, 0, "Interleave a newline when task is changed" },
-	{ "time-filter", 't', "TIME", 0, "Hide small functions run less than the TIME" },
-	{ "argument", 'A', "FUNC@arg[,arg,...]", 0, "Show function arguments" },
-	{ "retval", 'R', "FUNC@retval", 0, "Show function return value" },
 	{ "chrome", OPT_chrome_trace, 0, 0, "Dump recorded data in chrome trace format" },
 	{ "diff", OPT_diff, "DATA", 0, "Report differences" },
 	{ "sort-column", OPT_sort_column, "INDEX", 0, "Sort diff report on column INDEX (default: 2)" },
@@ -154,10 +160,10 @@ static struct argp_option uftrace_options[] = {
 	{ "kernel-only", OPT_kernel_only, 0, 0, "Dump kernel data only" },
 	{ "flame-graph", OPT_flame_graph, 0, 0, "Dump recorded data in FlameGraph format" },
 	{ "sample-time", OPT_sample_time, "TIME", 0, "Show flame graph with this sampling time" },
+	{ "graphviz", OPT_graphviz, 0, 0, "Dump recorded data in DOT format" },
 	{ "output-fields", 'f', "FIELD", 0, "Show FIELDs in the replay or graph output" },
 	{ "time-range", 'r', "TIME~TIME", 0, "Show output within the TIME(timestamp or elapsed time) range only" },
-	{ "patch", 'P', "FUNC", 0, "Apply dynamic patching for FUNCs" },
-	{ "event", 'E', "EVENT", 0, "Enable EVENT to save more information" },
+	{ "Event", 'E', "EVENT", 0, "Enable EVENT to save more information" },
 	{ "list-event", OPT_list_event, 0, 0, "List avaiable events" },
 	{ "run-cmd", OPT_run_cmd, "CMDLINE", 0, "Command line that want to execute after tracing data received" },
 	{ "opt-file", OPT_opt_file, "FILE", 0, "Read command-line options from FILE" },
@@ -165,13 +171,16 @@ static struct argp_option uftrace_options[] = {
 	{ "script", 'S', "SCRIPT", 0, "Run a given SCRIPT in function entry and exit" },
 	{ "diff-policy", OPT_diff_policy, "POLICY", 0, "Control diff report policy (default: 'abs,compact,no-percent')" },
 	{ "event-full", OPT_event_full, 0, 0, "Show all events outside of function" },
-	{ "nest-libcall", OPT_nest_libcall, 0, 0, "Show nested library calls" },
+	{ "nest-libcall", 'l', 0, 0, "Show nested library calls" },
 	{ "record", OPT_record, 0, 0, "Record a new trace data before running command" },
 	{ "auto-args", 'a', 0, 0, "Show arguments and return value of known functions" },
 	{ "libname", OPT_libname, 0, 0, "Show libname name with symbol name" },
 	{ "match", OPT_match_type, "TYPE", 0, "Support pattern match: regex, glob (default: regex)" },
 	{ "no-randomize-addr", OPT_no_randomize_addr, 0, 0, "Disable ASLR (Address Space Layout Randomization)" },
 	{ "no-event", OPT_no_event, 0, 0, "Disable (default) events" },
+	{ "watch", 'W', "POINT", 0, "Watch and report POINT if it's changed" },
+	{ "signal", OPT_signal, "SIG@act[,act,...]", 0, "Trigger action on those SIGnal" },
+	{ "srcline", OPT_srcline, 0, 0, "Enable recording source line info" },
 	{ "help", 'h', 0, 0, "Give this help list" },
 	{ 0 }
 };
@@ -309,6 +318,8 @@ static void parse_debug_domain(char *arg)
 			dbg_domain[DBG_KERNEL] = level;
 		else if (!strcmp(tok, "mcount"))
 			dbg_domain[DBG_MCOUNT] = level;
+		else if (!strcmp(tok, "plthook"))
+			dbg_domain[DBG_PLTHOOK] = level;
 		else if (!strcmp(tok, "dynamic"))
 			dbg_domain[DBG_DYNAMIC] = level;
 		else if (!strcmp(tok, "event"))
@@ -331,11 +342,8 @@ static bool has_time_unit(const char *str)
 		return false;
 }
 
-static uint64_t parse_timestamp(char *str, bool *elapsed)
+static uint64_t parse_any_timestamp(char *str, bool *elapsed)
 {
-	char *time;
-	uint64_t nsec;
-
 	if (*str == '\0')
 		return 0;
 
@@ -344,11 +352,8 @@ static uint64_t parse_timestamp(char *str, bool *elapsed)
 		return parse_time(str, 3);
 	}
 
-	if (asprintf(&time, "%ssec", str) < 0)
-		return -1;
-	nsec = parse_time(time, 9);
-	free(time);
-	return nsec;
+	*elapsed = false;
+	return parse_timestamp(str);
 }
 
 static bool parse_time_range(struct uftrace_time_range *range, char *arg)
@@ -365,11 +370,21 @@ static bool parse_time_range(struct uftrace_time_range *range, char *arg)
 
 	*pos++ = '\0';
 
-	range->start = parse_timestamp(str, &range->start_elapsed);
-	range->stop  = parse_timestamp(pos, &range->stop_elapsed);
+	range->start = parse_any_timestamp(str, &range->start_elapsed);
+	range->stop  = parse_any_timestamp(pos, &range->stop_elapsed);
 
 	free(str);
 	return true;
+}
+
+static char * remove_trailing_slash(char *path)
+{
+	size_t len = strlen(path);
+
+	if (path[len - 1] == '/')
+		path[len - 1] = '\0';
+
+	return path;
 }
 
 static error_t parse_option(int key, char *arg, struct argp_state *state)
@@ -401,12 +416,16 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		}
 		break;
 
+	case 'C':
+		opts->caller = opt_add_string(opts->caller, arg);
+		break;
+
 	case 'v':
 		debug++;
 		break;
 
 	case 'd':
-		opts->dirname = arg;
+		opts->dirname = remove_trailing_slash(arg);
 		break;
 
 	case 'b':
@@ -443,6 +462,14 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		break;
 
 	case 't':
+		/* do not override time-filter if it's already set */
+		if (parsing_default_opts && opts->threshold)
+			break;
+
+		/* add time-filter to uftrace.data/default.opts */
+		strv_append(&default_opts, "-t");
+		strv_append(&default_opts, arg);
+
 		opts->threshold = parse_time(arg, 3);
 		if (opts->range.start || opts->range.stop) {
 			pr_use("--time-range cannot be used with --time-filter\n");
@@ -452,14 +479,23 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 
 	case 'A':
 		opts->args = opt_add_string(opts->args, arg);
+		opts->srcline = true;
 		break;
 
 	case 'R':
 		opts->retval = opt_add_string(opts->retval, arg);
+		opts->srcline = true;
 		break;
 
 	case 'a':
 		opts->auto_args = true;
+		opts->srcline = true;
+		break;
+
+	case 'l':
+		/* --nest-libcall implies --force option */
+		opts->force = true;
+		opts->nest_libcall = true;
 		break;
 
 	case 'f':
@@ -479,6 +515,14 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		opts->patch = opt_add_string(opts->patch, arg);
 		break;
 
+	case 'Z':
+		opts->size_filter = strtol(arg, NULL, 0);
+		if (opts->size_filter <= 0) {
+			pr_use("--size-filter should be positive\n");
+			opts->size_filter = 0;
+		}
+		break;
+
 	case 'E':
 		if (!strcmp(arg, "list")) {
 			pr_use("'-E list' is deprecated, use --list-event instead.\n");
@@ -486,6 +530,10 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		}
 		else
 			opts->event = opt_add_string(opts->event, arg);
+		break;
+
+	case 'W':
+		opts->watch = opt_add_string(opts->watch, arg);
 		break;
 
 	case 'h':
@@ -620,6 +668,10 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		opts->flame_graph = true;
 		break;
 
+	case OPT_graphviz:
+		opts->graphviz = true;
+		break;
+
 	case OPT_diff:
 		opts->diff = arg;
 		break;
@@ -712,12 +764,6 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		opts->event_skip_out = false;
 		break;
 
-	case OPT_nest_libcall:
-		/* --nest-libcall implies --force option */
-		opts->force = true;
-		opts->nest_libcall = true;
-		break;
-
 	case OPT_record:
 		opts->record = true;
 		break;
@@ -740,6 +786,14 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 
 	case OPT_no_event:
 		opts->no_event = true;
+		break;
+
+	case OPT_signal:
+		opts->sig_trigger = opt_add_string(opts->sig_trigger, arg);
+		break;
+
+	case OPT_srcline:
+		opts->srcline = true;
 		break;
 
 	case ARGP_KEY_ARG:
@@ -955,6 +1009,36 @@ static void free_opts(struct opts *opts)
 }
 
 #ifndef UNIT_TEST
+static void apply_default_opts(int *argc, char ***argv, struct opts *opts)
+{
+	char *basename = "default.opts";
+	char opts_file[PATH_MAX];
+	struct stat stbuf;
+
+	/* default.opts is only for analysis commands */
+	if (opts->mode == UFTRACE_MODE_RECORD ||
+	    opts->mode == UFTRACE_MODE_LIVE ||
+	    opts->mode == UFTRACE_MODE_RECV)
+		return;
+
+	/* this is not to override user given time-filter by default opts */
+	parsing_default_opts = true;
+
+	snprintf(opts_file, PATH_MAX, "%s/%s", opts->dirname, basename);
+	if (!stat(opts_file, &stbuf) && stbuf.st_size > 0) {
+		pr_dbg("apply '%s' option file\n", opts_file);
+		parse_opt_file(argc, argv, opts_file, opts);
+	}
+	else if (!strcmp(opts->dirname, UFTRACE_DIR_NAME) &&
+		 !access("./info", F_OK)) {
+		/* try again applying default.opts in the current dir */
+		if (!stat(basename, &stbuf) && stbuf.st_size > 0) {
+			pr_dbg("apply './%s' option file\n", basename);
+			parse_opt_file(argc, argv, basename, opts);
+		}
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	struct opts opts = {
@@ -982,6 +1066,7 @@ int main(int argc, char *argv[])
 		.doc = "uftrace -- function (graph) tracer for userspace",
 	};
 	int ret = -1;
+	char *pager = NULL;
 
 	/* this must be done before argp_parse() */
 	logfp = stderr;
@@ -1020,9 +1105,6 @@ int main(int argc, char *argv[])
 	opts.range.kernel_skip_out = opts.kernel_skip_out;
 	opts.range.event_skip_out  = opts.event_skip_out;
 
-	setup_color(opts.color);
-	setup_signal();
-
 	if (opts.mode == UFTRACE_MODE_RECORD ||
 	    opts.mode == UFTRACE_MODE_RECV ||
 	    opts.mode == UFTRACE_MODE_TUI)
@@ -1031,7 +1113,21 @@ int main(int argc, char *argv[])
 		opts.use_pager = false;
 
 	if (opts.use_pager)
-		start_pager();
+		pager = setup_pager();
+
+	setup_color(opts.color, pager);
+	setup_signal();
+
+	/* 'live' will start pager at its replay time */
+	if (opts.use_pager && opts.mode != UFTRACE_MODE_LIVE)
+		start_pager(pager);
+
+	/* the srcline info is used for TUI status line by default */
+	if (opts.mode == UFTRACE_MODE_TUI)
+		opts.srcline = true;
+
+	/* apply 'default.opts' options for analysis commands */
+	apply_default_opts(&argc, &argv, &opts);
 
 	if (opts.idx == 0)
 		opts.idx = argc;
@@ -1081,7 +1177,7 @@ int main(int argc, char *argv[])
 		fclose(logfp);
 
 	if (opts.opt_file)
-		free_parsed_cmdline(argv);
+		free_parsed_cmdline(argv - opts.idx);
 
 	free_opts(&opts);
 	return ret;
@@ -1137,11 +1233,11 @@ TEST_CASE(option_parsing1)
 	TEST_EQ(dbg_domain[DBG_MCOUNT],  1);
 	TEST_EQ(dbg_domain[DBG_SYMBOL],  3);
 
-	TEST_EQ(parse_timestamp("1ns", &elapsed_time), 1ULL);
-	TEST_EQ(parse_timestamp("2us", &elapsed_time), 2000ULL);
-	TEST_EQ(parse_timestamp("3ms", &elapsed_time), 3000000ULL);
-	TEST_EQ(parse_timestamp("4s",  &elapsed_time), 4000000000ULL);
-	TEST_EQ(parse_timestamp("5m",  &elapsed_time), 300000000000ULL);
+	TEST_EQ(parse_any_timestamp("1ns", &elapsed_time), 1ULL);
+	TEST_EQ(parse_any_timestamp("2us", &elapsed_time), 2000ULL);
+	TEST_EQ(parse_any_timestamp("3ms", &elapsed_time), 3000000ULL);
+	TEST_EQ(parse_any_timestamp("4s",  &elapsed_time), 4000000000ULL);
+	TEST_EQ(parse_any_timestamp("5m",  &elapsed_time), 300000000000ULL);
 
 	return TEST_OK;
 }

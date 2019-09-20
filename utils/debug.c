@@ -33,6 +33,14 @@ enum color_setting log_color;
 enum color_setting out_color;
 int dbg_domain[DBG_DOMAIN_MAX];
 
+/* colored output for argspec display */
+const char *color_reset   = TERM_COLOR_RESET;
+const char *color_bold    = TERM_COLOR_BOLD;
+const char *color_string  = TERM_COLOR_MAGENTA;
+const char *color_symbol  = TERM_COLOR_CYAN;
+const char *color_enum    = TERM_COLOR_BLUE;
+const char *color_enum_or = TERM_COLOR_RESET TERM_COLOR_BOLD "|" TERM_COLOR_RESET TERM_COLOR_BLUE;
+
 static const struct color_code {
 	char		code;
 	const char	*color;
@@ -67,23 +75,74 @@ static void color(const char *code, FILE *fp)
 		pr_dbg("resetting terminal color failed");
 }
 
-void setup_color(enum color_setting color)
+static bool check_busybox(const char *pager)
+{
+	struct strv path_strv = STRV_INIT;
+	char buf[PATH_MAX];
+	char *path;
+	int i;
+	bool ret = false;
+
+	if (pager == NULL)
+		return false;
+
+	if (pager[0] == '/')
+		goto check;
+
+	/* search "PATH" env for absolute path */
+	strv_split(&path_strv, getenv("PATH"), ":");
+	strv_for_each(&path_strv, path, i) {
+		snprintf(buf, sizeof(buf), "%s/%s", path, pager);
+
+		if (!access(buf, X_OK)) {
+			pager = buf;
+			break;
+		}
+	}
+	strv_free(&path_strv);
+
+check:
+	path = realpath(pager, NULL);
+	if (path) {
+		ret = !strncmp("busybox", basename(path), 7);
+		free(path);
+	}
+
+	return ret;
+}
+
+void setup_color(enum color_setting color, char *pager)
 {
 	if (likely(color == COLOR_AUTO)) {
 		char *term = getenv("TERM");
 		bool dumb = term && !strcmp(term, "dumb");
+		bool busybox = false;
 
 		out_color = COLOR_ON;
 		log_color = COLOR_ON;
 
-		if (!isatty(fileno(outfp)) || dumb)
+		if (pager) {
+			/* less in the busybox doesn't support color */
+			busybox = check_busybox(pager);
+		}
+
+		if (!isatty(fileno(outfp)) || dumb || busybox)
 			out_color = COLOR_OFF;
-		if (!isatty(fileno(logfp)) || dumb)
+		if (!isatty(fileno(logfp)) || dumb || busybox)
 			log_color = COLOR_OFF;
 	}
 	else {
 		log_color = color;
 		out_color = color;
+	}
+
+	if (out_color != COLOR_ON) {
+		color_reset   = "";
+		color_bold    = "";
+		color_string  = "";
+		color_symbol  = "";
+		color_enum    = "";
+		color_enum_or = "|";
 	}
 }
 

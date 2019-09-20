@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdbool.h>
+#include <inttypes.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -48,36 +49,32 @@ static int add_debug_entry(struct rb_root *root, char *func, uint64_t offset,
 	struct rb_node *parent = NULL;
 	struct rb_node **p = &root->rb_node;
 
-	entry = xmalloc(sizeof(*entry));
-	entry->name = xstrdup(func);
-
-	entry->spec = xstrdup(argspec);
-	entry->offset = offset;
-
-	pr_dbg3("debug entry: %x %s%s\n", entry->offset, entry->name, entry->spec);
+	pr_dbg3("add debug entry: %"PRIx64" %s%s\n", offset, func, argspec);
 
 	while (*p) {
 		parent = *p;
 		iter = rb_entry(parent, struct debug_entry, node);
 
-		if (unlikely(iter->offset == entry->offset)) {
+		if (unlikely(iter->offset == offset)) {
 			pr_dbg3("debug entry: conflict!\n");
 
 			/* mark it broken by using NULL spec */
 			free(iter->spec);
 			iter->spec = NULL;
 
-			free(entry->name);
-			free(entry->spec);
-			free(entry);
 			return 0;
 		}
 
-		if (iter->offset > entry->offset)
+		if (iter->offset > offset)
 			p = &parent->rb_left;
 		else
 			p = &parent->rb_right;
 	}
+
+	entry = xmalloc(sizeof(*entry));
+	entry->name = xstrdup(func);
+	entry->spec = xstrdup(argspec);
+	entry->offset = offset;
 
 	rb_link_node(&entry->node, parent, p);
 	rb_insert_color(&entry->node, root);
@@ -98,7 +95,7 @@ static struct debug_entry * find_debug_entry(struct rb_root *root, uint64_t offs
 
 		ret = iter->offset - offset;
 		if (ret == 0) {
-			pr_dbg3("found debug entry at %x (%s%s)\n",
+			pr_dbg3("found debug entry at %"PRIx64" (%s%s)\n",
 				offset, iter->name, iter->spec);
 			return iter;
 		}
@@ -132,20 +129,71 @@ static struct debug_file * get_debug_file(struct debug_info *dinfo,
 					  const char *filename)
 {
 	struct debug_file *df;
+	struct rb_node *parent = NULL;
+	struct rb_node **p = &dinfo->files.rb_node;
+	int ret;
 
 	if (filename == NULL)
 		return NULL;
 
-	list_for_each_entry(df, &dinfo->files, list) {
-		if (!strcmp(df->name, filename))
+	while (*p) {
+		parent = *p;
+		df = rb_entry(parent, struct debug_file, node);
+
+		ret = strcmp(df->name, filename);
+
+		if (ret == 0)
 			return df;
+
+		if (ret < 0)
+			p = &parent->rb_left;
+		else
+			p = &parent->rb_right;
 	}
 
 	df = xmalloc(sizeof(*df));
 	df->name = xstrdup(filename);
-	list_add(&df->list, &dinfo->files);
+
+	rb_link_node(&df->node, parent, p);
+	rb_insert_color(&df->node, &dinfo->files);
 
 	return df;
+}
+
+static void release_debug_file(struct rb_root *root)
+{
+	struct debug_file *df;
+	struct rb_node *node;
+
+	while (!RB_EMPTY_ROOT(root)) {
+		node = rb_first(root);
+		df = rb_entry(node, typeof(*df), node);
+
+		rb_erase(node, root);
+		free(df->name);
+		free(df);
+	}
+}
+
+/*
+ * symbol table contains normalized (zero-based) relative address.
+ * but some other info in non-PIE executable has different base
+ * address so it needs to convert back and forth.
+ */
+static inline unsigned long sym_to_dwarf_addr(struct debug_info *dinfo,
+					      unsigned long addr)
+{
+	if (dinfo->file_type == ET_EXEC)
+		addr += dinfo->offset;
+	return addr;
+}
+
+static inline unsigned long dwarf_to_sym_addr(struct debug_info *dinfo,
+					      unsigned long addr)
+{
+	if (dinfo->file_type == ET_EXEC)
+		addr -= dinfo->offset;
+	return addr;
 }
 
 #ifdef HAVE_LIBDW
@@ -237,13 +285,14 @@ static int setup_dwarf_info(const char *filename, struct debug_info *dinfo,
 	pr_dbg2("setup dwarf debug info for %s\n", filename);
 
 	/*
-	 * symbol address was adjusted to add offset already
-	 * but it needs to use address in file (for shared libraries).
+	 * symbol table already uses relative address but non-PIE
+	 * executble needs to use absolute address for DWARF info.
+	 * Also as filter entry uses absolute address, it needs to
+	 * keep the offset to recover relative address back.
 	 */
-	if (elf_file_type(dinfo) == ET_DYN)
-		dinfo->offset = offset;
-	else
-		dinfo->offset = 0;
+	dinfo->offset = offset;
+
+	dinfo->file_type = elf_file_type(dinfo);
 
 	return 0;
 }
@@ -272,23 +321,26 @@ static char * fill_enum_str(Dwarf_Die *die)
 	char *str = NULL;
 	Dwarf_Die e_val;
 
-	if (dwarf_child(die, &e_val) != 0) {
+	if (dwarf_child(die, &e_val) != 0)
+		goto out;
+
+	do {
+		if (dwarf_tag(&e_val) == DW_TAG_enumerator) {
+			char buf[256];
+			Dwarf_Sword val;
+
+			val = int_attr(&e_val, DW_AT_const_value, false);
+			snprintf(buf, sizeof(buf), "%s=%ld",
+				 dwarf_diename(&e_val), (long)val);
+
+			str = strjoin(str, buf, ",");
+		}
+	}
+	while (dwarf_siblingof(&e_val, &e_val) == 0);
+
+out:
+	if (str == NULL)
 		pr_dbg2("no enum values\n");
-		return NULL;
-	}
-
-	while (dwarf_tag(&e_val) == DW_TAG_enumerator) {
-		char buf[256];
-		Dwarf_Sword val;
-
-		val = int_attr(&e_val, DW_AT_const_value, false);
-		snprintf(buf, sizeof(buf), "%s=%ld", dwarf_diename(&e_val), (long)val);
-
-		str = strjoin(str, buf, ",");
-
-		if (dwarf_siblingof(&e_val, &e_val) != 0)
-			break;
-	}
 
 	return str;
 }
@@ -313,21 +365,21 @@ static char * make_enum_name(Dwarf_Die *die)
 
 	/* replace forbidden characters */
 	tmp = enum_name;
-	while ((tmp = strpbrk(tmp, "+-.() ")) != NULL)
+	while ((tmp = strpbrk(tmp, "+-.()<> ")) != NULL)
 		*tmp++ = '_';
 
 	return enum_name;
 }
 
 /* returns size in bit */
-static size_t type_size(Dwarf_Die *die)
+static size_t type_size(Dwarf_Die *die, size_t default_size)
 {
 	int size;
 
 	/* just guess it's word size */
 	size = dwarf_bytesize(die);
 	if (size <= 0)
-		size = sizeof(long);
+		size = default_size;
 
 	return size * 8;
 }
@@ -339,7 +391,7 @@ static bool is_empty_aggregate(Dwarf_Die *die)
 	bool inherited = false;
 
 	/* C++ defines size of an empty struct as 1 byte */
-	if (type_size(die) > 8)
+	if (type_size(die, sizeof(long)) > 1 * 8)
 		return false;
 
 retry:
@@ -419,7 +471,7 @@ static bool resolve_type_info(Dwarf_Die *die, struct type_data *td)
 
 			td->fmt = ARG_FMT_ENUM;
 			tname = dwarf_diename(die);
-			if (tname)
+			if (tname && (isalpha(*tname) || *tname == '_'))
 				td->enum_name = xstrdup(tname);
 			else
 				td->enum_name = make_enum_name(die);
@@ -427,6 +479,8 @@ static bool resolve_type_info(Dwarf_Die *die, struct type_data *td)
 			xasprintf(&enum_def, "enum %s { %s }",
 				  td->enum_name, enum_str);
 			pr_dbg3("type: %s\n", enum_str);
+
+			td->size = type_size(die, sizeof(int));
 
 			parse_enum_string(enum_def, &td->dinfo->enums);
 			free(enum_def);
@@ -457,7 +511,7 @@ static bool resolve_type_info(Dwarf_Die *die, struct type_data *td)
 			break;
 		case DW_TAG_subroutine_type:
 			if (td->pointer == 1) {
-				td->fmt = ARG_FMT_FUNC_PTR;
+				td->fmt = ARG_FMT_PTR;
 				pr_dbg3("type: function pointer\n");
 				/* prevent to look up (return) type more */
 				return true;
@@ -476,14 +530,14 @@ static bool resolve_type_info(Dwarf_Die *die, struct type_data *td)
 		td->size = sizeof(long) * 8;
 
 		/* treat 'char *' as string */
-		if (td->pointer == 1 && tname && !strcmp(tname, "char")) {
+		if (td->pointer == 1 && tname && !strcmp(tname, "char"))
 			td->fmt = ARG_FMT_STR;
-			return true;
-		}
-		return false;
+		else
+			td->fmt = ARG_FMT_PTR;
+		return true;
 	}
 
-	td->size = type_size(die);
+	td->size = type_size(die, sizeof(long));
 	/* TODO: handle aggregate types correctly */
 	if (td->size > sizeof(long) * 8)
 		td->broken = true;
@@ -503,7 +557,6 @@ static bool resolve_type_info(Dwarf_Die *die, struct type_data *td)
 
 struct arg_data {
 	const char		*name;
-	unsigned long		addr;
 	char			*argspec;
 	int			idx;
 	int			fpidx;
@@ -560,7 +613,7 @@ static bool add_type_info(char *spec, size_t len, Dwarf_Die *die,
 			strcat(spec, sz);
 		}
 		break;
-	case ARG_FMT_FUNC_PTR:
+	case ARG_FMT_PTR:
 		strcat(spec, "/p");
 		break;
 	case ARG_FMT_ENUM:
@@ -640,11 +693,6 @@ static bool get_arg_location(Dwarf_Die *die, struct location_data *ld)
 	return true;
 }
 
-__weak const char * arch_register_dwarf_name(int dwarf_reg)
-{
-	return "invalid register";
-}
-
 static void add_location(char *spec, size_t len, Dwarf_Die *die,
 			 struct arg_data *ad)
 {
@@ -659,7 +707,7 @@ static void add_location(char *spec, size_t len, Dwarf_Die *die,
 
 	switch (data.type) {
 	case ARG_TYPE_REG:
-		reg = arch_register_dwarf_name(data.reg);
+		reg = arch_register_dwarf_name(host_cpu_arch(), data.reg);
 
 		if (strcmp(reg, "invalid register")) {
 			snprintf(buf, sizeof(buf), "%%%s", reg);
@@ -782,10 +830,8 @@ static char *find_last_component(char *name)
 	return p;
 }
 
-static bool match_name(struct sym *sym, char *name, bool demangled)
+static bool match_name(struct sym *sym, char *name)
 {
-	char *last_sym;
-	char *last_name;
 	bool ret;
 
 	if (sym == NULL)
@@ -794,17 +840,39 @@ static bool match_name(struct sym *sym, char *name, bool demangled)
 	if (!strcmp(sym->name, name))
 		return true;
 
-	if (demangled || demangler != DEMANGLE_SIMPLE)
-		return false;
+	/* name is mangled C++/Rust symbol */
+	if (name[0] == '_' && name[1] == 'Z') {
+		char *demangled_name = demangle(name);
 
-	last_sym = find_last_component(sym->name);
-	last_name = find_last_component(name);
+		ret = !strcmp(sym->name, demangled_name);
+		free(demangled_name);
+		return ret;
+	}
 
-	ret = !strcmp(last_sym, last_name);
+	/* name is already (fully) demangled */
+	if (strpbrk(name, "(<:>)")) {
+		char *demangled_sym = NULL;
+		char *last_sym;
+		char *last_name;
 
-	free(last_sym);
-	free(last_name);
-	return ret;
+		if (demangler == DEMANGLE_FULL)
+			return !strcmp(sym->name, name);
+
+		if (demangler == DEMANGLE_NONE)
+			demangled_sym = demangle(sym->name);
+
+		last_sym = find_last_component(sym->name);
+		last_name = find_last_component(name);
+
+		ret = !strcmp(last_sym, last_name);
+
+		free(last_sym);
+		free(last_name);
+		free(demangled_sym);
+		return ret;
+	}
+
+	return false;
 }
 
 static void get_source_location(Dwarf_Die *die, struct build_data *bd,
@@ -827,9 +895,10 @@ static void get_source_location(Dwarf_Die *die, struct build_data *bd,
 	else {
 		Dwarf_Die cudie;
 		Dwarf_Line *line;
+		unsigned long dwarf_addr = sym_to_dwarf_addr(dinfo, sym->addr);
 
 		dwarf_diecu(die, &cudie, NULL, NULL);
-		line = dwarf_getsrc_die(&cudie, sym->addr - dinfo->offset);
+		line = dwarf_getsrc_die(&cudie, dwarf_addr);
 		filename = dwarf_linesrc(line, NULL, NULL);
 		dfile = get_debug_file(dinfo, filename);
 		dwarf_lineno(line, &dline);
@@ -851,7 +920,6 @@ static int get_dwarfspecs_cb(Dwarf_Die *die, void *data)
 		.dinfo = bd->dinfo,
 	};
 	char *name = NULL;
-	bool needs_free = false;
 	Dwarf_Addr offset;
 	struct sym *sym;
 	int i;
@@ -871,36 +939,37 @@ static int get_dwarfspecs_cb(Dwarf_Die *die, void *data)
 		return DWARF_CB_OK;
 
 	dwarf_lowpc(die, &offset);
-	offset += bd->dinfo->offset;
+	offset = dwarf_to_sym_addr(bd->dinfo, offset);
 
-	if (dwarf_hasattr_integrate(die, DW_AT_linkage_name)) {
-		name = demangle(str_attr(die, DW_AT_linkage_name, true));
-		needs_free = true;
-	}
+	if (dwarf_hasattr_integrate(die, DW_AT_linkage_name))
+		name = str_attr(die, DW_AT_linkage_name, true);
 	if (name == NULL)
 		name = (char *)dwarf_diename(die);
 	if (unlikely(name == NULL))
 		return DWARF_CB_OK;
 
-	/* double-check symbol table has same info */
-	sym = find_sym(bd->symtab, offset);
-	if (sym == NULL || !match_name(sym, name, needs_free)) {
-		pr_dbg2("skip unknown debug info: %s / %s (%lx)\n",
+	/*
+	 * double-check symbol table has same info.
+	 * we add 1 to the offset because of ARM(THUMB) symbols
+	 * but DWARF doesn't know about it.
+	 */
+	sym = find_sym(bd->symtab, offset + 1);
+	if (sym == NULL || !match_name(sym, name)) {
+		pr_dbg4("skip unknown debug info: %s / %s (%lx)\n",
 			sym ? sym->name : "no name", name, offset);
 		goto out;
 	}
 
 	get_source_location(die, bd, sym);
 
-	ad.name = name;
-	ad.addr = offset;
+	ad.name = sym->name;
 
 	for (i = 0; i < bd->nr_rets; i++) {
-		if (!match_filter_pattern(&bd->rets[i], name))
+		if (!match_filter_pattern(&bd->rets[i], sym->name))
 			continue;
 
 		if (get_retspec(die, &ad)) {
-			add_debug_entry(&bd->dinfo->rets, name, offset,
+			add_debug_entry(&bd->dinfo->rets, sym->name, sym->addr,
 					ad.argspec);
 		}
 
@@ -910,11 +979,11 @@ static int get_dwarfspecs_cb(Dwarf_Die *die, void *data)
 	}
 
 	for (i = 0; i < bd->nr_args; i++) {
-		if (!match_filter_pattern(&bd->args[i], name))
+		if (!match_filter_pattern(&bd->args[i], sym->name))
 			continue;
 
 		if (get_argspec(die, &ad)) {
-			add_debug_entry(&bd->dinfo->args, name, offset,
+			add_debug_entry(&bd->dinfo->args, sym->name, sym->addr,
 					ad.argspec);
 		}
 
@@ -924,8 +993,6 @@ static int get_dwarfspecs_cb(Dwarf_Die *die, void *data)
 	}
 
 out:
-	if (needs_free)
-		free(name);
 	return DWARF_CB_OK;
 }
 
@@ -994,11 +1061,6 @@ static void build_dwarf_info(struct debug_info *dinfo, struct symtab *symtab,
 
 #else  /* !HAVE_LIBDW */
 
-static int elf_file_type(struct debug_info *dinfo)
-{
-	return ET_NONE;
-}
-
 static int setup_dwarf_info(const char *filename, struct debug_info *dinfo,
 			    unsigned long offset, bool force)
 {
@@ -1024,27 +1086,20 @@ static int setup_debug_info(const char *filename, struct debug_info *dinfo,
 	dinfo->args = RB_ROOT;
 	dinfo->rets = RB_ROOT;
 	dinfo->enums = RB_ROOT;
-	INIT_LIST_HEAD(&dinfo->files);
+	dinfo->files = RB_ROOT;
 
 	return setup_dwarf_info(filename, dinfo, offset, force);
 }
 
 static void release_debug_info(struct debug_info *dinfo)
 {
-	struct debug_file *df, *tmp;
-
 	free_debug_entry(&dinfo->args);
 	free_debug_entry(&dinfo->rets);
 	release_enum_def(&dinfo->enums);
+	release_debug_file(&dinfo->files);
 
 	free(dinfo->locs);
 	dinfo->locs = NULL;
-
-	list_for_each_entry_safe(df, tmp, &dinfo->files, list) {
-		list_del(&df->list);
-		free(df->name);
-		free(df);
-	}
 
 	release_dwarf_info(dinfo);
 }
@@ -1112,22 +1167,15 @@ void prepare_debug_info(struct symtabs *symtabs,
 	/* file and line info need be saved regardless of argspec */
 	pr_dbg("prepare debug info\n");
 
-	setup_debug_info(symtabs->filename, &symtabs->dinfo, symtabs->exec_base,
-			 force);
-	build_dwarf_info(&symtabs->dinfo, &symtabs->symtab, ptype,
-			 &dwarf_args, &dwarf_rets);
+	for_each_map(symtabs, map) {
+		struct symtab *stab = &map->mod->symtab;
+		struct debug_info *dinfo = &map->mod->dinfo;
 
-	map = symtabs->maps;
-	while (map) {
-		/* avoid loading of main executable or libmcount */
-		if (strcmp(map->libname, symtabs->filename) &&
-		    strncmp(basename(map->libname), "libmcount", 9)) {
-			setup_debug_info(map->libname, &map->dinfo, map->start,
-					 force);
-			build_dwarf_info(&map->dinfo, &map->symtab, ptype,
-					 &dwarf_args, &dwarf_rets);
-		}
-		map = map->next;
+		if (map->mod == NULL)
+			continue;
+
+		setup_debug_info(map->libname, dinfo, map->start, force);
+		build_dwarf_info(dinfo, stab, ptype, &dwarf_args, &dwarf_rets);
 	}
 
 	strv_free(&dwarf_args);
@@ -1143,15 +1191,11 @@ void finish_debug_info(struct symtabs *symtabs)
 	if (!symtabs->loaded_debug)
 		return;
 
-	release_debug_info(&symtabs->dinfo);
+	for_each_map(symtabs, map) {
+		if (map->mod == NULL)
+			continue;
 
-	map = symtabs->maps;
-	while (map) {
-		if (strcmp(map->libname, symtabs->filename) &&
-		    strncmp(basename(map->libname), "libmcount", 9))
-			release_debug_info(&map->dinfo);
-
-		map = map->next;
+		release_debug_info(&map->mod->dinfo);
 	}
 
 	symtabs->loaded_debug = false;
@@ -1237,8 +1281,7 @@ static void save_debug_entries(struct debug_info *dinfo,
 		if (loc->sym == NULL)
 			continue;
 
-		save_debug_file(fp, 'F', loc->sym->name,
-				loc->sym->addr - dinfo->offset);
+		save_debug_file(fp, 'F', loc->sym->name, loc->sym->addr);
 		save_debug_file(fp, 'L', loc->file->name, loc->line);
 
 		entry = find_debug_entry(&dinfo->args, loc->sym->addr);
@@ -1260,25 +1303,17 @@ void save_debug_info(struct symtabs *symtabs, char *dirname)
 	if (!symtabs->loaded_debug)
 		return;
 
-	/* use file-offset for main executable */
-	if (elf_file_type(&symtabs->dinfo) == ET_EXEC)
-		symtabs->dinfo.offset = symtabs->exec_base;
+	for_each_map(symtabs, map) {
+		if (map->mod == NULL)
+			continue;
 
-	/* XXX: libmcount doesn't set symtabs->dirname */
-	save_debug_entries(&symtabs->dinfo, dirname, symtabs->filename);
-
-	map = symtabs->maps;
-	while (map) {
-		if (strcmp(map->libname, symtabs->filename) &&
-		    strncmp(basename(map->libname), "libmcount", 9))
-			save_debug_entries(&map->dinfo, dirname, map->libname);
-
-		map = map->next;
+		save_debug_entries(&map->mod->dinfo, dirname, map->libname);
 	}
 }
 
 static int load_debug_file(struct debug_info *dinfo, struct symtab *symtab,
-			   const char *dirname, const char *filename)
+			   const char *dirname, const char *filename,
+			   bool needs_srcline)
 {
 	char *pathname;
 	FILE *fp;
@@ -1291,9 +1326,12 @@ static int load_debug_file(struct debug_info *dinfo, struct symtab *symtab,
 	dinfo->args = RB_ROOT;
 	dinfo->rets = RB_ROOT;
 	dinfo->enums = RB_ROOT;
-	INIT_LIST_HEAD(&dinfo->files);
-	dinfo->nr_locs = symtab->nr_sym;
-	dinfo->locs = xcalloc(dinfo->nr_locs, sizeof(*dinfo->locs));
+	dinfo->files = RB_ROOT;
+
+	if (needs_srcline) {
+		dinfo->nr_locs = symtab->nr_sym;
+		dinfo->locs = xcalloc(dinfo->nr_locs, sizeof(*dinfo->locs));
+	}
 
 	xasprintf(&pathname, "%s/%s.dbg", dirname, basename(filename));
 
@@ -1325,7 +1363,6 @@ static int load_debug_file(struct debug_info *dinfo, struct symtab *symtab,
 		switch (line[0]) {
 		case 'F':
 			offset = strtoul(&line[3], &pos, 16);
-			offset += dinfo->offset;
 
 			if (*pos == ' ')
 				pos++;
@@ -1337,6 +1374,9 @@ static int load_debug_file(struct debug_info *dinfo, struct symtab *symtab,
 		case 'R':
 			if (line[0] == 'R')
 				root = &dinfo->rets;
+			
+			if (func == NULL)
+				goto out;
 
 			if (add_debug_entry(root, func, offset, &line[3]) < 0)
 				goto out;
@@ -1346,6 +1386,9 @@ static int load_debug_file(struct debug_info *dinfo, struct symtab *symtab,
 				goto out;
 			break;
 		case 'L':
+			if (!needs_srcline)
+				break;
+
 			sym = find_sym(symtab, offset);
 			if (sym == NULL)
 				goto out;
@@ -1378,23 +1421,21 @@ out:
 	return ret;
 }
 
-void load_debug_info(struct symtabs *symtabs)
+void load_debug_info(struct symtabs *symtabs, bool needs_srcline)
 {
 	struct uftrace_mmap *map;
 
-	symtabs->dinfo.offset = symtabs->exec_base;
-	load_debug_file(&symtabs->dinfo, &symtabs->symtab,
-			symtabs->dirname, symtabs->filename);
+	for_each_map(symtabs, map) {
+		struct symtab *stab = &map->mod->symtab;
+		struct debug_info *dinfo = &map->mod->dinfo;
 
-	map = symtabs->maps;
-	while (map) {
-		if (strcmp(map->libname, symtabs->filename) &&
-		    strncmp(basename(map->libname), "libmcount", 9)) {
-			map->dinfo.offset = map->start;
-			load_debug_file(&map->dinfo, &map->symtab,
-					symtabs->dirname, map->libname);
+		if (map->mod == NULL)
+			continue;
+
+		if (!debug_info_has_location(dinfo)) {
+			load_debug_file(dinfo, stab, symtabs->dirname,
+					map->libname, needs_srcline);
 		}
-		map = map->next;
 	}
 
 	symtabs->loaded_debug = true;
@@ -1424,23 +1465,20 @@ struct debug_location *find_file_line(struct symtabs *symtabs, uint64_t addr)
 
 	map = find_map(symtabs, addr);
 
-	if (map == MAP_MAIN) {
-		symtab = &symtabs->symtab;
-		dinfo = &symtabs->dinfo;
-	}
-	else if (map == MAP_KERNEL) {
-		map = NULL;
-		dinfo = NULL;
-	}
-	else if (map != NULL) {
-		symtab = &map->symtab;
-		dinfo = &map->dinfo;
-	}
+	/* TODO: support kernel debug info */
+	if (map == MAP_KERNEL)
+		return NULL;
 
-	if (map && debug_info_has_location(dinfo))
-		sym = find_sym(symtab, addr);
+	if (map == NULL || map->mod == NULL)
+		return NULL;
 
-	if (map == NULL || sym == NULL)
+	symtab = &map->mod->symtab;
+	dinfo = &map->mod->dinfo;
+
+	if (debug_info_has_location(dinfo))
+		sym = find_sym(symtab, addr - map->start);
+
+	if (sym == NULL)
 		return NULL;
 
 	idx = sym - symtab->sym;

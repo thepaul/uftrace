@@ -58,7 +58,7 @@ static int thread_ctl[2];
 
 static bool has_perf_event;
 static bool has_sched_event;
-
+static bool finish_received;
 
 static bool can_use_fast_libmcount(struct opts *opts)
 {
@@ -66,10 +66,11 @@ static bool can_use_fast_libmcount(struct opts *opts)
 		return false;
 	if (opts->depth != MCOUNT_DEFAULT_DEPTH)
 		return false;
-	if (getenv("UFTRACE_FILTER") || getenv("UFTRACE_TRIGGER") ||
-	    getenv("UFTRACE_ARGUMENT") || getenv("UFTRACE_RETVAL") ||
-	    getenv("UFTRACE_PATCH") || getenv("UFTRACE_SCRIPT") ||
-	    getenv("UFTRACE_AUTO_ARGS"))
+	if (getenv("UFTRACE_FILTER")    || getenv("UFTRACE_TRIGGER") ||
+	    getenv("UFTRACE_ARGUMENT")  || getenv("UFTRACE_RETVAL") ||
+	    getenv("UFTRACE_PATCH")     || getenv("UFTRACE_SCRIPT") ||
+	    getenv("UFTRACE_AUTO_ARGS") || getenv("UFTRACE_WATCH") ||
+	    getenv("UFTRACE_CALLER")    || getenv("UFTRACE_SIGNAL"))
 		return false;
 	return true;
 }
@@ -93,7 +94,8 @@ static char *build_debug_domain_string(void)
 char * get_libmcount_path(struct opts *opts)
 {
 	char *libmcount, *lib = xmalloc(PATH_MAX);
-	bool must_use_multi_thread = check_libpthread(opts->exename);
+	bool must_use_multi_thread = has_dependency(opts->exename,
+						    "libpthread.so.0");
 
 	if (opts->nop) {
 		libmcount = "libmcount-nop.so";
@@ -129,9 +131,10 @@ char * get_libmcount_path(struct opts *opts)
 	}
 
 #ifdef INSTALL_LIB_PATH
+	/* try first to load libmcount from the installtion path */
 	snprintf(lib, PATH_MAX, "%s/%s", INSTALL_LIB_PATH, libmcount);
-	if (access(lib, F_OK) != 0 && errno == ENOENT)
-		pr_warn("Didn't you run 'make install' ?\n");
+	if (access(lib, F_OK) == 0)
+		return lib;
 #endif
 	strcpy(lib, libmcount);
 	return lib;
@@ -142,8 +145,7 @@ void put_libmcount_path(char *libpath)
 	free(libpath);
 }
 
-static void setup_child_environ(struct opts *opts, int pfd,
-				int argc, char *argv[])
+static void setup_child_environ(struct opts *opts, int argc, char *argv[])
 {
 	char buf[PATH_MAX];
 	char *old_preload, *libpath;
@@ -210,6 +212,11 @@ static void setup_child_environ(struct opts *opts, int pfd,
 			setenv("UFTRACE_PATCH", patch_str, 1);
 			free(patch_str);
 		}
+
+		if (opts->size_filter) {
+			snprintf(buf, sizeof(buf), "%d", opts->size_filter);
+			setenv("UFTRACE_PATCH_SIZE", buf, 1);
+		}
 	}
 
 	if (opts->event) {
@@ -220,6 +227,9 @@ static void setup_child_environ(struct opts *opts, int pfd,
 			free(event_str);
 		}
 	}
+
+	if (opts->watch)
+		setenv("UFTRACE_WATCH", opts->watch, 1);
 
 	if (opts->depth != OPT_DEPTH_DEFAULT) {
 		snprintf(buf, sizeof(buf), "%d", opts->depth);
@@ -234,6 +244,15 @@ static void setup_child_environ(struct opts *opts, int pfd,
 	if (opts->threshold) {
 		snprintf(buf, sizeof(buf), "%"PRIu64, opts->threshold);
 		setenv("UFTRACE_THRESHOLD", buf, 1);
+	}
+
+	if (opts->caller) {
+		char *caller_str = uftrace_clear_kernel(opts->caller);
+
+		if (caller_str) {
+			setenv("UFTRACE_CALLER", caller_str, 1);
+			free(caller_str);
+		}
 	}
 
 	if (opts->libcall) {
@@ -261,8 +280,6 @@ static void setup_child_environ(struct opts *opts, int pfd,
 		setenv("UFTRACE_LOGFD", buf, 1);
 	}
 
-	snprintf(buf, sizeof(buf), "%d", pfd);
-	setenv("UFTRACE_PIPE", buf, 1);
 	setenv("UFTRACE_SHMEM", "1", 1);
 
 	if (debug) {
@@ -271,7 +288,7 @@ static void setup_child_environ(struct opts *opts, int pfd,
 		setenv("UFTRACE_DEBUG_DOMAIN", build_debug_domain_string(), 1);
 	}
 
-	if(opts->disabled)
+	if (opts->disabled)
 		setenv("UFTRACE_DISABLED", "1", 1);
 
 	if (log_color == COLOR_ON) {
@@ -292,6 +309,12 @@ static void setup_child_environ(struct opts *opts, int pfd,
 	if (opts->patt_type != PATT_REGEX)
 		setenv("UFTRACE_PATTERN", get_filter_pattern(opts->patt_type), 1);
 
+	if (opts->sig_trigger)
+		setenv("UFTRACE_SIGNAL", opts->sig_trigger, 1);
+
+	if (opts->srcline)
+		setenv("UFTRACE_SRCLINE", "1", 1);
+
 	if (argc > 0) {
 		char *args = NULL;
 		int i;
@@ -302,6 +325,10 @@ static void setup_child_environ(struct opts *opts, int pfd,
 		setenv("UFTRACE_ARGS", args, 1);
 		free(args);
 	}
+
+	/*
+	 * ----- end of option processing -----
+	 */
 
 	libpath = get_libmcount_path(opts);
 	if (libpath == NULL)
@@ -323,6 +350,7 @@ static void setup_child_environ(struct opts *opts, int pfd,
 
 	put_libmcount_path(libpath);
 	setenv("XRAY_OPTIONS", "patch_premain=false", 1);
+	setenv("GLIBC_TUNABLES", "glibc.cpu.hwcaps=-IBT,-SHSTK", 1);
 }
 
 static uint64_t calc_feat_mask(struct opts *opts)
@@ -630,6 +658,8 @@ void *writer_thread(void *arg)
 	int i, dummy;
 	sigset_t sigset;
 
+	pthread_setname_np(pthread_self(), "WriterThread");
+
 	if (opts->rt_prio) {
 		struct sched_param param = {
 			.sched_priority = opts->rt_prio,
@@ -655,7 +685,7 @@ void *writer_thread(void *arg)
 			continue;
 
 		if (read(thread_ctl[0], &dummy, sizeof(dummy)) < 0) {
-			if (errno == EAGAIN && errno == EINTR)
+			if (errno == EAGAIN || errno == EINTR)
 				continue;
 			/* other errors are problematic */
 			break;
@@ -891,7 +921,7 @@ static void unlink_shmem_list(void)
 		num = scandir("/dev/shm/", &shmem_bufs, filter_shmem, alphasort);
 		for (i = 0; i < num; i++) {
 			sid[0] = '/';
-			strncpy(&sid[1], shmem_bufs[i]->d_name, MSG_ID_SIZE);
+			memcpy(&sid[1], shmem_bufs[i]->d_name, MSG_ID_SIZE);
 			pr_dbg3("unlink %s\n", sid);
 			shm_unlink(sid);
 			free(shmem_bufs[i]);
@@ -1233,6 +1263,7 @@ static void read_record_mmap(int pfd, const char *dirname, int bufsize)
 
 	case UFTRACE_MSG_FINISH:
 		pr_dbg2("MSG FINISH\n");
+		finish_received = true;
 		break;
 
 	default:
@@ -1295,6 +1326,30 @@ static void send_sym_files(int sock, const char *dirname)
 	free(sym_list);
 }
 
+/* find "XXX.dbg" file */
+static int filter_dbg(const struct dirent *de)
+{
+	size_t len = strlen(de->d_name);
+
+	return !strncmp(".dbg", de->d_name + len - 4, 4);
+}
+
+static void send_dbg_files(int sock, const char *dirname)
+{
+	int i, dbgs;
+	struct dirent **dbg_list;
+
+	dbgs = scandir(dirname, &dbg_list, filter_dbg, alphasort);
+	if (dbgs < 0)
+		pr_err("cannot scan dbg files");
+
+	for (i = 0; i < dbgs; i++) {
+		send_trace_metadata(sock, dirname, dbg_list[i]->d_name);
+		free(dbg_list[i]);
+	}
+	free(dbg_list);
+}
+
 static void send_info_file(int sock, const char *dirname)
 {
 	int fd;
@@ -1346,7 +1401,15 @@ static void send_event_file(int sock, const char *dirname)
 	send_trace_metadata(sock, dirname, "events.txt");
 }
 
-static void save_session_symbols(struct opts *opts)
+static void send_log_file(int sock, const char *logfile)
+{
+	if (access(logfile, F_OK) != 0)
+		return;
+
+	send_trace_metadata(sock, NULL, (char*)logfile);
+}
+
+static void load_session_symbols(struct opts *opts)
 {
 	struct dirent **map_list;
 	int i, maps;
@@ -1372,10 +1435,8 @@ static void save_session_symbols(struct opts *opts)
 		read_session_map(opts->dirname, &symtabs, sid);
 
 		load_module_symtabs(&symtabs);
-		save_module_symtabs(&symtabs);
 
 		delete_session_map(&symtabs);
-		unload_symtabs(&symtabs);
 	}
 
 	free(map_list);
@@ -1400,21 +1461,18 @@ static char *get_child_time(struct timespec *ts1, struct timespec *ts2)
 
 static void print_child_time(char *elapsed_time)
 {
-	pr_out("elapsed time: %s\n", elapsed_time);
+	pr_out("elapsed time: %20s\n", elapsed_time);
 }
 
 static void print_child_usage(struct rusage *ru)
 {
-	pr_out(" system time: %lu.%06lu000 sec\n",
+	pr_out(" system time: %6lu.%06lu000 sec\n",
 	       ru->ru_stime.tv_sec, ru->ru_stime.tv_usec);
-	pr_out("   user time: %lu.%06lu000 sec\n",
+	pr_out("   user time: %6lu.%06lu000 sec\n",
 	       ru->ru_utime.tv_sec, ru->ru_utime.tv_usec);
 }
 
-#define UFTRACE_MSG  "Cannot trace '%s': No such executable file\n"	\
-"\tNote that uftrace doesn't search $PATH for you.\n"			\
-"\tIf you really want to trace executables in the $PATH,\n"		\
-"\tplease give it the absolute pathname (like /usr/bin/%s).\n"
+#define UFTRACE_MSG  "Cannot trace '%s': No such executable file.\n"
 
 #define MCOUNT_MSG  "Can't find '%s' symbol in the '%s'.\n"		\
 "\tIt seems not to be compiled with -pg or -finstrument-functions flag\n" 	\
@@ -1434,9 +1492,55 @@ static void print_child_usage(struct rusage *ru)
 #define STATIC_MSG  "Cannot trace static binary: %s\n"			\
 "\tIt seems to be compiled with -static, rebuild the binary without it.\n"
 
+#define SCRIPT_MSG  "Cannot trace script file: %s\n"			\
+"\tTo trace binaries run by the script, use --force option.\n"
+
 #ifndef  EM_AARCH64
 # define EM_AARCH64  183
 #endif
+
+static bool is_regular_executable(const char *pathname)
+{
+	struct stat sb;
+
+	if (!stat(pathname, &sb)) {
+		if (S_ISREG(sb.st_mode) && (sb.st_mode & S_IXUSR))
+			return true;
+	}
+	return false;
+}
+
+static void find_in_path(char **exename)
+{
+	/* try to find the binary in PATH */
+	struct strv strv = STRV_INIT;
+	char *env = getenv("PATH");
+	char *pathname = NULL;
+	char *path;
+	bool found = false;
+	int i;
+
+	if (!env || *exename[0] == '/')
+		pr_err_ns(UFTRACE_MSG, *exename);
+
+	/* search opts->exename in PATH one by one */
+	strv_split(&strv, env, ":");
+
+	strv_for_each(&strv, path, i) {
+		xasprintf(&pathname, "%s/%s", path, *exename);
+		if (is_regular_executable(pathname)) {
+			found = true;
+			break;
+		}
+		free(pathname);
+	}
+
+	if (!found)
+		pr_err_ns(UFTRACE_MSG, *exename);
+
+	*exename = pathname;
+	strv_free(&strv);
+}
 
 static void check_binary(struct opts *opts)
 {
@@ -1450,14 +1554,12 @@ static void check_binary(struct opts *opts)
 		EM_X86_64, EM_ARM, EM_AARCH64, EM_386
 	};
 
-	pr_dbg3("checking binary %s\n", opts->exename);
+again:
+	/* if it cannot be found in PATH, then fails inside */
+	if (!is_regular_executable(opts->exename))
+		find_in_path(&opts->exename);
 
-	if (access(opts->exename, X_OK) < 0) {
-		if (errno == ENOENT && opts->exename[0] != '/') {
-			pr_err_ns(UFTRACE_MSG, opts->exename, opts->exename);
-		}
-		pr_err("Cannot trace '%s'", opts->exename);
-	}
+	pr_dbg("checking binary %s\n", opts->exename);
 
 	fd = open(opts->exename, O_RDONLY);
 	if (fd < 0)
@@ -1466,8 +1568,25 @@ static void check_binary(struct opts *opts)
 	if (read(fd, elf_ident, sizeof(elf_ident)) < 0)
 		pr_err("Cannot read '%s'", opts->exename);
 
-	if (memcmp(elf_ident, ELFMAG, SELFMAG))
-		pr_err_ns(UFTRACE_ELF_MSG, opts->exename);
+	if (memcmp(elf_ident, ELFMAG, SELFMAG)) {
+		char *script = check_script_file(opts->exename);
+		char *p;
+
+		if (script == NULL)
+			pr_err_ns(UFTRACE_ELF_MSG, opts->exename);
+
+		if (!opts->force && !opts->patch)
+			pr_err_ns(SCRIPT_MSG, opts->exename);
+
+		/* ignore options */
+		p = strchr(script, ' ');
+		if (p)
+			*p = '\0';
+
+		opts->exename = script;
+		close(fd);
+		goto again;
+	}
 
 	if (read(fd, &e_type, sizeof(e_type)) < 0)
 		pr_err("Cannot read '%s'", opts->exename);
@@ -1523,6 +1642,13 @@ static void check_perf_event(struct opts *opts)
 	enum uftrace_pattern_type ptype = opts->patt_type;
 
 	has_perf_event = has_sched_event = !opts->no_event;
+
+	/*
+	 * caller filter focuses onto a given function,
+	 * displaying sched event with it is annoying.
+	 */
+	if (opts->caller != NULL)
+		has_sched_event = false;
 
 	if (opts->event == NULL)
 		return;
@@ -1732,6 +1858,11 @@ static int stop_tracing(struct writer_data *wd, struct opts *opts)
 		if (check_tid_list())
 			break;
 
+		if (finish_received) {
+			status = UFTRACE_EXIT_FINISHED;
+			break;
+		}
+
 		pr_dbg2("waiting for FORK2\n");
 	}
 
@@ -1820,16 +1951,16 @@ static void write_symbol_files(struct writer_data *wd, struct opts *opts)
 		return;
 
 	/* main executable and shared libraries */
-	save_session_symbols(opts);
+	load_session_symbols(opts);
 
 	/* dynamically loaded libraries using dlopen() */
 	list_for_each_entry_safe(dlib, tmp, &dlopen_libs, list) {
 		struct symtabs dlib_symtabs = {
-			.loaded = false,
+			.dirname = opts->dirname,
+			.flags = SYMTAB_FL_ADJ_OFFSET,
 		};
 
-		load_symtabs(&dlib_symtabs, opts->dirname, dlib->libname);
-		save_symbol_file(&dlib_symtabs, opts->dirname, dlib->libname);
+		load_module_symtab(&dlib_symtabs, dlib->libname);
 
 		list_del(&dlib->list);
 
@@ -1837,18 +1968,24 @@ static void write_symbol_files(struct writer_data *wd, struct opts *opts)
 		free(dlib);
 	}
 
+	save_module_symtabs(opts->dirname);
+	unload_module_symtabs();
+
 	if (opts->host) {
 		int sock = wd->sock;
 
 		send_task_file(sock, opts->dirname);
 		send_map_files(sock, opts->dirname);
 		send_sym_files(sock, opts->dirname);
+		send_dbg_files(sock, opts->dirname);
 		send_info_file(sock, opts->dirname);
 
 		if (opts->kernel)
 			send_kernel_metadata(sock, opts->dirname);
 		if (opts->event)
 			send_event_file(sock, opts->dirname);
+		if (opts->logfile)
+			send_log_file(sock, opts->logfile);
 
 		send_trace_end(sock);
 		close(sock);
@@ -1859,14 +1996,36 @@ static void write_symbol_files(struct writer_data *wd, struct opts *opts)
 		chown_directory(opts->dirname);
 }
 
-int do_main_loop(int pfd[2], int ready, struct opts *opts, int pid)
+int do_main_loop(int ready, struct opts *opts, int pid)
 {
 	int ret;
 	struct writer_data wd;
+	char *channel = NULL;
+
+	if (opts->nop) {
+		setup_writers(&wd, opts);
+		start_tracing(&wd, opts, ready);
+		close(ready);
+
+		wait(NULL);
+		uftrace_done = true;
+
+		ret = stop_tracing(&wd, opts);
+		finish_writers(&wd, opts);
+		return ret;
+	}
+
+	xasprintf(&channel, "%s/%s", opts->dirname, ".channel");
 
 	wd.pid = pid;
-	wd.pipefd = pfd[0];
-	close(pfd[1]);
+	wd.pipefd = open(channel, O_RDONLY | O_NONBLOCK);
+
+	free(channel);
+	if (wd.pipefd < 0)
+		pr_err("cannot open pipe");
+
+	if (opts->sig_trigger)
+		pr_out("uftrace: install signal handlers to task %d\n", pid);
 
 	setup_writers(&wd, opts);
 	start_tracing(&wd, opts, ready);
@@ -1874,7 +2033,7 @@ int do_main_loop(int pfd[2], int ready, struct opts *opts, int pid)
 
 	while (!uftrace_done) {
 		struct pollfd pollfd = {
-			.fd = pfd[0],
+			.fd = wd.pipefd,
 			.events = POLLIN,
 		};
 
@@ -1885,7 +2044,7 @@ int do_main_loop(int pfd[2], int ready, struct opts *opts, int pid)
 			pr_err("error during poll");
 
 		if (pollfd.revents & POLLIN)
-			read_record_mmap(pfd[0], opts->dirname, opts->bufsize);
+			read_record_mmap(wd.pipefd, opts->dirname, opts->bufsize);
 
 		if (pollfd.revents & (POLLERR | POLLHUP))
 			break;
@@ -1898,10 +2057,13 @@ int do_main_loop(int pfd[2], int ready, struct opts *opts, int pid)
 	return ret;
 }
 
-int do_child_exec(int pfd[2], int ready, struct opts *opts,
+int do_child_exec(int ready, struct opts *opts,
 		  int argc, char *argv[])
 {
 	uint64_t dummy;
+	char *shebang;
+	char fullpath[PATH_MAX];
+	struct strv new_args = STRV_INIT;
 
 	if (opts->no_randomize_addr) {
 		/* disable ASLR (Address Space Layout Randomization) */
@@ -1909,17 +2071,49 @@ int do_child_exec(int pfd[2], int ready, struct opts *opts,
 			pr_dbg("disabling ASLR failed\n");
 	}
 
-	close(pfd[0]);
+	/*
+	 * The current working directory can be changed by calling chdir.
+	 * So dirname has to be converted to an absolute path to avoid unexpected problems.
+	 */
+	if (realpath(opts->dirname, fullpath) != NULL)
+		opts->dirname = fullpath;
 
-	setup_child_environ(opts, pfd[1], argc, argv);
+	shebang = check_script_file(argv[0]);
+	if (shebang) {
+		char *s, *p;
+		int i;
+
+		s = shebang;
+
+		while (isspace(*s))
+			s++;
+
+		p = strchr(s, ' ');
+		if (p != NULL)
+			*p++ = '\0';
+
+		strv_append(&new_args, s);
+		if (p != NULL)
+			strv_append(&new_args, p);
+
+		for (i = 0; i < argc; i++)
+			strv_append(&new_args, argv[i]);
+
+		argc = new_args.nr;
+		argv = new_args.p;
+
+		free(shebang);
+	}
+
+	setup_child_environ(opts, argc, argv);
 
 	/* wait for parent ready */
 	if (read(ready, &dummy, sizeof(dummy)) != (ssize_t)sizeof(dummy))
 		pr_err("waiting for parent failed");
 
 	/*
-	 * I don't think the traced binary is in PATH.
-	 * So use plain 'execv' rather than 'execvp'.
+	 * The traced binary is already resolved into absolute pathname.
+	 * So plain 'execv' is enough and no need to use 'execvp'.
 	 */
 	execv(opts->exename, argv);
 	abort();
@@ -1928,15 +2122,9 @@ int do_child_exec(int pfd[2], int ready, struct opts *opts,
 int command_record(int argc, char *argv[], struct opts *opts)
 {
 	int pid;
-	int pfd[2];
-	int efd;
+	int ready;
 	int ret = -1;
-
-	if (pipe(pfd) < 0)
-		pr_err("cannot setup internal pipe");
-
-	if (!opts->nop && create_directory(opts->dirname) < 0)
-		return -1;
+	char *channel = NULL;
 
 	/* apply script-provided options */
 	if (opts->script_file)
@@ -1945,11 +2133,20 @@ int command_record(int argc, char *argv[], struct opts *opts)
 	check_binary(opts);
 	check_perf_event(opts);
 
+	if (!opts->nop) {
+		if (create_directory(opts->dirname) < 0)
+			return -1;
+
+		xasprintf(&channel, "%s/%s", opts->dirname, ".channel");
+		if (mkfifo(channel, 0600) < 0)
+			pr_err("cannot create a communication channel");
+	}
+
 	fflush(stdout);
 
-	efd = eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
-	if (efd < 0)
-		pr_dbg("creating eventfd failed: %d\n", efd);
+	ready = eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
+	if (ready < 0)
+		pr_dbg("creating eventfd failed: %d\n", ready);
 
 	pid = fork();
 	if (pid < 0)
@@ -1957,15 +2154,21 @@ int command_record(int argc, char *argv[], struct opts *opts)
 
 	if (pid == 0) {
 		if (opts->keep_pid)
-			ret = do_main_loop(pfd, efd, opts, getppid());
+			ret = do_main_loop(ready, opts, getppid());
 		else
-			do_child_exec(pfd, efd, opts, argc, argv);
+			do_child_exec(ready, opts, argc, argv);
+
+		if (channel)
+			unlink(channel);
 		return ret;
 	}
 
 	if (opts->keep_pid)
-		do_child_exec(pfd, efd, opts, argc, argv);
+		do_child_exec(ready, opts, argc, argv);
 	else
-		ret = do_main_loop(pfd, efd, opts, pid);
+		ret = do_main_loop(ready, opts, pid);
+
+	if (channel)
+		unlink(channel);
 	return ret;
 }

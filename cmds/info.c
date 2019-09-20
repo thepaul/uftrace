@@ -22,13 +22,14 @@
 #include "utils/utils.h"
 #include "utils/filter.h"
 #include "utils/symbol.h"
+#include "utils/fstack.h"
 #include "version.h"
 
 #define BUILD_ID_SIZE 20
 #define BUILD_ID_STR_SIZE (BUILD_ID_SIZE * 2 + 1)
 
 struct read_handler_arg {
-	struct ftrace_file_handle *handle;
+	struct uftrace_data *handle;
 	char buf[PATH_MAX];
 };
 
@@ -67,7 +68,7 @@ static int fill_exe_name(void *arg)
 static int read_exe_name(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char *buf = rha->buf;
 
@@ -151,7 +152,7 @@ static int convert_to_int(unsigned char hex)
 static int read_exe_build_id(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char build_id_str[BUILD_ID_STR_SIZE];
 	char *buf = rha->buf;
@@ -189,7 +190,7 @@ static int fill_exit_status(void *arg)
 static int read_exit_status(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char *buf = rha->buf;
 
@@ -231,8 +232,10 @@ static int fill_cmdline(void *arg)
 	p[ret - 1] = '\n';
 
 	if ((write(fha->fd, "cmdline:", 8) < 8) ||
-	    (write(fha->fd, p, ret) < ret))
+	    (write(fha->fd, p, ret) < ret)) {
+		free(p);
 		return -1;
+	}
 
 	free(p);
 	return ret;
@@ -241,7 +244,7 @@ static int fill_cmdline(void *arg)
 static int read_cmdline(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char *buf = rha->buf;
 
@@ -275,7 +278,7 @@ static int fill_cpuinfo(void *arg)
 static int read_cpuinfo(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char *buf = rha->buf;
 	int i, lines;
@@ -299,8 +302,24 @@ static int read_cpuinfo(void *arg)
 		if (!strncmp(&buf[8], "nr_cpus=", 8)) {
 			sscanf(&buf[8], "nr_cpus=%d / %d\n",
 			       &info->nr_cpus_online, &info->nr_cpus_possible);
-		} else if (!strncmp(&buf[8], "desc=", 5)) {
+		}
+		else if (!strncmp(&buf[8], "desc=", 5)) {
 			info->cpudesc = copy_info_str(&buf[13]);
+
+			/* guess CPU arch from the description */
+			if (!strncmp(info->cpudesc, "ARMv6", 5) ||
+			    !strncmp(info->cpudesc, "ARMv7", 5)) {
+				handle->arch = UFT_CPU_ARM;
+			}
+			else if (!strncmp(info->cpudesc, "ARM64", 5)) {
+				handle->arch = UFT_CPU_AARCH64;
+			}
+			else if (data_is_lp64(handle)) {
+				handle->arch = UFT_CPU_X86_64;
+			}
+			else {
+				handle->arch = UFT_CPU_I386;
+			}
 		}
 	}
 
@@ -358,7 +377,7 @@ static int fill_meminfo(void *arg)
 static int read_meminfo(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char *buf = rha->buf;
 
@@ -420,7 +439,7 @@ static int fill_osinfo(void *arg)
 static int read_osinfo(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char *buf = rha->buf;
 	int i, lines;
@@ -482,8 +501,8 @@ static int fill_taskinfo(void *arg)
 	};
 	int i;
 
-	if (read_task_txt_file(&link, fha->opts->dirname, false, false) < 0 &&
-	    read_task_file(&link, fha->opts->dirname, false, false) < 0)
+	if (read_task_txt_file(&link, fha->opts->dirname, false, false, false) < 0 &&
+	    read_task_file(&link, fha->opts->dirname, false, false, false) < 0)
 		return -1;
 
 	walk_tasks(&link, build_tid_list, &tlist);
@@ -506,7 +525,7 @@ static int fill_taskinfo(void *arg)
 static int read_taskinfo(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	int i, lines;
 	int ret = -1;
@@ -531,7 +550,8 @@ static int read_taskinfo(void *arg)
 
 		if (!strncmp(&buf[9], "nr_tid=", 7)) {
 			info->nr_tid = strtol(&buf[16], NULL, 10);
-		} else if (!strncmp(&buf[9], "tids=", 5)) {
+		}
+		else if (!strncmp(&buf[9], "tids=", 5)) {
 			char *tids_str = &buf[14];
 			char *endp = tids_str;
 			int *tids = xcalloc(sizeof(*tids), info->nr_tid);
@@ -552,6 +572,8 @@ static int read_taskinfo(void *arg)
 
 			assert(nr_tid == info->nr_tid);
 		}
+		else
+			goto out;
 	}
 	ret = 0;
 out:
@@ -586,7 +608,7 @@ static int fill_usageinfo(void *arg)
 static int read_usageinfo(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char *buf = rha->buf;
 	int i, lines;
@@ -648,7 +670,7 @@ static int fill_loadinfo(void *arg)
 static int read_loadinfo(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char *buf = rha->buf;
 
@@ -696,7 +718,7 @@ static int fill_arg_spec(void *arg)
 static int read_arg_spec(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	int i, lines;
 	int ret = -1;
@@ -759,7 +781,7 @@ static int fill_record_date(void *arg)
 static int read_record_date(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char *buf = rha->buf;
 
@@ -795,7 +817,7 @@ static int fill_pattern_type(void *arg)
 static int read_pattern_type(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char *buf = rha->buf;
 	size_t len;
@@ -824,7 +846,7 @@ static int fill_uftrace_version(void *arg)
 static int read_uftrace_version(void *arg)
 {
 	struct read_handler_arg *rha = arg;
-	struct ftrace_file_handle *handle = rha->handle;
+	struct uftrace_data *handle = rha->handle;
 	struct uftrace_info *info = &handle->info;
 	char *buf = rha->buf;
 
@@ -876,7 +898,7 @@ void fill_uftrace_info(uint64_t *info_mask, int fd, struct opts *opts, int statu
 	for (i = 0; i < ARRAY_SIZE(fill_handlers); i++) {
 		errno = 0;
 		offset = lseek(fd, 0, SEEK_CUR);
-		if (offset == -1 && errno) {
+		if (offset == (off_t)-1 && errno) {
 			pr_dbg("skip info due to failed lseek: %m\n");
 			continue;
 		}
@@ -884,7 +906,7 @@ void fill_uftrace_info(uint64_t *info_mask, int fd, struct opts *opts, int statu
 		if (fill_handlers[i].handler(&arg) < 0) {
 			/* ignore failed info */
 			errno = 0;
-			if (lseek(fd, offset, SEEK_SET) == -1 && errno)
+			if (lseek(fd, offset, SEEK_SET) == (off_t)-1 && errno)
 				pr_warn("fail to reset uftrace info: %m\n");
 
 			continue;
@@ -893,7 +915,7 @@ void fill_uftrace_info(uint64_t *info_mask, int fd, struct opts *opts, int statu
 	}
 }
 
-int read_uftrace_info(uint64_t info_mask, struct ftrace_file_handle *handle)
+int read_uftrace_info(uint64_t info_mask, struct uftrace_data *handle)
 {
 	size_t i;
 	struct read_handler_arg arg = {
@@ -956,7 +978,7 @@ static void print_info(void *unused, const char *fmt, ...)
 	va_end(ap);
 }
 
-void process_uftrace_info(struct ftrace_file_handle *handle, struct opts *opts,
+void process_uftrace_info(struct uftrace_data *handle, struct opts *opts,
 			  void (*process)(void *data, const char *fmt, ...),
 			  void *data)
 {
@@ -965,6 +987,9 @@ void process_uftrace_info(struct ftrace_file_handle *handle, struct opts *opts,
 	const char *fmt = "# %-20s: %s\n";
 	uint64_t info_mask = handle->hdr.info_mask;
 	struct uftrace_info *info = &handle->info;
+
+	if (info_mask == 0)
+		return;
 
 	snprintf(buf, sizeof(buf), "%s/info", opts->dirname);
 
@@ -1018,10 +1043,16 @@ void process_uftrace_info(struct ftrace_file_handle *handle, struct opts *opts,
 		int sz, len;
 		char *p;
 
+		/* ignore errors */
+		read_task_txt_file(&handle->sessions, opts->dirname,
+				   false, false, false);
+
 		process(data, "# %-20s: %d\n", "number of tasks", nr);
 
-		if (handle->hdr.feat_mask & PERF_EVENT)
-			update_perf_task_comm(handle);
+		if (handle->hdr.feat_mask & PERF_EVENT) {
+			if (setup_perf_data(handle) == 0)
+				update_perf_task_comm(handle);
+		}
 
 		sz = nr * 32;  /* 32 > strlen("tid (comm)") */
 		len = 0;
@@ -1033,7 +1064,8 @@ void process_uftrace_info(struct ftrace_file_handle *handle, struct opts *opts,
 			task = find_task(&handle->sessions, tid);
 
 			len = snprintf(p, sz, "%s%d(%s)",
-				       first ? "" : ", ", tid, task->comm);
+				       first ? "" : ", ", tid,
+				       task ? task->comm : "");
 			p  += len;
 			sz -= len;
 
@@ -1071,13 +1103,18 @@ void process_uftrace_info(struct ftrace_file_handle *handle, struct opts *opts,
 	if (info_mask & (1UL << EXIT_STATUS)) {
 		int status = info->exit_status;
 
-		if (WIFEXITED(status)) {
+		if (status == UFTRACE_EXIT_FINISHED) {
+			snprintf(buf, sizeof(buf), "terminated by finish trigger");
+		}
+		else if (WIFEXITED(status)) {
 			snprintf(buf, sizeof(buf), "exited with code: %d",
 				 WEXITSTATUS(status));
-		} else if (WIFSIGNALED(status)) {
-			snprintf(buf, sizeof(buf), "terminated by signal: %d",
-				 WTERMSIG(status));
-		} else {
+		}
+		else if (WIFSIGNALED(status)) {
+			snprintf(buf, sizeof(buf), "terminated by signal: %d (%s)",
+				 WTERMSIG(status), strsignal(WTERMSIG(status)));
+		}
+		else {
 			snprintf(buf, sizeof(buf), "unknown exit status: %d",
 				 status);
 		}
@@ -1105,32 +1142,37 @@ void process_uftrace_info(struct ftrace_file_handle *handle, struct opts *opts,
 int command_info(int argc, char *argv[], struct opts *opts)
 {
 	int ret;
-	struct ftrace_file_handle handle;
+	struct uftrace_data handle;
 
-	ret = open_data_file(opts, &handle);
+	ret = open_info_file(opts, &handle);
+	if (ret < 0) {
+		pr_warn("cannot open record data: %s: %m\n", opts->dirname);
+		return -1;
+	}
 
 	if (opts->print_symtab) {
 		struct symtabs symtabs = {
-			.loaded = false,
+			.dirname = opts->dirname,
+			.filename = opts->exename,
 			.flags = SYMTAB_FL_USE_SYMFILE | SYMTAB_FL_DEMANGLE,
 		};
+		struct uftrace_module *mod;
 
 		if (!opts->exename) {
 			pr_use("Usage: uftrace info --symbols [COMMAND]\n");
 			return -1;
 		}
 
-		load_symtabs(&symtabs, opts->dirname, opts->exename);
-		print_symtabs(&symtabs);
-		unload_symtabs(&symtabs);
+		mod = load_module_symtab(&symtabs, symtabs.filename);
+		if (mod == NULL)
+			goto out;
+
+		print_symtab(&mod->symtab);
+		unload_module_symtabs();
 		goto out;
 	}
 
-	if (ret < 0 && errno != ENODATA) {
-		pr_warn("cannot open record data: %s: %m\n", opts->dirname);
-		return -1;
-	}
-
+	fstack_setup_filters(opts, &handle);
 	process_uftrace_info(&handle, opts, print_info, NULL);
 
 out:

@@ -1,6 +1,9 @@
 #ifndef MCOUNT_ARCH_H
 #define MCOUNT_ARCH_H
 
+#include "utils/arch.h"
+#include "utils/list.h"
+
 #define mcount_regs  mcount_regs
 
 struct mcount_regs {
@@ -22,28 +25,6 @@ struct mcount_regs {
 #define ARCH_MAX_REG_ARGS  6
 #define ARCH_MAX_FLOAT_REGS  8
 
-enum x86_reg_index {
-	X86_REG_INT_BASE = 0,
-	/* integer registers */
-	X86_REG_RDI,
-	X86_REG_RSI,
-	X86_REG_RDX,
-	X86_REG_RCX,
-	X86_REG_R8,
-	X86_REG_R9,
-
-	X86_REG_FLOAT_BASE = 100,
-	/* floating-point registers */
-	X86_REG_XMM0,
-	X86_REG_XMM1,
-	X86_REG_XMM2,
-	X86_REG_XMM3,
-	X86_REG_XMM4,
-	X86_REG_XMM5,
-	X86_REG_XMM6,
-	X86_REG_XMM7,
-};
-
 #define HAVE_MCOUNT_ARCH_CONTEXT
 struct mcount_arch_context {
 	double xmm[ARCH_MAX_FLOAT_REGS];
@@ -53,5 +34,27 @@ struct mcount_arch_context {
 #define ARCH_PLTHOOK_ADDR_OFFSET  6
 
 #define ARCH_SUPPORT_AUTO_RECOVER  1
+#define ARCH_CAN_RESTORE_PLTHOOK   1
+
+struct plthook_arch_context {
+	bool	has_plt_sec;
+};
+
+struct mcount_disasm_engine;
+struct mcount_dynamic_info;
+struct sym;
+
+int disasm_check_insns(struct mcount_disasm_engine *disasm,
+		       struct mcount_dynamic_info *mdi, struct sym *sym);
+
+struct dynamic_bad_symbol {
+	struct list_head	list;
+	struct sym		*sym;
+};
+
+struct dynamic_bad_symbol * find_bad_jump(struct mcount_dynamic_info *mdi,
+					  unsigned long addr);
+bool add_bad_jump(struct mcount_dynamic_info *mdi, unsigned long callsite,
+		  unsigned long target);
 
 #endif /* MCOUNT_ARCH_H */

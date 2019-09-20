@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 
 from runtest import TestBase
-import os, re
+import os
 
 # there was a problem applying depth filter if it contains kernel functions
 class TestCase(TestBase):
     def __init__(self):
-        TestBase.__init__(self, 'openclose', """
+        TestBase.__init__(self, 'openclose', serial=True, result="""
 # DURATION    TID     FUNCTION
    0.714 us [ 4435] | __monstartup();
    0.349 us [ 4435] | __cxa_atexit();
@@ -29,14 +29,12 @@ class TestCase(TestBase):
         return TestBase.TEST_SUCCESS
 
     def runcmd(self):
-        # the -T option works on replay time and accept a regex
-        # while -N option works on record time and accept a glob
         uftrace = TestBase.uftrace_cmd
         program = 't-' + self.name
 
         argument  = '-K3'
-        argument += ' -T do_syscall_64@kernel,depth=1'
         argument += ' -T ^sys_@kernel,depth=1'
+        argument += ' -T ^__x64_@kernel,depth=1'
         argument += ' -N exit_to_usermode_loop@kernel'
         argument += ' -N _*do_page_fault@kernel'
 
@@ -49,6 +47,6 @@ class TestCase(TestBase):
         major, minor, release = uname[2].split('.')
         if uname[0] == 'Linux' and uname[4] == 'x86_64' and \
            int(major) >= 4 and int(minor) >= 17:
-            return re.sub('sys_[a-zA-Z0-9_]+', 'do_syscall_64', result)
-        else:
-            return result.replace('sys_open', 'sys_openat')
+            result = result.replace('sys_', '__x64_sys_')
+
+        return result.replace(' sys_open', ' sys_openat')

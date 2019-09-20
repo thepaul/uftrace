@@ -10,21 +10,28 @@
 // contain more function prototypes as of now.
 //
 
-#include <sys/types.h>
-#include <unistd.h>
-
-
-////////////////////////////////////////////////////////////////////////////////
-// memory
 #include <stdlib.h>
-void *malloc(size_t size);
-void free(void* ptr);
-void* calloc(size_t nmemb, size_t size);
-void* realloc(void* ptr, size_t size);
+int atoi(const char *str);
+long atol(const char *str);
+double atof(const char *str);
+
+long strtol(const char *str, void *endp, int base);
+unsigned long strtoul(const char *str, void *endp, int base);
+double strtod(const char *str, void *endp);
+float strtof(const char *str, void *endp);
 
 void qsort(void *base, size_t nmemb, size_t size, funcptr_t compar);
 void qsort_r(void *base, size_t nmemb, size_t size, funcptr_t compar, void *arg);
 void *bsearch(const void *key, const void *base, size_t nmemb, size_t size, funcptr_t compar);
+
+void exit(int status);
+
+////////////////////////////////////////////////////////////////////////////////
+// memory
+void *malloc(size_t size);
+void free(void* ptr);
+void* calloc(size_t nmemb, size_t size);
+void* realloc(void* ptr, size_t size);
 
 #include <sys/mman.h>
 enum uft_mmap_prot { PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC = 4, };
@@ -134,10 +141,10 @@ size_t strspn(const char *s, const char *accept);
 size_t strcspn(const char *s, const char *reject);
 char* strsep(char **stringp, const char *delim);
 
-void *memcpy(void *dest, const void *src, size_t n);
-void *memset(void *s, int c, size_t n);
+void memcpy(void *dest, const void *src, size_t n);
+void memset(void *s, int c, size_t n);
 int memcmp(const void *s1, const void *s2, size_t n);
-void *memmove(void *dest, const void *src, size_t n);
+void memmove(void *dest, const void *src, size_t n);
 
 void *memchr(const void *s, int c, size_t n);
 void *memrchr(const void *s, int c, size_t n);
@@ -152,8 +159,8 @@ void *rawmemchr(const void *s, int c);
 int printf(const char *format, ...);
 int fprintf(FILE *stream, const char *format, ...);
 int dprintf(int fd, const char *format, ...);
-int sprintf(char *str, const char *format, ...);
-int snprintf(char *str, size_t size, const char *format, ...);
+int sprintf(void *dest, const char *format, ...);
+int snprintf(void *dest, size_t size, const char *format, ...);
 
 int fputc(char c, FILE *stream);
 int fputs(const char *s, FILE *stream);
@@ -162,7 +169,7 @@ int putchar(char c);
 int puts(const char *s);
 
 char fgetc(FILE *stream);
-char *fgets(char *s, int size, FILE *stream);
+char *fgets(void *s, int size, FILE *stream);
 char getc(FILE *stream);
 char getchar(void);
 char ungetc(char c, FILE *stream);
@@ -193,6 +200,7 @@ enum uft_open_flag {
 	O_DIRECT    = 040000,
 	O_LARGEFILE = 0100000,
 	O_DIRECTORY = 0200000,
+	O_NOFOLLOW  = 0400000,
 	O_NOATIME   = 01000000,
 	O_CLOEXEC   = 02000000,
 	O_SYNC      = 04010000,
@@ -200,10 +208,36 @@ enum uft_open_flag {
 };
 int open(const char* pathname, enum uft_open_flag flags);
 int open64(const char* pathname, enum uft_open_flag flags);
+int openat(int fd, const char* pathname, enum uft_open_flag flags);
+int open64at(int fd, const char* pathname, enum uft_open_flag flags);
 int close(int fd);
+
+enum uft_fcntl_cmd {
+	F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_SETFL,
+	F_GETLK, F_SETLK, F_SETLKW,
+	F_SETOWN, F_GETOWN, F_SEGSIG, F_GETSIG,
+	F_GETLK64, F_SETLK64, F_SETLKW64,
+	F_SETOWN_EX, F_GETOWN_EX,
+};
+int fcntl(int fd, enum uft_fcntl_cmd);
+int fcntl64(int fd, enum uft_fcntl_cmd);
 
 enum uft_seek_whence { SEEK_SET, SEEK_CUR, SEEK_END, SEEK_DATA, SEEK_HOLE, };
 off_t lseek(int fd, off_t offset, enum uft_seek_whence whence);
+
+enum uft_falloc_mde {
+	FALLOC_FL_KEEP_SIZE         = 1,
+	FALLOC_FL_PUNCH_HOLE        = 2,
+	FALLOC_FL_NO_HIDE_STALE     = 4,
+	FALLOC_FL_COLLAPSE_RANGE    = 8,
+	FALLOC_FL_ZERO_RANGE        = 16,
+	FALLOC_FL_INSERT_RANGE      = 32,
+	FALLOC_FL_UNSHARE_RANGE     = 64,
+};
+int fallocate(int fd, enum uft_falloc_mode mode, off_t off, off_t len);
+
+int fsync(int fd);
+int fdatasync(int fd);
 
 FILE *fopen(const char *path, const char *mode);
 FILE *fopen64(const char *filename, const char *type);
@@ -212,16 +246,37 @@ FILE *freopen(const char *path, const char *mode, FILE *stream);
 int fclose(FILE *stream);
 int fseek(FILE *stream, long offset, int whence);
 long ftell(FILE *stream);
+int fflush(FILE *stream);
 
 ssize_t read(int fd, void *buf, size_t count);
 ssize_t write(int fd, const void *buf, size_t count);
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
 
+int feof(FILE *stream);
+int ferror(FILE *stream);
+int fileno(FILE *stream);
+
 enum uft_access_flag {
 	F_OK = 0, X_OK = 1, W_OK = 2, R_OK = 4,
 };
 int access(const char *pathname, enum uft_access_flag mode);
+
+int unlink(const char *pathname);
+int unlinkat(int dirfd, const char *pathname, int flags);
+int mkdir(const char *pathname, mode_t mode);
+int rmdir(const char *pathname);
+int chdir(const char *pathname);
+
+#include <dirent.h>
+void * opendir(const char *name);
+int closedir(void *dirp);
+
+char * getcwd(void *buf, size_t size);
+
+#include <libgen.h>
+char *dirname(char *path);
+char *basename(char *path);
 ////////////////////////////////////////////////////////////////////////////////
 
 
@@ -239,6 +294,8 @@ int execle(const char *path, const char *arg, ...);
 int execv(const char *path, ...);
 //int execvp(const char *file, char *const argv[]); // cannot understand argv type
 int execvp(const char *file, ...);
+//int execve(const char *file, char *const argv[], char *const envp[]);
+int execve(const char *file, ...);
 //int execvpe(const char *file, char *const argv[], char *const envp[]);
 int execvpe(const char *file, ...);
 
@@ -310,7 +367,7 @@ enum uft_socket_type {
 enum uft_socket_flag {
 	 SOCK_NONBLOCK = 04000, SOCK_CLOEXEC = 02000000,
 };
-int socket(enum uft_socket_domain domain, enum eft_socket_type type, int protocol);
+int socket(enum uft_socket_domain domain, enum uft_socket_type type, int protocol);
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
@@ -321,6 +378,16 @@ struct hostent *gethostbyname(const char *name);
 struct hostent *gethostbyaddr(const void *addr, socklen_t len, enum uft_socket_domain type);
 int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res);
 void freeaddrinfo(struct addrinfo *res);
+
+#include <netinet/in.h>
+#include <arpa/inet.h>
+int inet_pton(enum uft_socket_domain af, const char *src, void *dst);
+const char *inet_ntop(enum uft_socket_domain af, const void *src, char *dst, socklen_t size);
+int inet_aton(const char *cp, struct in_addr *inp);
+char *inet_ntoa(struct in_addr in);
+
+in_addr_t inet_addr(const char *cp);
+in_addr_t inet_network(const char *cp);
 ////////////////////////////////////////////////////////////////////////////////
 
 
@@ -337,6 +404,7 @@ enum uft_signal {
 	SIGRTMIN = 32, SIGRTMAX = 64,
 };
 int kill(pid_t pid, enum uft_signal sig);
+int raise(enum uft_signal sig);
 long signal(enum uft_signal sig, funcptr_t handler);
 int sigaction(enum uft_signal signum, const struct sigaction *act, struct sigaction *oldact);
 int sigemptyset(sigset_t *set);
@@ -344,6 +412,10 @@ int sigfillset(sigset_t *set);
 int sigaddset(sigset_t *set, enum uft_signal signum);
 int sigdelset(sigset_t *set, enum uft_signal signum);
 int sigismember(const sigset_t *set, enum uft_signal signum);
+
+enum uft_sigmask { SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK };
+int sigprocmask(enum uft_sigmask how, const sigset_t *set, sigset_t *oldset);
+int pthread_sigmask(enum uft_sigmask how, const sigset_t *set, sigset_t *oldset);
 ////////////////////////////////////////////////////////////////////////////////
 
 
@@ -369,12 +441,103 @@ enum uft_prctl_op {
 };
 int prctl(enum uft_prctl_op option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5);
 
+#include <sys/select.h>
+int select(int nfds, void *rset, void *wset, void *eset, void *timeout);
+int pselect(int nfds, void *rset, void *wset, void *eset, void *timeout, sigset_t *mask);
+
 #include <poll.h>
 int poll(struct pollfd *fds, nfds_t nfds, int timeout);
+int ppoll(struct pollfd *fds, nfds_t nfds, void *timeout, sigset_t *mask);
+
+#include <sys/epoll.h>
+enum uft_epoll_op { EPOLL_CTL_ADD = 1, EPOLL_CTL_DEL, EPOLL_CTL_MOD };
+
+int epoll_create(int size);
+int epoll_create1(int flags);
+int epoll_ctl(int efd, enum uft_epoll_op op, int fd, void *event);
+int epoll_wait(int efd, void *events, int max_event, int timeout);
+int epoll_pwait(int efd, void *events, int max_event, int timeout, sigset_t *mask);
 
 #include <sys/syscall.h>   /* For SYS_xxx definitions */
 long syscall(long number, ...);
 
 #include <sys/ioctl.h>
 int ioctl(int fd, unsigned long request, ...);
+
+#include <libintl.h>
+void textdomain(const char * domainname);
+void bindtextdomain(const char * domainname, const char * dirname);
+char *gettext (const char * msgid);
+char *dgettext (const char * domainname, const char * msgid);
+char *dcgettext (const char * domainname, const char * msgid, int category);
+
+#include <locale.h>
+enum uft_locale {
+	LC_TYPE = 0, LC_NUMERIC, LC_TIME, LC_COLLATE, LC_MONETARY, LC_MESSAGES,
+	LC_ALL, LC_PAPER, LC_NAME, LC_ADDRESS, LC_TELEPHONE, LC_MEASUREMENT,
+	LC_IDENTIFICATION,
+};
+char * setlocale(enum uft_locale category, const char * locale);
+
+#include <getopt.h>
+int getopt(int argc, void *argv, const char * optstr);
+/* ignore struct option for longopts for now */
+int getopt_long(int argc, void *argv, const char * optstr);
+int getopt_long_only(int argc, void *argv, const char * optstr);
+
+#include <sys/stat.h>
+int stat(const char *pathname, void *statbuf);
+int fstat(int fd, void *statbuf);
+int lstat(const char *pathname, void *statbuf);
+
+enum uft_mode {
+	mod_777 = 0777, mod_755 = 0755, mod_666 = 0666, mod_644 = 0644,
+	mod_400 = 0400, mod_600 = 0600, mod_660 = 0660, mod_640 = 0640,
+	mod_444 = 0444, mod_022 = 0022, mod_440 = 0440, mod_222 = 0222,
+	mod_111 = 0111, mod_011 = 0011, mod_033 = 0033, mod_077 = 0077,
+};
+int chmod(const char *pathname, enum uft_mode mode);
+int fchmod(int fd, enum uft_mode mode);
+void umask(enum uft_mode mask);
+
+int creat(const char *file, enum uft_mode mode);
+int creat64(const char *file, enum uft_mode mode);
+
+#include <unistd.h>
+int isatty(int fd);
+
+uid_t getuid(void);
+uid_t getgid(void);
+uid_t geteuid(void);
+uid_t getegid(void);
+int setuid(uid_t id);
+int setgid(uid_t id);
+int seteuid(uid_t id);
+int setegid(uid_t id);
+int setreuid(uid_t ruid, uid_t euid);
+int setregid(uid_t rgid, uid_t egid);
+int setresuid(uid_t ruid, uid_t euid, uid_t suid);
+int setresgid(uid_t rgid, uid_t egid, uid_t sgid);
+
+int chown(const char *path, uid_t uid, uid_t gid);
+int lchown(const char *path, uid_t uid, uid_t gid);
+int fchown(int fd, uid_t uid, uid_t gid);
+
+#include <time.h>
+enum uft_clockid_t {
+	CLOCK_REALTIME = 0,
+	CLOCK_MONOTONIC,
+	CLOCK_PROCESS_CPUTIME_ID,
+	CLOCK_THREAD_CPUTIME_ID,
+	CLOCK_MONOTONIC_RAW,
+	CLOCK_REALTIME_COARSE,
+	CLOCK_MONOTONIC_COARSE,
+	CLOCK_BOOTTIME,
+	CLOCK_REALTIME_ALARM,
+	CLOCK_BOOTTIME_ALARM,
+	CLOCK_TAI = 11,
+};
+int clock_getres(enum uft_clockid_t clk_id, struct timespec *res);
+int clock_gettime(enum uft_clockid_t clk_id, struct timespec *tp);
+int clock_settime(enum uft_clockid_t clk_id, const struct timespec *tp);
 ////////////////////////////////////////////////////////////////////////////////

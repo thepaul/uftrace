@@ -240,7 +240,7 @@ out:
  * files.  It returns 0 on success, -1 on failure.  Callers should
  * call finish_perf_data() after reading all perf event data.
  */
-int setup_perf_data(struct ftrace_file_handle *handle)
+int setup_perf_data(struct uftrace_data *handle)
 {
 	struct uftrace_perf_reader *perf;
 	glob_t globbuf;
@@ -252,6 +252,7 @@ int setup_perf_data(struct ftrace_file_handle *handle)
 	if (glob(pattern, GLOB_ERR, NULL, &globbuf)) {
 		pr_dbg("failed to search perf data file\n");
 		handle->hdr.feat_mask &= ~PERF_EVENT;
+		handle->nr_perf = 0;
 		goto out;
 	}
 
@@ -279,7 +280,7 @@ out:
  *
  * This function releases all resources regarding perf event.
  */
-void finish_perf_data(struct ftrace_file_handle *handle)
+void finish_perf_data(struct uftrace_data *handle)
 {
 	int i;
 
@@ -293,10 +294,11 @@ void finish_perf_data(struct ftrace_file_handle *handle)
 	handle->perf = NULL;
 }
 
-static int read_perf_event(struct ftrace_file_handle *handle,
+static int read_perf_event(struct uftrace_data *handle,
 			   struct uftrace_perf_reader *perf)
 {
 	struct perf_event_header h;
+	struct uftrace_task_reader *task;
 	union {
 		struct perf_context_switch_event cs;
 		struct perf_task_event t;
@@ -392,7 +394,8 @@ again:
 		goto again;
 	}
 
-	if (unlikely(find_task(&handle->sessions, perf->tid) == NULL))
+	task = get_task_handle(handle, perf->tid);
+	if (unlikely(task == NULL || task->fp == NULL))
 		goto again;
 
 	perf->type = h.type;
@@ -411,7 +414,7 @@ again:
  * It's important that callers should reset the valid bit after using
  * the event so that it can read next event for the cpu data file.
  */
-int read_perf_data(struct ftrace_file_handle *handle)
+int read_perf_data(struct uftrace_data *handle)
 {
 	struct uftrace_perf_reader *perf;
 	uint64_t min_time = ~0ULL;
@@ -451,7 +454,7 @@ int read_perf_data(struct ftrace_file_handle *handle)
  * event.  But do_dump_file() calls it directly without the above
  * function in order to access to the raw file contents.
  */
-struct uftrace_record * get_perf_record(struct ftrace_file_handle *handle,
+struct uftrace_record * get_perf_record(struct uftrace_data *handle,
 					struct uftrace_perf_reader *perf)
 {
 	static struct uftrace_record rec;
@@ -494,7 +497,7 @@ struct uftrace_record * get_perf_record(struct ftrace_file_handle *handle,
  * This function reads perf events for each cpu data file and updates
  * task->comm for each PERF_RECORD_COMM.
  */
-void update_perf_task_comm(struct ftrace_file_handle *handle)
+void update_perf_task_comm(struct uftrace_data *handle)
 {
 	struct uftrace_perf_reader *perf;
 	struct uftrace_task *task;
@@ -524,7 +527,7 @@ void update_perf_task_comm(struct ftrace_file_handle *handle)
 	}
 }
 
-static void remove_event_rstack(struct ftrace_task_handle *task)
+static void remove_event_rstack(struct uftrace_task_reader *task)
 {
 	struct uftrace_rstack_list_node *last;
 	uint64_t last_addr;
@@ -540,10 +543,10 @@ static void remove_event_rstack(struct ftrace_task_handle *task)
 	while (last_addr != EVENT_ID_PERF_SCHED_OUT);
 }
 
-void process_perf_event(struct ftrace_file_handle *handle)
+void process_perf_event(struct uftrace_data *handle)
 {
 	struct uftrace_perf_reader *perf;
-	struct ftrace_task_handle *task;
+	struct uftrace_task_reader *task;
 	struct uftrace_record *rec;
 	struct fstack_arguments args;
 	int p;
@@ -560,11 +563,14 @@ void process_perf_event(struct ftrace_file_handle *handle)
 		rec = get_perf_record(handle, perf);
 		task = get_task_handle(handle, perf->tid);
 
+		if (unlikely(task == NULL || task->fp == NULL))
+			continue;
+
 		if (perf->type == PERF_RECORD_COMM) {
 			rec->more = 1;
 			args.args = NULL;
 			args.data = xstrdup(perf->u.comm.comm);
-			args.len  = strlen(perf->u.comm.comm);
+			args.len  = strlen(perf->u.comm.comm) + 1;
 		}
 		else if (perf->type == PERF_RECORD_SWITCH && !perf->u.ctxsw.out) {
 			struct uftrace_rstack_list_node *last;

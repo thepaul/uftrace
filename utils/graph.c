@@ -28,7 +28,7 @@ void graph_init_callbacks(graph_fn entry_fn, graph_fn exit_fn, graph_fn event_fn
 	cb_arg   = arg;
 }
 
-struct uftrace_task_graph * graph_get_task(struct ftrace_task_handle *task,
+struct uftrace_task_graph * graph_get_task(struct uftrace_task_reader *task,
 					   size_t tg_size)
 {
 	struct rb_node *parent = NULL;
@@ -62,7 +62,7 @@ static int add_graph_entry(struct uftrace_task_graph *tg, char *name,
 {
 	struct uftrace_graph_node *node = NULL;
 	struct uftrace_graph_node *curr = tg->node;
-	struct uftrace_record *rstack = tg->task->rstack;
+	struct fstack *fstack = &tg->task->func_stack[tg->task->stack_count - 1];
 
 	if (tg->lost)
 		return 1;  /* ignore kernel functions after LOST */
@@ -87,7 +87,7 @@ static int add_graph_entry(struct uftrace_task_graph *tg, char *name,
 
 		node = xzalloc(node_size);
 
-		node->addr = rstack->addr;
+		node->addr = fstack->addr;
 		node->name = xstrdup(name ?: "none");
 		INIT_LIST_HEAD(&node->head);
 
@@ -95,12 +95,12 @@ static int add_graph_entry(struct uftrace_task_graph *tg, char *name,
 		list_add_tail(&node->list, &node->parent->head);
 		node->parent->nr_edges++;
 
-		if (uftrace_match_filter(node->addr, &sess->fixups, &tr)) {
+		if (uftrace_match_filter(fstack->addr, &sess->fixups, &tr)) {
 			struct sym *sym;
 			struct uftrace_special_node *snode;
 			enum uftrace_graph_node_type type = NODE_T_NORMAL;
 
-			sym = find_symtabs(&sess->symtabs, node->addr);
+			sym = find_symtabs(&sess->symtabs, fstack->addr);
 			if (sym == NULL)
 				goto out;
 

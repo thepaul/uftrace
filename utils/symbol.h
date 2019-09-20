@@ -14,6 +14,7 @@
 
 #include "utils/utils.h"
 #include "utils/list.h"
+#include "utils/rbtree.h"
 #include "utils/dwarf.h"
 
 #ifdef HAVE_LIBELF
@@ -26,13 +27,21 @@
 # define STT_GNU_IFUNC  10
 #endif
 
+#ifndef  STB_GNU_UNIQUE
+# define STB_GNU_UNIQUE  10
+#endif
+
 enum symtype {
-	ST_UNKNOWN,
-	ST_LOCAL	= 't',
-	ST_GLOBAL	= 'T',
-	ST_WEAK		= 'w',
-	ST_PLT		= 'P',
-	ST_KERNEL	= 'K',
+	ST_UNKNOWN	= '?',
+	ST_LOCAL_FUNC	= 't',
+	ST_GLOBAL_FUNC	= 'T',
+	ST_WEAK_FUNC	= 'w',
+	ST_PLT_FUNC	= 'P',
+	ST_KERNEL_FUNC	= 'K',
+	ST_LOCAL_DATA	= 'd',
+	ST_GLOBAL_DATA	= 'D',
+	ST_WEAK_DATA	= 'v',
+	ST_UNIQUE_DATA	= 'u',
 };
 
 struct sym {
@@ -52,14 +61,20 @@ struct symtab {
 	bool name_sorted;
 };
 
+struct uftrace_module {
+	struct rb_node node;
+	struct symtab symtab;
+	struct debug_info dinfo;
+	char name[];
+};
+
 struct uftrace_mmap {
 	struct uftrace_mmap *next;
+	struct uftrace_module *mod;
 	uint64_t start;
 	uint64_t end;
 	char prot[4];
 	uint32_t len;
-	struct symtab symtab;
-	struct debug_info dinfo;
 	char libname[];
 };
 
@@ -77,52 +92,46 @@ struct symtabs {
 	const char *dirname;
 	const char *filename;
 	enum symtab_flag flags;
-	struct symtab symtab;
-	struct symtab dsymtab;
-	struct debug_info dinfo;
 	uint64_t kernel_base;
 	uint64_t exec_base;
 	struct uftrace_mmap *maps;
 };
 
-/* only meaningful for 64-bit systems */
-#define KADDR_SHIFT  47
+#define for_each_map(symtabs, map)					\
+	for ((map) = (symtabs)->maps; (map) != NULL; (map) = (map)->next)
 
+/* addr should be from fstack or something other than rstack (rec) */
 static inline bool is_kernel_address(struct symtabs *symtabs, uint64_t addr)
 {
 	return addr >= symtabs->kernel_base;
 }
 
-static inline uint64_t get_real_address(uint64_t addr)
+/* convert rstack->addr (or rec->addr) to full 64-bit address */
+static inline uint64_t get_kernel_address(struct symtabs *symtabs, uint64_t addr)
 {
-	if (addr & (1ULL << KADDR_SHIFT))
-		return addr | (-1ULL << KADDR_SHIFT);
-	return addr;
+	return addr | symtabs->kernel_base;
 }
 
-uint64_t get_kernel_base(char *str);
+uint64_t guess_kernel_base(char *str);
 
 extern struct sym sched_sym;
 
 struct sym * find_symtabs(struct symtabs *symtabs, uint64_t addr);
 struct sym * find_sym(struct symtab *symtab, uint64_t addr);
 struct sym * find_symname(struct symtab *symtab, const char *name);
-void load_symtabs(struct symtabs *symtabs, const char *dirname,
-		  const char *filename);
-void unload_symtab(struct symtab *symtab);
-void unload_symtabs(struct symtabs *symtabs);
-void print_symtabs(struct symtabs *symtabs);
+void print_symtab(struct symtab *symtab);
 
-int arch_load_dynsymtab_bindnow(struct symtab *dsymtab,
-				struct uftrace_elf_data *elf,
-				unsigned long offset, unsigned long flags);
+int arch_load_dynsymtab_noplt(struct symtab *dsymtab,
+			      struct uftrace_elf_data *elf,
+			      unsigned long offset, unsigned long flags);
 int load_elf_dynsymtab(struct symtab *dsymtab, struct uftrace_elf_data *elf,
 		       unsigned long offset, unsigned long flags);
 
 void load_module_symtabs(struct symtabs *symtabs);
-void save_module_symtabs(struct symtabs *symtabs);
-void load_dlopen_symtabs(struct symtabs *symtabs, unsigned long offset,
-			 const char *filename);
+struct uftrace_module * load_module_symtab(struct symtabs *symtabs,
+					   const char *mod_name);
+void save_module_symtabs(const char *dirname);
+void unload_module_symtabs(void);
 
 enum uftrace_trace_type {
 	TRACE_ERROR   = -1,
@@ -131,18 +140,13 @@ enum uftrace_trace_type {
 	TRACE_CYGPROF,
 };
 
-bool check_libpthread(const char *filename);
+bool has_dependency(const char *filename, const char *libname);
 enum uftrace_trace_type check_trace_functions(const char *filename);
 int check_static_binary(const char *filename);
-
-struct sym * find_dynsym(struct symtabs *symtabs, size_t idx);
-size_t count_dynsym(struct symtabs *symtabs);
-
-/* map for main executable */
-#define MAP_MAIN (struct uftrace_mmap *)1
+char * check_script_file(const char *filename);
 
 /* pseudo-map for kernel image */
-#define MAP_KERNEL (struct uftrace_mmap *)2
+#define MAP_KERNEL (struct uftrace_mmap *)1
 
 struct uftrace_mmap * find_map(struct symtabs *symtabs, uint64_t addr);
 struct uftrace_mmap * find_map_by_name(struct symtabs *symtabs,
@@ -153,6 +157,8 @@ int save_kernel_symbol(char *dirname);
 int load_kernel_symbol(char *dirname);
 
 struct symtab * get_kernel_symtab(void);
+struct uftrace_module * get_kernel_module(void);
+
 int load_symbol_file(struct symtabs *symtabs, const char *symfile,
 		     uint64_t offset);
 void save_symbol_file(struct symtabs *symtabs, const char *dirname,
@@ -160,6 +166,8 @@ void save_symbol_file(struct symtabs *symtabs, const char *dirname,
 
 char *symbol_getname(struct sym *sym, uint64_t addr);
 void symbol_putname(struct sym *sym, char *name);
+
+char *symbol_getname_offset(struct sym *sym, uint64_t addr);
 
 struct dynsym_idxlist {
 	unsigned *idx;

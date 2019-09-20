@@ -1,4 +1,4 @@
-VERSION := 0.9
+VERSION := 0.9.3
 
 # Makefiles suck: This macro sets a default value of $(2) for the
 # variable named by $(1), unless the variable has been set by
@@ -53,7 +53,7 @@ export ARCH CC AR LD RM srcdir objdir LDFLAGS
 COMMON_CFLAGS := -D_GNU_SOURCE $(CFLAGS) $(CPPFLAGS)
 COMMON_CFLAGS += -iquote $(srcdir) -iquote $(objdir) -iquote $(srcdir)/arch/$(ARCH)
 #CFLAGS-DEBUG = -g -D_GNU_SOURCE $(CFLAGS_$@)
-COMMON_LDFLAGS := -lrt -ldl -pthread $(LDFLAGS)
+COMMON_LDFLAGS := -lrt -ldl -pthread -Wl,-z,noexecstack $(LDFLAGS)
 ifneq ($(elfdir),)
   COMMON_CFLAGS  += -I$(elfdir)/include
   COMMON_LDFLAGS += -L$(elfdir)/lib
@@ -102,6 +102,14 @@ ifeq ($(COVERAGE), 1)
   LIB_LDFLAGS   += --coverage
 endif
 
+ifeq ($(ASAN), 1)
+  UFTRACE_CFLAGS    += -O0 -g -fsanitize=address -fsanitize=leak
+  DEMANGLER_CFLAGS  += -O0 -g -fsanitize=address -fsanitize=leak
+  SYMBOLS_CFLAGS    += -O0 -g -fsanitize=address -fsanitize=leak
+  TRACEEVENT_CFLAGS += -O0 -g -fsanitize=address -fsanitize=leak
+  TEST_CFLAGS       += -O0 -g -fsanitize=address -fsanitize=leak
+endif
+
 export UFTRACE_CFLAGS LIB_CFLAGS TEST_CFLAGS TEST_LDFLAGS
 
 VERSION_GIT := $(shell git describe --tags 2> /dev/null || echo v$(VERSION))
@@ -126,14 +134,18 @@ TARGETS  := $(patsubst %,$(objdir)/%,$(_TARGETS))
 UFTRACE_SRCS := $(srcdir)/uftrace.c $(wildcard $(srcdir)/cmds/*.c $(srcdir)/utils/*.c)
 UFTRACE_OBJS := $(patsubst $(srcdir)/%.c,$(objdir)/%.o,$(UFTRACE_SRCS))
 
-DEMANGLER_SRCS := $(srcdir)/misc/demangler.c $(srcdir)/utils/demangle.c $(srcdir)/utils/debug.c
+UFTRACE_OBJS_VERSION := $(objdir)/cmds/script.o $(objdir)/cmds/tui.o
+UFTRACE_OBJS_VERSION += $(objdir)/cmds/dump.o $(objdir)/cmds/info.o
+
+DEMANGLER_SRCS := $(srcdir)/misc/demangler.c $(srcdir)/utils/demangle.c
+DEMANGLER_SRCS += $(srcdir)/utils/debug.c $(srcdir)/utils/utils.c
 DEMANGLER_OBJS := $(patsubst $(srcdir)/%.c,$(objdir)/%.o,$(DEMANGLER_SRCS))
 
 SYMBOLS_SRCS := $(srcdir)/misc/symbols.c $(srcdir)/utils/session.c
 SYMBOLS_SRCS += $(srcdir)/utils/demangle.c $(srcdir)/utils/rbtree.c
 SYMBOLS_SRCS += $(srcdir)/utils/utils.c $(srcdir)/utils/debug.c
 SYMBOLS_SRCS += $(srcdir)/utils/filter.c $(srcdir)/utils/dwarf.c
-SYMBOLS_SRCS += $(srcdir)/utils/auto-args.c
+SYMBOLS_SRCS += $(srcdir)/utils/auto-args.c $(srcdir)/utils/regs.c
 SYMBOLS_SRCS += $(wildcard $(srcdir)/utils/symbol*.c)
 SYMBOLS_OBJS := $(patsubst $(srcdir)/%.c,$(objdir)/%.o,$(SYMBOLS_SRCS))
 
@@ -148,7 +160,7 @@ LIBMCOUNT_FAST_OBJS := $(patsubst $(objdir)/%.op,$(objdir)/%-fast.op,$(LIBMCOUNT
 LIBMCOUNT_SINGLE_OBJS := $(patsubst $(objdir)/%.op,$(objdir)/%-single.op,$(LIBMCOUNT_OBJS))
 LIBMCOUNT_FAST_SINGLE_OBJS := $(patsubst $(objdir)/%.op,$(objdir)/%-fast-single.op,$(LIBMCOUNT_OBJS))
 
-LIBMCOUNT_UTILS_SRCS += $(srcdir)/utils/debug.c
+LIBMCOUNT_UTILS_SRCS += $(srcdir)/utils/debug.c $(srcdir)/utils/regs.c
 LIBMCOUNT_UTILS_SRCS += $(srcdir)/utils/rbtree.c $(srcdir)/utils/filter.c
 LIBMCOUNT_UTILS_SRCS += $(srcdir)/utils/demangle.c $(srcdir)/utils/utils.c
 LIBMCOUNT_UTILS_SRCS += $(srcdir)/utils/script.c $(srcdir)/utils/script-python.c
@@ -176,7 +188,7 @@ LIBMCOUNT_FAST_SINGLE_CFLAGS := -DDISABLE_MCOUNT_FILTER -DSINGLE_THREAD
 CFLAGS_$(objdir)/utils/demangle.o  = -Wno-unused-value
 CFLAGS_$(objdir)/utils/demangle.op = -Wno-unused-value
 
-MAKEFLAGS = --no-print-directory
+MAKEFLAGS += --no-print-directory
 
 
 all: $(objdir)/.config $(TARGETS)
@@ -193,6 +205,8 @@ config: $(srcdir)/configure
 
 $(LIBMCOUNT_UTILS_OBJS): $(objdir)/libmcount/%.op: $(srcdir)/utils/%.c $(LIBMCOUNT_DEPS)
 	$(QUIET_CC_FPIC)$(CC) $(LIB_CFLAGS) -c -o $@ $<
+
+$(objdir)/libmcount/mcount.op: $(objdir)/version.h 
 
 $(LIBMCOUNT_OBJS): $(objdir)/%.op: $(srcdir)/%.c $(LIBMCOUNT_DEPS)
 	$(QUIET_CC_FPIC)$(CC) $(LIB_CFLAGS) -c -o $@ $<
@@ -242,7 +256,9 @@ $(objdir)/misc/demangler.o: $(srcdir)/misc/demangler.c $(objdir)/version.h $(COM
 $(objdir)/misc/symbols.o: $(srcdir)/misc/symbols.c $(objdir)/version.h $(COMMON_DEPS)
 	$(QUIET_CC)$(CC) $(SYMBOLS_CFLAGS) -c -o $@ $<
 
-$(filter-out $(objdir)/uftrace.o,$(UFTRACE_OBJS)): $(objdir)/%.o: $(srcdir)/%.c $(COMMON_DEPS)
+$(UFTRACE_OBJS_VERSION): $(objdir)/version.h
+
+$(filter-out $(objdir)/uftrace.o, $(UFTRACE_OBJS)): $(objdir)/%.o: $(srcdir)/%.c $(COMMON_DEPS)
 	$(QUIET_CC)$(CC) $(UFTRACE_CFLAGS) -c -o $@ $<
 
 $(objdir)/version.h: PHONY
@@ -304,6 +320,12 @@ uninstall:
 test: all
 	@$(MAKE) -C $(srcdir)/tests TESTARG="$(TESTARG)" test
 
+unittest: all
+	@$(MAKE) -C $(srcdir)/tests TESTARG="$(TESTARG)" test_unit
+
+runtest: all
+	@$(MAKE) -C $(srcdir)/tests TESTARG="$(TESTARG)" test_run
+
 dist:
 	@git archive --prefix=uftrace-$(VERSION)/ $(VERSION_GIT) -o $(objdir)/uftrace-$(VERSION).tar
 	@tar rf $(objdir)/uftrace-$(VERSION).tar --transform="s|^|uftrace-$(VERSION)/|" $(objdir)/version.h
@@ -324,7 +346,7 @@ clean:
 	@$(MAKE) -sC $(srcdir)/arch/$(ARCH) clean
 	@$(MAKE) -sC $(srcdir)/tests ARCH=$(ARCH) clean
 	@$(MAKE) -sC $(srcdir)/doc clean
-	@$(MAKE) -sC $(srcdir)/libtraceevent clean
+	@$(MAKE) -sC $(srcdir)/libtraceevent BUILD_SRC=$(srcdir)/libtraceevent BUILD_OUTPUT=$(objdir)/libtraceevent CONFIG_FLAGS="$(TRACEEVENT_CFLAGS)" clean
 
 reset-coverage:
 	$(Q)find -name "*\.gcda" | xargs $(RM)

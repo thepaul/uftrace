@@ -2,14 +2,14 @@
 
 from runtest import TestBase
 import subprocess as sp
-import os, re
+import os
 
 TDIR  = 'xxx'
 TDIR2 = 'yyy'
 
 class TestCase(TestBase):
     def __init__(self):
-        TestBase.__init__(self, 'openclose', """
+        TestBase.__init__(self, 'openclose', serial=True, result="""
 # DURATION    TID     FUNCTION
    1.088 us [18343] | __monstartup();
    0.640 us [18343] | __cxa_atexit();
@@ -22,6 +22,7 @@ class TestCase(TestBase):
   37.325 us [18343] |   } /* fclose */
  128.387 us [18343] | } /* main */
 """)
+        self.gen_port()
 
     recv_p = None
 
@@ -34,10 +35,11 @@ class TestCase(TestBase):
         uftrace = TestBase.uftrace_cmd
         program = 't-' + self.name
 
-        recv_cmd = '%s recv -d %s' % (uftrace, TDIR)
+        recv_cmd = '%s recv -d %s --port %s' % (uftrace, TDIR, self.port)
         self.recv_p = sp.Popen(recv_cmd.split())
 
-        argument  = '-H %s -k -d %s' % ('localhost', TDIR2)
+        argument  = '-H %s -k -d %s --port %s' % ('localhost', TDIR2, self.port)
+        argument += ' -N %s@kernel' % 'exit_to_usermode_loop'
         argument += ' -N %s@kernel' % '_*do_page_fault'
 
         record_cmd = '%s record %s %s' % (uftrace, argument, program)
@@ -59,6 +61,6 @@ class TestCase(TestBase):
         major, minor, release = uname[2].split('.')
         if uname[0] == 'Linux' and uname[4] == 'x86_64' and \
            int(major) >= 4 and int(minor) >= 17:
-            return re.sub('sys_[a-zA-Z0-9_]+', 'do_syscall_64', result)
-        else:
-            return result.replace('sys_open', 'sys_openat')
+            result = result.replace('sys_', '__x64_sys_')
+
+        return result.replace(' sys_open', ' sys_openat')

@@ -22,9 +22,9 @@ Features
 ========
 
 It traces each function in the executable and shows time duration.  It
-can also trace external library calls - but only entry and exit are
-supported and cannot trace internal function calls in the library call
-unless the library itself built with profiling enabled.
+can also trace external library calls - but usually entry and exit are
+supported.  Optionally it's possible to trace other (nested) external
+library calls and/or internal function calls in the library call.
 
 It can show detailed execution flow at function level, and report which
 function has the highest overhead.  And it also shows various information
@@ -37,6 +37,25 @@ It supports multi-process and/or multi-threaded applications.  With root
 privilege, it can also trace kernel functions as well( with `-k` option)
 if the system enables the function graph tracer in the kernel
 (`CONFIG_FUNCTION_GRAPH_TRACER=y`).
+
+
+How to build and install uftrace
+================================
+
+On Linux distros, [misc/install-deps.sh](misc/install-deps.sh) installs required
+software(s) on your system.  Those are for optional advanced features but highly
+recommend to install them together.
+
+    $ sudo misc/install-deps.sh
+
+Once you installed required software(s) on your system, it can be built and
+installed like following:
+
+    $ ./configure
+    $ make
+    $ sudo make install
+
+For more advanced setup, please refer [INSTALL.md](INSTALL.md) file.
 
 
 How to use uftrace
@@ -65,9 +84,15 @@ If omitted, it defaults to the `live` command which is almost same as running
 record and replay subcommand in a row (but does not record the trace info
 to files).
 
-For recording, the executable should be compiled with `-pg`
+For recording, the executable needs to be compiled with the `-pg`
 (or `-finstrument-functions`) option which generates profiling code
 (calling mcount or __cyg_profile_func_enter/exit) for each function.
+
+Note that, there's an experimental support for dynamic tracing on x86_64
+which doesn't require such (re-)compilations.  Also recent compilers have
+some options to help uftrace to reduce tracing overhead with similar way
+(although it still needs recompilation of your program).  Please see
+[doc/uftrace-record.md](doc/uftrace-record.md) file.
 
     $ uftrace tests/t-abc
     # DURATION    TID     FUNCTION
@@ -186,7 +211,14 @@ The `dump` command shows raw output of each trace record.  You can see the resul
 in the chrome browser, once the data is processed with `uftrace dump --chrome`.
 Below is a trace of clang (LLVM) compiling a small C++ template metaprogram.
 
-![uftrace-chrome-dump](doc/uftrace-chrome.png)
+[![uftrace-chrome-dump](doc/uftrace-chrome.png)](https://uftrace.github.io/dump/clang.tmp.fib.html)
+
+It also supports flame-graph output as well.  The data can be processed with
+`uftrace dump --flame-graph` and passed to
+[flamegraph.pl](https://github.com/brendangregg/FlameGraph/blob/master/flamegraph.pl).
+Below is a flame graph result of gcc compiling a simple C program.
+
+[![uftrace-flame-graph-dump](https://uftrace.github.io/dump/gcc.svg)](https://uftrace.github.io/dump/gcc.svg)
 
 The `info` command shows system and program information when recorded.
 
@@ -226,31 +258,14 @@ It provides basic functionality of `graph`, `report` and `info` commands as of
 now.
 
 
-How to install uftrace
-======================
-
-The uftrace is written in C and tried to minimize external dependencies.
-Currently it does not require any of them but there're some optional
-dependencies to enable advanced features.
-
-Once you installed required software(s) on your system, it can be built and
-installed like following:
-
-    $ make
-    $ sudo make install
-
-For more advanced setup, please refer
-[INSTALL.md](INSTALL.md) file.
-
-
 Limitations
 ===========
 - It can trace a native C/C++ application on Linux.
 - It *cannot* trace already running process.
 - It *cannot* be used for system-wide tracing.
-- It supports x86_64 and ARM (v6 or later) and AArch64 for now.
+- It supports x86 (32 and 64 bit), ARM (v6 or later) and AArch64 for now.
 
 
 License
 =======
-The uftrace program is released under GPL v2.  See COPYING file for details.
+The uftrace program is released under GPL v2.  See [COPYING file](COPYING) for details.

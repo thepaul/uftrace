@@ -127,14 +127,37 @@ void build_debug_domain(char *dbg_domain_str)
 	}
 }
 
+bool mcount_rstack_has_plthook(struct mcount_thread_data *mtdp)
+{
+	int idx;
+
+	for (idx = 0; idx < mtdp->idx; idx++) {
+		if (mtdp->rstack[idx].dyn_idx != MCOUNT_INVALID_DYNIDX)
+			return true;
+	}
+	return false;
+}
+
 /* restore saved original return address */
 void mcount_rstack_restore(struct mcount_thread_data *mtdp)
 {
 	int idx;
+	struct mcount_ret_stack *rstack;
 
 	/* reverse order due to tail calls */
-	for (idx = mtdp->idx - 1; idx >= 0; idx--)
-		*mtdp->rstack[idx].parent_loc = mtdp->rstack[idx].parent_ip;
+	for (idx = mtdp->idx - 1; idx >= 0; idx--) {
+		rstack = &mtdp->rstack[idx];
+
+		if (rstack->parent_ip == mcount_return_fn ||
+		    rstack->parent_ip == (unsigned long)plthook_return)
+			continue;
+
+		if (!ARCH_CAN_RESTORE_PLTHOOK &&
+		    rstack->dyn_idx != MCOUNT_INVALID_DYNIDX)
+			continue;
+
+		*rstack->parent_loc = rstack->parent_ip;
+	}
 }
 
 /* hook return address again (used after mcount_rstack_restore) */
@@ -147,8 +170,8 @@ void mcount_rstack_reset(struct mcount_thread_data *mtdp)
 		rstack = &mtdp->rstack[idx];
 
 		if (rstack->dyn_idx == MCOUNT_INVALID_DYNIDX)
-			*rstack->parent_loc = (unsigned long)mcount_return;
-		else
+			*rstack->parent_loc = mcount_return_fn;
+		else if (ARCH_CAN_RESTORE_PLTHOOK)
 			*rstack->parent_loc = (unsigned long)plthook_return;
 	}
 }
@@ -168,6 +191,10 @@ void mcount_auto_restore(struct mcount_thread_data *mtdp)
 	curr_rstack = &mtdp->rstack[mtdp->idx - 1];
 	prev_rstack = &mtdp->rstack[mtdp->idx - 2];
 
+	if (!ARCH_CAN_RESTORE_PLTHOOK &&
+	    prev_rstack->dyn_idx != MCOUNT_INVALID_DYNIDX)
+		return;
+
 	/* ignore tail calls */
 	if (curr_rstack->parent_loc == prev_rstack->parent_loc)
 		return;
@@ -176,7 +203,7 @@ void mcount_auto_restore(struct mcount_thread_data *mtdp)
 		unsigned long parent_ip = prev_rstack->parent_ip;
 
 		/* parent also can be tail-called; skip */
-		if (parent_ip == (unsigned long)mcount_return ||
+		if (parent_ip == mcount_return_fn ||
 		    parent_ip == (unsigned long)plthook_return) {
 			prev_rstack--;
 			continue;
@@ -202,12 +229,16 @@ void mcount_auto_reset(struct mcount_thread_data *mtdp)
 	curr_rstack = &mtdp->rstack[mtdp->idx - 1];
 	prev_rstack = &mtdp->rstack[mtdp->idx - 2];
 
+	if (!ARCH_CAN_RESTORE_PLTHOOK &&
+	    prev_rstack->dyn_idx != MCOUNT_INVALID_DYNIDX)
+		return;
+
 	/* ignore tail calls */
 	if (curr_rstack->parent_loc == prev_rstack->parent_loc)
 		return;
 
 	if (prev_rstack->dyn_idx == MCOUNT_INVALID_DYNIDX)
-		*prev_rstack->parent_loc = (unsigned long)mcount_return;
+		*prev_rstack->parent_loc = mcount_return_fn;
 	else
 		*prev_rstack->parent_loc = (unsigned long)plthook_return;
 }
@@ -222,8 +253,10 @@ TEST_CASE(mcount_debug_domain)
 	/* ensure domain string matches to current domain bit */
 	TEST_EQ(DBG_DOMAIN_MAX, (int)strlen(DBG_DOMAIN_STR));
 
-	for (i = 0; i < DBG_DOMAIN_MAX; i++)
-		TEST_EQ(dbg_domain[i], 0);
+	for (i = 0; i < DBG_DOMAIN_MAX; i++) {
+		if (i != PR_DOMAIN)
+			TEST_EQ(dbg_domain[i], 0);
+	}
 
 	for (i = 0; i < DBG_DOMAIN_MAX; i++) {
 		dbg_str[i * 2]     = DBG_DOMAIN_STR[i];

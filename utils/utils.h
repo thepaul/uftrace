@@ -48,6 +48,14 @@ extern int debug;
 extern FILE *logfp;
 extern FILE *outfp;
 
+/* colored output for argspec display */
+extern const char *color_reset;
+extern const char *color_bold;
+extern const char *color_string;
+extern const char *color_symbol;
+extern const char *color_enum;
+extern const char *color_enum_or;
+
 /* must change DBG_DOMAIN_STR (in mcount.h) as well */
 enum debug_domain {
 	DBG_UFTRACE	= 0,
@@ -58,6 +66,7 @@ enum debug_domain {
 	DBG_SESSION,
 	DBG_KERNEL,
 	DBG_MCOUNT,
+	DBG_PLTHOOK,
 	DBG_DYNAMIC,
 	DBG_EVENT,
 	DBG_SCRIPT,
@@ -93,7 +102,7 @@ extern void __pr_color(char code, const char *fmt, ...);
 
 extern enum color_setting log_color;
 extern enum color_setting out_color;
-extern void setup_color(enum color_setting color);
+extern void setup_color(enum color_setting color, char *pager);
 extern void setup_signal(void);
 
 #ifndef PR_FMT
@@ -119,6 +128,12 @@ extern void setup_signal(void);
 #define pr_dbg3(fmt, ...) 					\
 ({								\
 	if (dbg_domain[PR_DOMAIN] > 2)		\
+		__pr_dbg(PR_FMT ": " fmt, ## __VA_ARGS__);	\
+})
+
+#define pr_dbg4(fmt, ...) 					\
+({								\
+	if (dbg_domain[PR_DOMAIN] > 3)		\
 		__pr_dbg(PR_FMT ": " fmt, ## __VA_ARGS__);	\
 })
 
@@ -209,6 +224,12 @@ extern void setup_signal(void);
 	}								\
 })
 
+#define call_if_nonull(fptr, ...) 					\
+({									\
+	if (fptr != NULL)						\
+		fptr(__VA_ARGS__);					\
+})
+
 #define htonq(x)  htobe64(x)
 #define ntohq(x)  be64toh(x)
 
@@ -243,6 +264,36 @@ static inline int get_elf_class(void)
 		return ELFCLASSNONE;
 }
 
+static inline bool host_is_lp64(void)
+{
+	return get_elf_class() == ELFCLASS64;
+}
+
+static inline char* has_kernel_opt(char *buf)
+{
+	int idx = 0;
+
+	if (!strncasecmp(buf, "kernel", 6))
+		idx = 6;
+	else if (!strncasecmp(buf, "k", 1))
+		idx = 1;
+
+	if (idx && (buf[idx] == '\0' || buf[idx] == ','))
+		return buf;
+
+	return NULL;
+}
+
+static inline char* has_kernel_filter(char *buf)
+{
+	char *opt = strchr(buf, '@');
+
+	if (opt && has_kernel_opt(opt + 1))
+		return opt;
+
+	return NULL;
+}
+
 struct uftrace_time_range {
 	uint64_t first;
 	uint64_t start;
@@ -261,9 +312,9 @@ int fread_all(void *byf, size_t size, FILE *fp);
 int write_all(int fd, const void *buf, size_t size);
 int writev_all(int fd, struct iovec *iov, int count);
 
-int create_directory(char *dirname);
-int remove_directory(char *dirname);
-int chown_directory(char *dirname);
+int create_directory(const char *dirname);
+int remove_directory(const char *dirname);
+int chown_directory(const char *dirname);
 char *read_exename(void);
 
 void print_time_unit(uint64_t delta_nsec);
@@ -271,11 +322,13 @@ void print_diff_percent(uint64_t base_nsec, uint64_t delta_nsec);
 void print_diff_time_unit(uint64_t base_nsec, uint64_t pair_nsec);
 void print_diff_count(unsigned long base, unsigned long pair);
 
-void start_pager(void);
+char *setup_pager(void);
+void start_pager(char *pager);
 void wait_for_pager(void);
 
 bool check_time_range(struct uftrace_time_range *range, uint64_t timestamp);
 uint64_t parse_time(char *arg, int limited_digits);
+uint64_t parse_timestamp(char *arg);
 
 char * strjoin(char *left, char *right, const char *delim);
 char * strquote(char *str, int *len);
@@ -293,16 +346,16 @@ struct strv {
 void strv_split(struct strv *strv, const char *str, const char *delim);
 void strv_copy(struct strv *strv, int argc, char *argv[]);
 void strv_append(struct strv *strv, const char *str);
+void strv_replace(struct strv *strv, int idx, const char *str);
 char * strv_join(struct strv *strv, const char *delim);
 void strv_free(struct strv *strv);
 
 char **parse_cmdline(char *cmd, int *argc);
 void free_parsed_cmdline(char **argv);
 
-struct ftrace_file_handle;
+struct uftrace_data;
 
-char *get_event_name(struct ftrace_file_handle *handle, unsigned evt_id);
+char *get_event_name(struct uftrace_data *handle, unsigned evt_id);
 char *absolute_dirname(const char *path, char *resolved_path);
-const char * arch_register_dwarf_name(int dwarf_reg);
 
 #endif /* UFTRACE_UTILS_H */

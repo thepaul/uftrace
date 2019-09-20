@@ -7,6 +7,7 @@
 #include "utils/utils.h"
 #include "utils/symbol.h"
 #include "utils/dwarf.h"
+#include "utils/arch.h"
 
 /* needs to print session info with symbol */
 static bool needs_session;
@@ -16,18 +17,14 @@ const char *argp_program_version = "symbols " UFTRACE_VERSION;
 
 static struct argp_option symbols_options[] = {
 	{ "data", 'd', "DATA", 0, "Use this DATA instead of uftrace.data" },
+	{ "verbose", 'v', 0, 0, "Be verbose" },
 	{ 0 }
 };
 
 struct symbols_opts {
 	char *dirname;
+	int  idx;
 };
-
-/* just to prevent linker failure */
-int arch_register_index(char *reg)
-{
-	return -1;
-}
 
 static error_t parse_option(int key, char *arg, struct argp_state *state)
 {
@@ -36,6 +33,15 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 	switch (key) {
 	case 'd':
 		opts->dirname = xstrdup(arg);
+		break;
+
+	case 'v':
+		debug++;
+		dbg_domain[DBG_SYMBOL]++;
+		break;
+
+	case ARGP_KEY_ARGS:
+		opts->idx = state->next;
 		break;
 
 	case ARGP_KEY_NO_ARGS:
@@ -74,7 +80,7 @@ static int print_session_symbol(struct uftrace_session *s, void *arg)
 	return 0;
 }
 
-static int read_session(struct uftrace_session_link *link, char *dirname)
+static int read_sessions(struct uftrace_session_link *link, char *dirname)
 {
 	FILE *fp;
 	char *fname = NULL;
@@ -102,14 +108,14 @@ static int read_session(struct uftrace_session_link *link, char *dirname)
 			       &sec, &nsec, &tmsg.tid, &tmsg.pid);
 
 			tmsg.time = (uint64_t)sec * NSEC_PER_SEC + nsec;
-			create_task(link, &tmsg, false, true);
+			create_task(link, &tmsg, false);
 		}
 		else if (!strncmp(line, "FORK", 4)) {
 			sscanf(line + 5, "timestamp=%lu.%lu pid=%d ppid=%d",
 			       &sec, &nsec, &tmsg.tid, &tmsg.pid);
 
 			tmsg.time = (uint64_t)sec * NSEC_PER_SEC + nsec;
-			create_task(link, &tmsg, true, true);
+			create_task(link, &tmsg, true);
 		}
 		else if (!strncmp(line, "SESS", 4)) {
 			sscanf(line + 5, "timestamp=%lu.%lu %*[^i]id=%d sid=%s",
@@ -128,7 +134,8 @@ static int read_session(struct uftrace_session_link *link, char *dirname)
 			smsg.task.time = (uint64_t)sec * NSEC_PER_SEC + nsec;
 			smsg.namelen = strlen(exename);
 
-			create_session(link, &smsg, dirname, exename, true);
+			create_session(link, &smsg, dirname, exename,
+				       true, true, false);
 			count++;
 		}
 		else if (!strncmp(line, "DLOP", 4)) {
@@ -167,6 +174,7 @@ static int read_session(struct uftrace_session_link *link, char *dirname)
 
 int main(int argc, char *argv[])
 {
+	int ret = 0;
 	uint64_t addr;
 	struct symbols_opts opts = {
 		.dirname = UFTRACE_DIR_NAME,
@@ -184,24 +192,49 @@ int main(int argc, char *argv[])
 
 	argp_parse(&argp, argc, argv, ARGP_IN_ORDER, NULL, &opts);
 
+	outfp = stdout;
+	logfp = stdout;
+
 retry:
-	if (read_session(&link, opts.dirname) < 0) {
+	if (read_sessions(&link, opts.dirname) < 0) {
 		if (!strcmp(opts.dirname, UFTRACE_DIR_NAME)) {
 			opts.dirname = ".";
 			goto retry;
 		}
 
 		printf("read session failed\n");
-		return -1;
+		ret = -1;
+		goto out;
 	}
 
-	while (scanf("%"PRIx64, &addr) == 1) {
-		printf("%"PRIx64":", addr);
-		if (needs_session)
+	if (opts.idx) {
+		int i;
+
+		for (i = opts.idx; i < argc; i++) {
+			sscanf(argv[i], "%"PRIx64, &addr);
+			printf("%"PRIx64":", addr);
+
+			if (needs_session)
+				putchar('\n');
+			walk_sessions(&link, print_session_symbol, &addr);
 			putchar('\n');
-		walk_sessions(&link, print_session_symbol, &addr);
-		putchar('\n');
+		}
+	}
+	else {
+		char buf[4096];
+
+		while (fgets(buf, sizeof(buf), stdin)) {
+			sscanf(buf, "%"PRIx64, &addr);
+			printf("%"PRIx64":", addr);
+
+			if (needs_session)
+				putchar('\n');
+			walk_sessions(&link, print_session_symbol, &addr);
+			putchar('\n');
+		}
 	}
 
-	return 0;
+out:
+	delete_sessions(&link);
+	return ret;
 }
